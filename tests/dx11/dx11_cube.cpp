@@ -114,10 +114,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         winClass.style = CS_HREDRAW | CS_VREDRAW;
         winClass.lpfnWndProc = &WndProc;
         winClass.hInstance = hInstance;
-        winClass.hIcon = LoadIconW(0, IDI_APPLICATION);
-        winClass.hCursor = LoadCursorW(0, IDC_ARROW);
+        winClass.hIcon = LoadIconW((HINSTANCE)nullptr, (LPCWSTR)IDI_APPLICATION);
+        winClass.hCursor = LoadCursorW((HINSTANCE)nullptr, (LPCWSTR)IDC_ARROW);
         winClass.lpszClassName = L"MyWindowClass";
-        winClass.hIconSm = LoadIconW(0, IDI_APPLICATION);
+        winClass.hIconSm = LoadIconW((HINSTANCE)nullptr, (LPCWSTR)IDI_APPLICATION);
 
         if(!RegisterClassExW(&winClass)) {
             MessageBoxA(0, "RegisterClassEx failed", "Fatal Error", MB_OK);
@@ -156,16 +156,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
         #endif
 
-        HRESULT hResult = D3D11CreateDevice(0, D3D_DRIVER_TYPE_HARDWARE, 
-                                            0, creationFlags, 
-                                            featureLevels, ARRAYSIZE(featureLevels), 
-                                            D3D11_SDK_VERSION, &baseDevice, 
+        HRESULT hResult = D3D11CreateDevice(0, D3D_DRIVER_TYPE_HARDWARE,
+                                            0, creationFlags,
+                                            featureLevels, ARRAYSIZE(featureLevels),
+                                            D3D11_SDK_VERSION, &baseDevice,
                                             0, &baseDeviceContext);
         if(FAILED(hResult)){
             MessageBoxA(0, "D3D11CreateDevice() failed", "Fatal Error", MB_OK);
             return GetLastError();
         }
-        
+
         // Get 1.1 interface of D3D11 Device and Context
         hResult = baseDevice->QueryInterface(__uuidof(ID3D11Device1), (void**)&d3d11Device);
         assert(SUCCEEDED(hResult));
@@ -211,8 +211,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
             DXGI_ADAPTER_DESC adapterDesc;
             dxgiAdapter->GetDesc(&adapterDesc);
 
-            OutputDebugStringA("Graphics Device: ");
-            OutputDebugStringW(adapterDesc.Description);
+            for (int i = 0; i < 128 && adapterDesc.Description[i]; i++)
 
             hResult = dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)&dxgiFactory);
             assert(SUCCEEDED(hResult));
@@ -220,8 +219,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         }
         
         DXGI_SWAP_CHAIN_DESC1 d3d11SwapChainDesc = {};
-        d3d11SwapChainDesc.Width = 0; // use window width
-        d3d11SwapChainDesc.Height = 0; // use window height
+        d3d11SwapChainDesc.Width = 1024;   // iOS: explicit (no real window)
+        d3d11SwapChainDesc.Height = 768;
         d3d11SwapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
         d3d11SwapChainDesc.SampleDesc.Count = 1;
         d3d11SwapChainDesc.SampleDesc.Quality = 0;
@@ -445,25 +444,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
                 dt = (1.f / 60.f);
         }
 
-        MSG msg = {};
-        while(PeekMessageW(&msg, 0, 0, 0, PM_REMOVE))
-        {
-            if(msg.message == WM_QUIT)
-                isRunning = false;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // Skip PeekMessageW on iOS — no real window manager; our Wine
+        // build blocks here. Just never deliver input messages.
+        (void)0;
 
-        // Get window dimensions
-        int windowWidth, windowHeight;
-        float windowAspectRatio;
-        {
-            RECT clientRect;
-            GetClientRect(hwnd, &clientRect);
-            windowWidth = clientRect.right - clientRect.left;
-            windowHeight = clientRect.bottom - clientRect.top;
-            windowAspectRatio = (float)windowWidth / (float)windowHeight;
-        }
+        // Get window dimensions (hardcoded on iOS — our Wine has no real
+        // window manager, GetClientRect returns uninitialized garbage).
+        int windowWidth = 1024, windowHeight = 768;
+        float windowAspectRatio = (float)windowWidth / (float)windowHeight;
 
         if(global_windowDidResize)
         {
@@ -573,7 +561,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         d3d11DeviceContext->IASetIndexBuffer(indexBuffer, DXGI_FORMAT_R16_UINT, 0);
 
         d3d11DeviceContext->DrawIndexed(numIndices, 0, 0);
-    
+
         d3d11SwapChain->Present(1, 0);
     }
 

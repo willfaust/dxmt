@@ -733,12 +733,23 @@ public:
       return DXGI_ERROR_INVALID_CALL;
 
     HRESULT hr = S_OK;
+#ifdef DXMT_IOS
+    // iOS has no real window manager, so wsi::isMinimized / isForeground
+    // return meaningless values. Treat the single iOS surface as always
+    // visible + foregrounded.
+    bool window_minimized = false;
+#else
     bool window_minimized = wsi::isMinimized(hWnd);
+#endif
     if ((window_minimized || desc_.Width == 0 || desc_.Height == 0)
         // MSDN: You will not receive DXGI_STATUS_OCCLUDED if you're using a flip model swap chain.
         && desc_.SwapEffect <= DXGI_SWAP_EFFECT_SEQUENTIAL)
       hr = DXGI_STATUS_OCCLUDED;
+#ifdef DXMT_IOS
+    bool should_exit_fs = false;
+#else
     bool should_exit_fs = !fullscreen_desc_.Windowed && !window_minimized && !wsi::isForeground(hWnd);
+#endif
     if (hr == S_OK && should_exit_fs)
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)

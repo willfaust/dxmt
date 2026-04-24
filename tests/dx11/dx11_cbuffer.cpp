@@ -48,10 +48,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         winClass.style = CS_HREDRAW | CS_VREDRAW;
         winClass.lpfnWndProc = &WndProc;
         winClass.hInstance = hInstance;
-        winClass.hIcon = LoadIconW(0, IDI_APPLICATION);
-        winClass.hCursor = LoadCursorW(0, IDC_ARROW);
+        winClass.hIcon = LoadIconW((HINSTANCE)nullptr, (LPCWSTR)IDI_APPLICATION);
+        winClass.hCursor = LoadCursorW((HINSTANCE)nullptr, (LPCWSTR)IDC_ARROW);
         winClass.lpszClassName = L"MyWindowClass";
-        winClass.hIconSm = LoadIconW(0, IDI_APPLICATION);
+        winClass.hIconSm = LoadIconW((HINSTANCE)nullptr, (LPCWSTR)IDI_APPLICATION);
 
         if(!RegisterClassExW(&winClass)) {
             MessageBoxA(0, "RegisterClassEx failed", "Fatal Error", MB_OK);

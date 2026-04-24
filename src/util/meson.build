@@ -29,6 +29,15 @@ if dxmt_native
     'wsi_window_headless.cpp',
     'wsi_platform_darwin.cpp',
   ])
+elif host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'windows'
+  # Mythic iOS target: aarch64-windows PE, but running inside our iOS Wine
+  # with no real window manager. Use headless wsi to stop user32 calls from
+  # returning garbage.
+  util_src += files([
+    'wsi_monitor_headless.cpp',
+    'wsi_window_headless.cpp',
+    'wsi_platform_win32.cpp',
+  ])
 else
   util_src += files([
     'wsi_monitor_win32.cpp',
