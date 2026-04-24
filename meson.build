@@ -176,6 +176,13 @@ if not dxmt_native
       windows_native_install_dir = 'system32'
     endif
     windows_builtin_install_dir = 'x86_64-windows'
+  elif cpu_family == 'aarch64'
+    if wine_builtin_dll
+      windows_native_install_dir = 'aarch64-windows'
+    else
+      windows_native_install_dir = 'system32'
+    endif
+    windows_builtin_install_dir = 'aarch64-windows'
   else
     error('invalid cpu family')
   endif

@@ -1063,12 +1063,9 @@ CreateSwapChain(
     return DXGI_ERROR_INVALID_CALL;
   InitReturnPtr(ppSwapChain);
 
-  DWORD window_process_id;
-  GetWindowThreadProcessId(hWnd, &window_process_id);
-  if (GetProcessId(GetCurrentProcess()) != window_process_id) {
-    ERR("CreateSwapChain: cross-process swapchain not supported yet");
-    return E_FAIL;
-  }
+  /* Mythic-iOS: Wine runs the game as a thread inside the host app, so the
+   * HWND's "process" and GetCurrentProcess() can legitimately disagree in
+   * ways that don't map to a real cross-process scenario. Skip the check. */
 
   Com<IMTLDXGIDevice> layer_factory;
   if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&layer_factory)))) {

@@ -1,13 +1,35 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#import <UIKit/UIKit.h>
+/* iOS lacks CGDirectDisplay: provide minimal stubs for single-display use. */
+typedef uint32_t CGDirectDisplayID;
+#define kCGNullDirectDisplay ((CGDirectDisplayID)0)
+static inline CGDirectDisplayID CGMainDisplayID(void) { return 1; }
+#else
 #import <Cocoa/Cocoa.h>
+#endif
+#if !TARGET_OS_IOS
 #import <ColorSync/ColorSync.h>
+#endif
 #import <CoreFoundation/CFRunLoop.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
+#if TARGET_OS_IOS
+#include <objc/message.h>
+#include <objc/runtime.h>
+#else
 #include "objc/objc-runtime.h"
+#endif
+#if TARGET_OS_IOS
+/* iOS SDK omits bootstrap.h but the functions exist in libsystem. */
+typedef char name_t[128];
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+#else
 #include <bootstrap.h>
+#endif
 #include <mach/mach_port.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
@@ -1196,7 +1218,11 @@ _MTLTexture_replaceRegion(void *obj) {
 static NTSTATUS
 _MTLBuffer_didModifyRange(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+#if !TARGET_OS_IOS
   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
+#else
+  (void)params; /* iOS unified memory — no range invalidation needed. */
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -1498,7 +1524,9 @@ _MetalLayer_setProps(void *obj) {
     layer.opaque = props->opaque;
     layer.framebufferOnly = props->framebuffer_only;
     layer.contentsScale = props->contents_scale;
+#if !TARGET_OS_IOS
     layer.displaySyncEnabled = props->display_sync_enabled;
+#endif
     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
   });
@@ -1514,7 +1542,11 @@ _MetalLayer_getProps(void *obj) {
   props->opaque = layer.opaque;
   props->framebuffer_only = layer.framebufferOnly;
   props->contents_scale = layer.contentsScale;
+#if TARGET_OS_IOS
+  props->display_sync_enabled = true; /* iOS always syncs to display refresh. */
+#else
   props->display_sync_enabled = layer.displaySyncEnabled;
+#endif
   props->drawable_height = layer.drawableSize.height;
   props->drawable_width = layer.drawableSize.width;
   props->pixel_format = layer.pixelFormat;
@@ -1723,7 +1755,13 @@ _MTLCommandEncoder_setLabel(void *args) {
 static NTSTATUS
 _MTLDevice_setShouldMaximizeConcurrentCompilation(void *args) {
   struct unixcall_generic_obj_uint64_noret *params = args;
+#if !TARGET_OS_IOS
   [(id<MTLDevice>)params->handle setShouldMaximizeConcurrentCompilation:(BOOL)params->arg];
+#else
+  /* setShouldMaximizeConcurrentCompilation: is macOS-only — iOS MTLDevice
+   * raises an ObjC exception if we call it. Skip. */
+  (void)params;
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -2139,6 +2177,7 @@ _WMTGetSecondaryDisplayId(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
   params->ret = kCGNullDirectDisplay;
 
+#if !TARGET_OS_IOS
   uint32_t count = 0;
   CGGetOnlineDisplayList(0, NULL, &count);
 
@@ -2158,10 +2197,12 @@ _WMTGetSecondaryDisplayId(void *obj) {
     params->ret = id;
     break;
   }
+#endif
 
   return STATUS_SUCCESS;
 }
 
+#if !TARGET_OS_IOS
 typedef struct icc_XYZ_t {
   uint32_t sig;      // 0x205a5958
   uint32_t reserved; // 0
@@ -2203,7 +2244,9 @@ GetDisplayColorGamut(ColorSyncProfileRef profile, struct WMTDisplayDescription *
              profile, kColorSyncSigBlueColorantTag, &desc_out->blue_primaries[0], &desc_out->blue_primaries[1]
          );
 }
+#endif /* !TARGET_OS_IOS — end of ColorSync/NSScreen block */
 
+#if !TARGET_OS_IOS
 NSScreen *
 GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
   for (NSScreen *screen in [NSScreen screens]) {
@@ -2214,12 +2257,19 @@ GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
   }
   return nil;
 }
+#endif
 
 static NTSTATUS
 _WMTGetDisplayDescription(void *obj) {
   struct unixcall_generic_obj_ptr_noret *params = obj;
-  CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
+#if TARGET_OS_IOS
+  (void)params;
+  desc_out->maximum_edr_color_component_value = 1.0;
+  desc_out->maximum_reference_edr_color_component_value = 0.0;
+  desc_out->maximum_potential_edr_color_component_value = 1.0;
+#else
+  CGDirectDisplayID display_id = params->handle;
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
   if (!profile || !GetDisplayColorGamut(profile, desc_out))
     GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
@@ -2235,6 +2285,7 @@ _WMTGetDisplayDescription(void *obj) {
     desc_out->maximum_reference_edr_color_component_value = 0.0;
     desc_out->maximum_potential_edr_color_component_value = 1.0;
   }
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -2254,6 +2305,7 @@ _MetalLayer_getEDRValue(void *obj) {
   value->maximum_edr_color_component_value = 1.0;
   value->maximum_potential_edr_color_component_value = 1.0;
 
+#if !TARGET_OS_IOS
   if (![layer.delegate isKindOfClass:NSView.class])
     return STATUS_SUCCESS;
 
@@ -2269,6 +2321,7 @@ _MetalLayer_getEDRValue(void *obj) {
   value->maximum_edr_color_component_value =
       layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
   value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+#endif
 
   return STATUS_SUCCESS;
 }
@@ -2329,6 +2382,10 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
   params->version = 0;
+#if TARGET_OS_IOS
+  (void)layer;
+  return STATUS_SUCCESS;
+#else
   if (![layer.delegate isKindOfClass:NSView.class])
     return STATUS_SUCCESS;
 
@@ -2352,6 +2409,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
 
   return STATUS_SUCCESS;
+#endif
 }
 
 static NTSTATUS
@@ -2485,8 +2543,11 @@ static NTSTATUS
 _MTLBuffer_updateContents(void *obj) {
   struct unixcall_mtlbuffer_updatecontents *params = obj;
   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
+#if !TARGET_OS_IOS
+  /* Managed storage mode doesn't exist on iOS (unified memory). */
   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -2669,6 +2730,14 @@ NTSTATUS _CacheReader_get(void *obj);
 NTSTATUS _CacheWriter_alloc_init(void *obj);
 NTSTATUS _CacheWriter_set(void *obj);
 NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
+
+#if TARGET_OS_IOS
+/* On iOS we statically link DXMT's unix side into the host app (Mythic.app),
+ * alongside ntdll's own __wine_unix_call_funcs. Rename ours so the linker
+ * doesn't get a duplicate symbol; our ntdll's load_builtin_unixlib picks
+ * it up by name when a DLL registers winemetal.so as its unix path.        */
+#define __wine_unix_call_funcs dxmt_winemetal_unix_call_funcs
+#endif
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
