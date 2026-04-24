@@ -144,6 +144,14 @@ endif
 
 add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
+# On iOS all Metal storage modes that are Managed on macOS must become
+# Shared — iOS has unified memory and raises an assertion for storageMode 1
+# (Managed). Enable for aarch64-windows cross-build which is our iOS target.
+if host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'windows'
+  add_project_arguments('-DDXMT_IOS=1', language: 'cpp')
+  add_project_arguments('-DDXMT_IOS=1', language: 'c')
+endif
+
 dxmt_version = vcs_tag(
   command: ['git', 'describe', '--always'],
   input:  'version.h.in',

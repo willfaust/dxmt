@@ -122,6 +122,13 @@ enum WMTResourceOptions : uint64_t {
   WMTResourceOptionCPUCacheModeWriteCombined = 1,
 };
 
+#ifdef DXMT_IOS
+/* iOS Metal has no Managed storage mode — unified memory means Shared gives
+ * the same CPU+GPU read/write semantics without needing didModifyRange:.
+ * Remap at the symbol level so all existing DXMT call sites just work. */
+#define WMTResourceStorageModeManaged WMTResourceStorageModeShared
+#endif
+
 struct WMTMemoryPointer {
   void *ptr;
 #if defined(__i386__)
