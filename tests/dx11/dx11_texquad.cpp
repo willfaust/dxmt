@@ -146,8 +146,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
             DXGI_ADAPTER_DESC adapterDesc;
             dxgiAdapter->GetDesc(&adapterDesc);
 
-            OutputDebugStringA("Graphics Device: ");
-            OutputDebugStringW(adapterDesc.Description);
+            fprintf(stderr, "[texquad] Graphics Device: "); fflush(stderr);
+            for (int i = 0; i < 128 && adapterDesc.Description[i]; i++)
+                fputc((char)adapterDesc.Description[i], stderr);
+            fputc('\n', stderr); fflush(stderr);
 
             hResult = dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)&dxgiFactory);
             assert(SUCCEEDED(hResult));
@@ -155,8 +157,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         }
 
         DXGI_SWAP_CHAIN_DESC1 d3d11SwapChainDesc = {};
-        d3d11SwapChainDesc.Width = 0; // use window width
-        d3d11SwapChainDesc.Height = 0; // use window height
+        d3d11SwapChainDesc.Width = 1024;   // iOS: explicit
+        d3d11SwapChainDesc.Height = 768;
         d3d11SwapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
         d3d11SwapChainDesc.SampleDesc.Count = 1;
         d3d11SwapChainDesc.SampleDesc.Quality = 0;
@@ -190,7 +192,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     ID3D11VertexShader* vertexShader;
     {
         ID3DBlob* shaderCompileErrorsBlob;
-        HRESULT hResult = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, &shaderCompileErrorsBlob);
+        HRESULT hResult = D3DCompileFromFile(L"shader_texquad.hlsl", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, &shaderCompileErrorsBlob);
         if(FAILED(hResult))
         {
             const char* errorString = NULL;
@@ -213,7 +215,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     {
         ID3DBlob* psBlob;
         ID3DBlob* shaderCompileErrorsBlob;
-        HRESULT hResult = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, &shaderCompileErrorsBlob);
+        HRESULT hResult = D3DCompileFromFile(L"shader_texquad.hlsl", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, &shaderCompileErrorsBlob);
         if(FAILED(hResult))
         {
             const char* errorString = NULL;
@@ -290,13 +292,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     ID3D11SamplerState* samplerState;
     d3d11Device->CreateSamplerState(&samplerDesc, &samplerState);
 
-    // Load Image
-    int texWidth, texHeight, texNumChannels;
-    int texForceNumChannels = 4;
-    unsigned char* testTextureBytes = stbi_load("testTexture.png", &texWidth, &texHeight,
-                                                &texNumChannels, texForceNumChannels);
-    assert(testTextureBytes);
+    // Generate a procedural 128x128 checkerboard — avoids shipping a PNG
+    // into the Wine prefix filesystem. 16x16 tiles, alternating colors.
+    int texWidth = 128, texHeight = 128;
     int texBytesPerRow = 4 * texWidth;
+    unsigned char* testTextureBytes = (unsigned char*)malloc(texBytesPerRow * texHeight);
+    for (int y = 0; y < texHeight; y++) {
+        for (int x = 0; x < texWidth; x++) {
+            bool on = ((x / 16) ^ (y / 16)) & 1;
+            unsigned char *p = testTextureBytes + y*texBytesPerRow + x*4;
+            // Checker pattern with a bit of color based on position.
+            p[0] = on ? 255 : (unsigned char)(x * 2);        // R
+            p[1] = on ? 255 : (unsigned char)(y * 2);        // G
+            p[2] = on ? 255 : 80;                            // B
+            p[3] = 255;                                      // A
+        }
+    }
 
     // Create Texture
     D3D11_TEXTURE2D_DESC textureDesc = {};
@@ -325,14 +336,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     bool isRunning = true;
     while(isRunning)
     {
-        MSG msg = {};
-        while(PeekMessageW(&msg, 0, 0, 0, PM_REMOVE))
-        {
-            if(msg.message == WM_QUIT)
-                isRunning = false;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // Skip PeekMessageW on iOS — no real window manager.
+        (void)0;
 
         if(global_windowDidResize)
         {
@@ -357,9 +362,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         FLOAT backgroundColor[4] = { 0.1f, 0.2f, 0.6f, 1.0f };
         d3d11DeviceContext->ClearRenderTargetView(d3d11FrameBufferView, backgroundColor);
 
-        RECT winRect;
-        GetClientRect(hwnd, &winRect);
-        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, (FLOAT)(winRect.right - winRect.left), (FLOAT)(winRect.bottom - winRect.top), 0.0f, 1.0f };
+        // iOS: hardcode dims (GetClientRect returns uninitialized data here).
+        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 1024.0f, 768.0f, 0.0f, 1.0f };
         d3d11DeviceContext->RSSetViewports(1, &viewport);
 
         d3d11DeviceContext->OMSetRenderTargets(1, &d3d11FrameBufferView, nullptr);
