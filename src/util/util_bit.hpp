@@ -10,7 +10,12 @@
 
 #pragma once
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
+/* ARM64EC must be detected BEFORE x86_64 because the arm64ec-w64-mingw32
+ * toolchain defines both __x86_64__ and __arm64ec__/__AARCH64EL__ — the
+ * code generated is ARM64, so x86 intrinsics aren't usable. Treat as ARM64. */
+#if defined(__arm64ec__) || defined(_M_ARM64EC)
+#define DXMT_ARCH_ARM64
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||           \
     defined(_M_IX86)
 #define DXMT_ARCH_X86
 #if defined(__x86_64__) || defined(_M_X64)

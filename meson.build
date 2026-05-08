@@ -16,6 +16,16 @@ clangpp = meson.get_compiler('cpp', native: true)
 
 cpu_family = target_machine.cpu_family()
 
+# ARM64EC: arm64ec-w64-mingw32-clang reports cpu_family() = 'aarch64' but is
+# really an x86_64-callable hybrid PE — we need to install to arm64ec-windows
+# (matches our wine/build-arm64ec layout) rather than aarch64-windows.
+is_arm64ec = false
+if cpu_family == 'aarch64'
+  is_arm64ec = cpp.compiles(
+    '#if !defined(__arm64ec__) && !defined(_M_ARM64EC)\n#error not arm64ec\n#endif\nint main(void){return 0;}',
+    name: 'arm64ec target')
+endif
+
 dxmt_include_dirs = [
   './include',
   './libs'
@@ -185,12 +195,21 @@ if not dxmt_native
     endif
     windows_builtin_install_dir = 'x86_64-windows'
   elif cpu_family == 'aarch64'
-    if wine_builtin_dll
-      windows_native_install_dir = 'aarch64-windows'
+    if is_arm64ec
+      if wine_builtin_dll
+        windows_native_install_dir = 'arm64ec-windows'
+      else
+        windows_native_install_dir = 'system32'
+      endif
+      windows_builtin_install_dir = 'arm64ec-windows'
     else
-      windows_native_install_dir = 'system32'
+      if wine_builtin_dll
+        windows_native_install_dir = 'aarch64-windows'
+      else
+        windows_native_install_dir = 'system32'
+      endif
+      windows_builtin_install_dir = 'aarch64-windows'
     endif
-    windows_builtin_install_dir = 'aarch64-windows'
   else
     error('invalid cpu family')
   endif
