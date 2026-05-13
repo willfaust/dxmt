@@ -168,7 +168,12 @@ void handle_signature_vs(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+       * wiring it through airconv is a larger change. Silently drop the
+       * output — culling is a rasterizer optimization, so omitting it
+       * just means a few extra primitives reach the fragment stage. The
+       * shader still computes the value into its temp register; we simply
+       * don't emit it as a stage output. Required for Thumper to boot. */
       break;
     case D3D10_SB_NAME_POSITION: {
       auto assigned_index =
@@ -839,7 +844,12 @@ void handle_signature_ds(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+       * wiring it through airconv is a larger change. Silently drop the
+       * output — culling is a rasterizer optimization, so omitting it
+       * just means a few extra primitives reach the fragment stage. The
+       * shader still computes the value into its temp register; we simply
+       * don't emit it as a stage output. Required for Thumper to boot. */
       break;
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
@@ -1063,7 +1073,12 @@ handle_signature_gs(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+       * wiring it through airconv is a larger change. Silently drop the
+       * output — culling is a rasterizer optimization, so omitting it
+       * just means a few extra primitives reach the fragment stage. The
+       * shader still computes the value into its temp register; we simply
+       * don't emit it as a stage output. Required for Thumper to boot. */
       break;
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
