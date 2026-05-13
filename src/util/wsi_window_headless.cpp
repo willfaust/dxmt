@@ -6,6 +6,10 @@
  * Copyright (c) 2019 Joshua Ashton
  *
  * See <https://github.com/doitsujin/dxvk/blob/master/LICENSE>
+ *
+ * iOS-Mythic 2026-05-13: Synthetic monitor / no-op fullscreen so Thumper-
+ * style games can negotiate display mode without DISP_CHANGE_BADMODE.
+ * Pairs with wsi_monitor_headless.cpp (1024x768 @ 60Hz synthetic monitor).
  */
 
 #include "wsi_window.hpp"
@@ -16,39 +20,46 @@
 
 namespace dxmt::wsi {
 
+/* Same synthetic handle as wsi_monitor_headless.cpp — must match. */
+static HMONITOR const kSyntheticMonitor = reinterpret_cast<HMONITOR>(1);
+
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
   if (pWidth)
     *pWidth = 1024;
 
   if (pHeight)
-    *pHeight = 1024;
+    *pHeight = 768;
 }
 
 void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
                   uint32_t height) {
 }
 
+/* Headless no-op fullscreen success. Games negotiate a mode and expect
+ * setWindowMode/enterFullscreenMode to return true; failing here makes
+ * games abort with DISP_CHANGE_BADMODE-equivalent error paths. */
 bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
-  return false;
+  return true;
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
                          DXMTWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
-  return false;
+  return true;
 }
 
 bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
                          bool restoreCoordinates) {
-  return false;
+  return true;
 }
 
 bool restoreDisplayMode(HMONITOR hMonitor) {
-  return false;
+  return true;
 }
 
 HMONITOR getWindowMonitor(HWND hWindow) {
-  return 0;
+  /* Return the same synthetic monitor everything else uses. */
+  return kSyntheticMonitor;
 }
 
 bool isWindow(HWND hWindow) { return true; }
