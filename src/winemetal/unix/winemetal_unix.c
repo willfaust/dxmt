@@ -312,6 +312,12 @@ static bool query_bc_support(void) {
     }
   }
   g_bc_supported_cached = supported ? 1 : 0;
+  /* iOS-Mythic 2026-05-18: one-shot log so we can see if A15+ supports BC
+   * natively (would skip all the BC decoder work). Fires exactly once
+   * per process — first call to to_metal_pixel_format. */
+  dprintf(STDERR_FILENO,
+          "[iOS DXMT] supportsBCTextureCompression = %s\n",
+          supported ? "YES" : "NO");
   return supported;
 }
 
@@ -1386,6 +1392,12 @@ static inline void mythic_log_present_cadence(const char *path) {
     dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu (%s)\n",
             (unsigned long long)n, path);
   }
+}
+
+/* iOS-Mythic 2026-05-18: exposed for SwiftUI FPS overlay. Reads the
+ * atomic counter on the calling thread (typically a 100ms Swift Timer). */
+uint64_t mythic_get_present_count(void) {
+  return atomic_load_explicit(&g_mythic_present_count, memory_order_relaxed);
 }
 
 static NTSTATUS
