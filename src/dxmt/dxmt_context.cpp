@@ -693,6 +693,17 @@ std::unique_ptr<VisibilityResultReadback>
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
 
+  /* iOS-Mythic 2026-07-03: drain autoreleased thunk objects once per flush.
+   * Everything created through the winemetal unix thunks in this function —
+   * render/compute/blit encoders, and critically the CAMetalDrawable from
+   * Presenter::encodeCommands — is returned autoreleased onto a Wine pthread
+   * that never drains a pool, so on iOS the drawables accumulated forever.
+   * After maximumDrawableCount (3) leaked drawables, every nextDrawable
+   * blocks its full 1s timeout: the intermittent "present counter climbs at
+   * ~1 FPS but the screen stays black" failure. The command buffer retains
+   * the drawable through presentation, so draining here is safe. */
+  auto pool = WMT::MakeAutoreleasePool();
+
   unsigned encoder_count = encoder_count_;
   unsigned encoder_index = 0;
   EncoderData **encoders =
@@ -900,10 +911,18 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto drawable = data->presenter->encodeCommands(cmdbuf, {}, data->backbuffer, data->metadata);
       auto t1 = clock::now();
       currentFrameStatistics().drawable_blocking_interval += (t1 - t0);
-      if (data->after > 0)
-        cmdbuf.presentDrawableAfterMinimumDuration(drawable, data->after);
-      else
-        cmdbuf.presentDrawable(drawable);
+      /* iOS-Mythic 2026-07-03 EXPERIMENT: always plain presentDrawable.
+       * presentDrawableAfterMinimumDuration schedules each frame relative
+       * to the PREVIOUS frame's completed on-glass presentation. On iOS 27
+       * our layer's presentations only complete when the render server is
+       * forced to re-composite (screenshots advance exactly one frame;
+       * touches/normal transactions do nothing), so the min-duration chain
+       * stalls at ~1 present/s with frames invisibly queued. Plain
+       * presentDrawable requests immediate presentation, bypassing the
+       * stalled timeline. Revert to the conditional below if this doesn't
+       * discriminate. */
+      (void)data->after;
+      cmdbuf.presentDrawable(drawable);
       data->~PresentData();
       break;
     }

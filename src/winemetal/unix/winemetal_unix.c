@@ -35,6 +35,12 @@ extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name,
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
 
+/* iOS-Mythic 2026-05-22 draw-call telemetry. Defined further down with
+ * the present counter; forward-declared here so the draw command cases
+ * (above the definition site in source order) can increment them. */
+static _Atomic uint64_t g_mythic_draw_calls;
+static _Atomic uint64_t g_mythic_draw_calls_at_last_log;
+
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
@@ -1121,6 +1127,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDraw: {
       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+      atomic_fetch_add_explicit(&g_mythic_draw_calls, 1, memory_order_relaxed);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                   vertexStart:body->vertex_start
                   vertexCount:body->vertex_count
@@ -1130,6 +1137,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndexed: {
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
+      atomic_fetch_add_explicit(&g_mythic_draw_calls, 1, memory_order_relaxed);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
                            indexType:(MTLIndexType)body->index_type
@@ -1142,6 +1150,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
+      atomic_fetch_add_explicit(&g_mythic_draw_calls, 1, memory_order_relaxed);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                 indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
           indirectBufferOffset:body->indirect_args_offset];
@@ -1149,6 +1158,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
+      atomic_fetch_add_explicit(&g_mythic_draw_calls, 1, memory_order_relaxed);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
                          indexBuffer:(id<MTLBuffer>)body->index_buffer
@@ -1386,11 +1396,32 @@ _MTLBuffer_didModifyRange(void *obj) {
  * game's render loop is alive (continuous Presents → splash sustained via
  * redraw) or wedged on first frame. Prints once per ~60 frames at ~1Hz. */
 static _Atomic uint64_t g_mythic_present_count = 0;
-static inline void mythic_log_present_cadence(const char *path) {
+/* iOS-Mythic 2026-05-22: draw-call counter, sampled+reset on each present
+ * log line. Tells us if the game is issuing draws between Presents or
+ * presenting empty frames. Bumped in WMTRenderCommandDraw{,Indexed,Indirect,
+ * IndexedIndirect} cases of the render-command processor.
+ * Forward-declared near top of file; definition lives here. */
+
+static inline void mythic_log_present_cadence(const char *path, double after) {
   uint64_t n = atomic_fetch_add_explicit(&g_mythic_present_count, 1, memory_order_relaxed) + 1;
-  if (n == 1 || (n % 60) == 0) {
-    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu (%s)\n",
-            (unsigned long long)n, path);
+  /* 2026-07-03: every-16 cadence (was 60) + monotonic timestamp + the
+   * `after` min-duration arg — measures the black-phase ~1 FPS pacing
+   * directly from the log (game-phase log lines carry no timestamps under
+   * the WINEDEBUG perf default). */
+  if (n == 1 || (n % 16) == 0) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* Sample + reset draw counter delta since last log line. */
+    uint64_t cur_draws = atomic_load_explicit(&g_mythic_draw_calls, memory_order_relaxed);
+    uint64_t last_draws = atomic_exchange_explicit(&g_mythic_draw_calls_at_last_log, cur_draws, memory_order_relaxed);
+    uint64_t draws_since_last = cur_draws - last_draws;
+    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu t=%llu.%03lu after=%.4f (draws_since_last=%llu total_draws=%llu) [%s]\n",
+            (unsigned long long)n,
+            (unsigned long long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000000),
+            after,
+            (unsigned long long)draws_since_last,
+            (unsigned long long)cur_draws,
+            path);
   }
 }
 
@@ -1403,7 +1434,7 @@ uint64_t mythic_get_present_count(void) {
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
-  mythic_log_present_cadence("presentDrawable");
+  mythic_log_present_cadence("presentDrawable", 0.0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   return STATUS_SUCCESS;
 }
@@ -1411,7 +1442,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
-  mythic_log_present_cadence("presentDrawableAfterMinDuration");
+  mythic_log_present_cadence("presentDrawableAfterMinDuration", params->arg1);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
   return STATUS_SUCCESS;
@@ -1672,7 +1703,25 @@ _MetalDrawable_texture(void *obj) {
 static NTSTATUS
 _MetalLayer_nextDrawable(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
+  /* 2026-07-03: measure blocking time. When queued presentations never
+   * complete (render server not compositing the layer), all 3 pool
+   * drawables stay owned by the presentation queue and this call blocks
+   * its full 1s timeout — the observed ~1 present/s black-screen pacing. */
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   params->ret = (obj_handle_t)[(CAMetalLayer *)params->handle nextDrawable];
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  static _Atomic uint64_t nd_total = 0, nd_slow = 0;
+  uint64_t n = atomic_fetch_add_explicit(&nd_total, 1, memory_order_relaxed) + 1;
+  if (ms > 50.0) {
+    uint64_t s = atomic_fetch_add_explicit(&nd_slow, 1, memory_order_relaxed) + 1;
+    if (s <= 16 || (s % 64) == 0)
+      dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu BLOCKED %.0fms (nil=%d slow_total=%llu)\n",
+              (unsigned long long)n, ms, params->ret == 0, (unsigned long long)s);
+  } else if (n <= 8) {
+    dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu took %.2fms\n", (unsigned long long)n, ms);
+  }
   return STATUS_SUCCESS;
 }
 
