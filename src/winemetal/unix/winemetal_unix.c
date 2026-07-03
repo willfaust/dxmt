@@ -1415,12 +1415,23 @@ static inline void mythic_log_present_cadence(const char *path, double after) {
     uint64_t cur_draws = atomic_load_explicit(&g_mythic_draw_calls, memory_order_relaxed);
     uint64_t last_draws = atomic_exchange_explicit(&g_mythic_draw_calls_at_last_log, cur_draws, memory_order_relaxed);
     uint64_t draws_since_last = cur_draws - last_draws;
-    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu t=%llu.%03lu after=%.4f (draws_since_last=%llu total_draws=%llu) [%s]\n",
+    /* 2026-07-03 Mach-exception storm probe: the PC-sampling profiler put
+     * ~25% of game-thread time in the exception-resume trampoline. This
+     * counter (signal_arm64_ios.c, same binary) exposes exceptions/present.
+     * Thousands per present = steady-state trap storm (suspect: guest CALL
+     * pushes into trap-mode-protected callret memory at ~70us each). */
+    extern volatile int ios_exc_msg_count;
+    static int last_exc_count = 0;
+    int cur_exc = ios_exc_msg_count;
+    int exc_delta = cur_exc - last_exc_count;
+    last_exc_count = cur_exc;
+    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu t=%llu.%03lu after=%.4f (draws_since_last=%llu total_draws=%llu machexc_delta=%d) [%s]\n",
             (unsigned long long)n,
             (unsigned long long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000000),
             after,
             (unsigned long long)draws_since_last,
             (unsigned long long)cur_draws,
+            exc_delta,
             path);
   }
 }
@@ -1430,6 +1441,11 @@ static inline void mythic_log_present_cadence(const char *path, double after) {
 uint64_t mythic_get_present_count(void) {
   return atomic_load_explicit(&g_mythic_present_count, memory_order_relaxed);
 }
+
+/* NOTE (2026-07-03): a presented-handler probe lived here during the
+ * visibility-stall investigation. Removed — presentedTime reported 0.000
+ * even for frames provably on glass (the splash), so it carries no signal
+ * for this layer. See project memory for the full postmortem. */
 
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {

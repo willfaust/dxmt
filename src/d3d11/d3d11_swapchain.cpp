@@ -875,6 +875,32 @@ public:
         std::min(frame.render_pass_optimized, 999u),
         std::min(frame.clear_pass_count - frame.clear_pass_optimized, 999u), std::min(frame.clear_pass_optimized, 99u)
     ));
+
+    /* iOS-Mythic 2026-07-03: dump the same frame statistics to the log every
+     * 64 frames — the HUD is invisible without MTL_HUD_ENABLED, and these
+     * numbers split the measured ~10-12ms-per-draw frame cost into
+     * game/encode/commit/GPU-sync so the bottleneck is attributable from a
+     * pulled device log alone. Averages are per-frame, in ms. */
+    {
+      static uint64_t mythic_stats_frame = 0;
+      if ((++mythic_stats_frame % 64) == 0) {
+        Logger::info(std::format(
+            "[FRAME_STATS] #{} cmdbufs={} commit_avg={:.2f}ms sync_cnt={} sync_avg={:.2f}ms "
+            "event_stall_max={} latency_avg={:.2f}ms enc_prep={:.2f}ms enc_flush={:.2f}ms "
+            "drawable_block={:.2f}ms renderpass={}+{} clear={}+{}",
+            mythic_stats_frame, frame.command_buffer_count,
+            average.commit_interval.count() / 1000000.0,
+            frame.sync_count,
+            average.sync_interval.count() / 1000000.0,
+            statistics.max().event_stall,
+            average.present_lantency_interval.count() / 1000000.0,
+            average.encode_prepare_interval.count() / 1000000.0,
+            average.encode_flush_interval.count() / 1000000.0,
+            average.drawable_blocking_interval.count() / 1000000.0,
+            frame.render_pass_count - frame.render_pass_optimized, frame.render_pass_optimized,
+            frame.clear_pass_count - frame.clear_pass_optimized, frame.clear_pass_optimized));
+      }
+    }
     {
       /* scaler info */
       auto &info = frame.last_scaler_info;
