@@ -1425,14 +1425,30 @@ static inline void mythic_log_present_cadence(const char *path, double after) {
     int cur_exc = ios_exc_msg_count;
     int exc_delta = cur_exc - last_exc_count;
     last_exc_count = cur_exc;
-    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu t=%llu.%03lu after=%.4f (draws_since_last=%llu total_draws=%llu machexc_delta=%d) [%s]\n",
+    /* iOS-Mythic 2026-07-05: frame anatomy for the locked-60 push —
+     * game-thread server_wait wall time + wait/timeout/request counts
+     * (server_ios.c, same binary). Deltas cover the 16 presents since
+     * the last line. Answers: is the last ~1.5ms/frame server-request
+     * WORK or wait-wake LATENCY? */
+    extern volatile long long ios_srv_wait_us, ios_srv_wait_req_us;
+    extern volatile int ios_srv_wait_count, ios_srv_wait_timeouts, ios_srv_req_count;
+    static long long last_wait_us, last_req_us; static int last_wc, last_wt, last_rq;
+    long long cur_wait_us = ios_srv_wait_us, cur_req_us = ios_srv_wait_req_us;
+    int cur_wc = ios_srv_wait_count, cur_wt = ios_srv_wait_timeouts, cur_rq = ios_srv_req_count;
+    dprintf(STDERR_FILENO, "[iOS DXMT] Present #%llu t=%llu.%03lu after=%.4f (draws_since_last=%llu total_draws=%llu machexc_delta=%d srvw=%d/%d w_ms=%.1f wreq_ms=%.1f reqs=%d) [%s]\n",
             (unsigned long long)n,
             (unsigned long long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000000),
             after,
             (unsigned long long)draws_since_last,
             (unsigned long long)cur_draws,
             exc_delta,
+            cur_wc - last_wc, cur_wt - last_wt,
+            (cur_wait_us - last_wait_us) / 1000.0,
+            (cur_req_us - last_req_us) / 1000.0,
+            cur_rq - last_rq,
             path);
+    last_wait_us = cur_wait_us; last_req_us = cur_req_us;
+    last_wc = cur_wc; last_wt = cur_wt; last_rq = cur_rq;
   }
 }
 
