@@ -1463,11 +1463,31 @@ uint64_t mythic_get_present_count(void) {
  * even for frames provably on glass (the splash), so it carries no signal
  * for this layer. See project memory for the full postmortem. */
 
+/* iOS-Mythic 2026-07-05: runtime vsync-lock toggle. iOS has no true
+ * "vsync off" (no displaySyncEnabled); the ceiling is the display
+ * refresh — 120Hz on ProMotion once Info.plist sets
+ * CADisableMinimumFrameDurationOnPhone. locked=1 (default) paces
+ * presents with afterMinimumDuration(1/60) = the shipped locked-60
+ * behavior; locked=0 presents immediately and free-runs up to the
+ * display max. Read per present — flip live from the Swift UI. */
+static volatile int g_mythic_vsync_locked = 1;
+void mythic_set_vsync_locked(int locked) {
+  g_mythic_vsync_locked = locked ? 1 : 0;
+  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_locked=%d\n", g_mythic_vsync_locked);
+}
+int mythic_get_vsync_locked(void) { return g_mythic_vsync_locked; }
+
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
-  mythic_log_present_cadence("presentDrawable", 0.0);
-  [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
+  if (g_mythic_vsync_locked) {
+    mythic_log_present_cadence("presentDrawable60", 0.0);
+    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
+                                     afterMinimumDuration:(1.0 / 60.0)];
+  } else {
+    mythic_log_present_cadence("presentDrawable", 0.0);
+    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
+  }
   return STATUS_SUCCESS;
 }
 
