@@ -1463,27 +1463,38 @@ uint64_t mythic_get_present_count(void) {
  * even for frames provably on glass (the splash), so it carries no signal
  * for this layer. See project memory for the full postmortem. */
 
-/* iOS-Mythic 2026-07-05: runtime vsync-lock toggle. iOS has no true
- * "vsync off" (no displaySyncEnabled); the ceiling is the display
- * refresh — 120Hz on ProMotion once Info.plist sets
- * CADisableMinimumFrameDurationOnPhone. locked=1 (default) paces
- * presents with afterMinimumDuration(1/60) = the shipped locked-60
- * behavior; locked=0 presents immediately and free-runs up to the
- * display max. Read per present — flip live from the Swift UI. */
-static volatile int g_mythic_vsync_locked = 1;
-void mythic_set_vsync_locked(int locked) {
-  g_mythic_vsync_locked = locked ? 1 : 0;
-  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_locked=%d\n", g_mythic_vsync_locked);
+/* iOS-Mythic 2026-07-05: runtime present-pacing mode, read per present
+ * (live-flippable from the Swift UI):
+ *   1 = LOCKED (default): afterMinimumDuration(1/60) — exact 60.
+ *   0 = MAX: present every frame, free-run to the display refresh
+ *       (120Hz ProMotion with CADisableMinimumFrameDurationOnPhone +
+ *       the app-side CADisplayLink intent; thermal governor may cap 60).
+ *   2 = RAW: mailbox/frame-skip — the game runs UNTHROTTLED; a real
+ *       drawable present is submitted at most every 8ms, other frames
+ *       release their drawable unpresented so the pool never blocks.
+ *       Measures raw stack throughput independent of the panel; the
+ *       present COUNTER counts every game present (incl. skipped) so
+ *       the FPS overlay reads true game rate. */
+static volatile int g_mythic_vsync_mode = 1;
+void mythic_set_vsync_locked(int mode) {
+  g_mythic_vsync_mode = mode;
+  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_mode=%d (1=locked60 0=max 2=raw)\n", mode);
 }
-int mythic_get_vsync_locked(void) { return g_mythic_vsync_locked; }
+int mythic_get_vsync_locked(void) { return g_mythic_vsync_mode; }
 
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
-  if (g_mythic_vsync_locked) {
+  int mode = g_mythic_vsync_mode;
+  if (mode == 1) {
     mythic_log_present_cadence("presentDrawable60", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
                                      afterMinimumDuration:(1.0 / 60.0)];
+  } else if (mode == 2) {
+    /* Frame-skip gating lives in _MetalLayer_nextDrawable (nil return);
+     * only real, ≥18ms-spaced frames reach here. */
+    mythic_log_present_cadence("presentRaw", 0.0);
+    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   } else {
     mythic_log_present_cadence("presentDrawable", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
@@ -1755,6 +1766,31 @@ _MetalDrawable_texture(void *obj) {
 static NTSTATUS
 _MetalLayer_nextDrawable(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
+  /* iOS-Mythic 2026-07-05 RAW mode (mode 2): the mailbox skip lives HERE,
+   * before any drawable is consumed. First attempt gated at the
+   * presentDrawable thunk — too late: every game frame had already
+   * acquired a drawable, and PRESENTED drawables are held until vsync,
+   * so a hot-capped 60Hz panel exhausted the 3-drawable pool and
+   * throttled "unlocked" RAW right back to 60 (observed 02:35 run).
+   * Returning nil here = no drawable touched, no block anywhere; the
+   * PE side (Presenter::encodeCommands / flushCommands) skips the blit
+   * and present on nil. Real acquires are spaced ≥18ms so presented
+   * drawables can never exhaust the pool even on a 60Hz-capped panel.
+   * Skipped frames tick the present counter so the FPS overlay shows
+   * TRUE game rate. */
+  if (g_mythic_vsync_mode == 2) {
+    static struct timespec last_acquire; /* encode-thread only */
+    struct timespec now;
+    double since;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    since = (now.tv_sec - last_acquire.tv_sec) + (now.tv_nsec - last_acquire.tv_nsec) / 1e9;
+    if (since < 0.018) {
+      params->ret = 0;
+      mythic_log_present_cadence("presentSkipped", 0.0);
+      return STATUS_SUCCESS;
+    }
+    last_acquire = now;
+  }
   /* 2026-07-03: measure blocking time. When queued presentations never
    * complete (render server not compositing the layer), all 3 pool
    * drawables stay owned by the presentation queue and this call blocks

@@ -922,7 +922,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
        * stalled timeline. Revert to the conditional below if this doesn't
        * discriminate. */
       (void)data->after;
-      cmdbuf.presentDrawable(drawable);
+      /* nil drawable = RAW-mode frame skip (mailbox) — nothing to present */
+      if (drawable)
+        cmdbuf.presentDrawable(drawable);
       data->~PresentData();
       break;
     }

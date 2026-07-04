@@ -155,6 +155,11 @@ Presenter::encodeCommands(
     WMT::CommandBuffer cmdbuf, WMT::Fence fence, WMT::Texture backbuffer, DXMTPresentMetadata metadata
 ) {
   auto drawable = layer_.nextDrawable();
+  /* iOS-Mythic RAW mode: the unix thunk returns nil inside the
+   * frame-skip window (mailbox). Skip the blit — caller drops the
+   * present on a nil drawable. */
+  if (!drawable)
+    return drawable;
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
