@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IOS
@@ -1404,6 +1405,14 @@ static _Atomic uint64_t g_mythic_present_count = 0;
 
 static inline void mythic_log_present_cadence(const char *path, double after) {
   uint64_t n = atomic_fetch_add_explicit(&g_mythic_present_count, 1, memory_order_relaxed) + 1;
+  /* iOS-Mythic quiet mode: counter always ticks (FPS overlay reads it);
+   * only the log line is suppressed. At RAW rates this line fires 100+
+   * times/s — real I/O + heat. */
+  {
+    static int quiet = -1;
+    if (quiet < 0) quiet = getenv("MYTHIC_QUIET") != NULL;
+    if (quiet) return;
+  }
   /* 2026-07-03: every-16 cadence (was 60) + monotonic timestamp + the
    * `after` min-duration arg — measures the black-phase ~1 FPS pacing
    * directly from the log (game-phase log lines carry no timestamps under
