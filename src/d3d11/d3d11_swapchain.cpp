@@ -732,6 +732,35 @@ public:
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
 
+    /* iOS-Mythic 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
+     * ceiling. Splits each frame into time spent INSIDE Present1 (our
+     * present path: SyncFrame wait, Commit, PresentBoundary) vs OUTSIDE
+     * (game sim/render/its own frame limiter). gap≈50ms with inside≈0 ⇒
+     * the game paces itself between presents; inside≈50ms ⇒ we block.
+     * Also logs the SyncInterval the game passes (3 @60Hz would = 20). */
+    {
+      auto now = std::chrono::steady_clock::now();
+      if (mythic_gap_last_entry_.time_since_epoch().count() != 0) {
+        double gap_ms = std::chrono::duration<double, std::milli>(now - mythic_gap_last_entry_).count();
+        mythic_gap_sum_ms_ += gap_ms;
+        mythic_gap_max_ms_ = std::max(mythic_gap_max_ms_, gap_ms);
+      }
+      mythic_gap_last_entry_ = now;
+      mythic_gap_sync_min_ = std::min(mythic_gap_sync_min_, SyncInterval);
+      mythic_gap_sync_max_ = std::max(mythic_gap_sync_max_, SyncInterval);
+      if ((++mythic_gap_count_ % 64) == 0) {
+        Logger::info(std::format(
+            "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
+            "inside_max={:.1f}ms sync_interval={}..{}",
+            mythic_gap_count_, mythic_gap_sum_ms_ / 64.0, mythic_gap_max_ms_,
+            mythic_inside_sum_ms_ / 64.0, mythic_inside_max_ms_,
+            mythic_gap_sync_min_, mythic_gap_sync_max_));
+        mythic_gap_sum_ms_ = 0; mythic_gap_max_ms_ = 0;
+        mythic_inside_sum_ms_ = 0; mythic_inside_max_ms_ = 0;
+        mythic_gap_sync_min_ = ~0u; mythic_gap_sync_max_ = 0;
+      }
+    }
+
     HRESULT hr = S_OK;
 #ifdef DXMT_IOS
     // iOS has no real window manager, so wsi::isMinimized / isForeground
@@ -814,6 +843,13 @@ public:
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
     cmd_queue.PresentBoundary();
+
+    {
+      double inside_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - mythic_gap_last_entry_).count();
+      mythic_inside_sum_ms_ += inside_ms;
+      mythic_inside_max_ms_ = std::max(mythic_inside_max_ms_, inside_ms);
+    }
 
     return hr;
   };
@@ -1070,6 +1106,14 @@ private:
   IMTLD3D11DeviceContext* device_context_;
   Com<D3D11ResourceCommon, false> backbuffer_;
   HANDLE present_semaphore_;
+
+  /* [PRESENT_GAP] accumulators — Present1 is only called from the game
+   * thread, so plain members are fine. */
+  std::chrono::steady_clock::time_point mythic_gap_last_entry_{};
+  uint64_t mythic_gap_count_ = 0;
+  double mythic_gap_sum_ms_ = 0, mythic_gap_max_ms_ = 0;
+  double mythic_inside_sum_ms_ = 0, mythic_inside_max_ms_ = 0;
+  UINT mythic_gap_sync_min_ = ~0u, mythic_gap_sync_max_ = 0;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   HWND hWnd;
   HMONITOR monitor_;
