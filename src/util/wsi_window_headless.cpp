@@ -24,11 +24,25 @@ namespace dxmt::wsi {
 static HMONITOR const kSyntheticMonitor = reinterpret_cast<HMONITOR>(1);
 
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
+  /* iOS-Mythic 2026-07-07 (task #24): report the REAL client size (user32
+   * works fine now) so swapchains match the window instead of a hardcoded
+   * 1024x768 that predates the 960x540 virtual desktop. Fall back to the
+   * screen size if the window query fails. */
+  RECT rect;
+  if (hWindow && ::GetClientRect(hWindow, &rect) &&
+      rect.right > rect.left && rect.bottom > rect.top) {
+    if (pWidth)
+      *pWidth = (uint32_t)(rect.right - rect.left);
+    if (pHeight)
+      *pHeight = (uint32_t)(rect.bottom - rect.top);
+    return;
+  }
+  int sw = ::GetSystemMetrics(SM_CXSCREEN);
+  int sh = ::GetSystemMetrics(SM_CYSCREEN);
   if (pWidth)
-    *pWidth = 1024;
-
+    *pWidth = (sw > 0) ? (uint32_t)sw : 1024;
   if (pHeight)
-    *pHeight = 768;
+    *pHeight = (sh > 0) ? (uint32_t)sh : 768;
 }
 
 void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
