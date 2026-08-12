@@ -1,3 +1,4 @@
+#include <memory>
 #include "Metal.hpp"
 #include "dxmt_resource_initializer.hpp"
 #include "dxmt_format.hpp"
@@ -208,6 +209,120 @@ ResourceInitializer::initWithZero(
   return current_seq_id_;
 }
 
+
+/* ======================= ml654 BC1/BC3 -> RGBA8 DECODE =======================
+ * WHY: A15 reports supportsBCTextureCompression = NO. remap_unsupported_bc()
+ * (winemetal_unix.c) therefore creates these textures as RGBA8 so the Metal
+ * descriptor validates — but the UPLOAD still carries BC-shaped pitches, so
+ * texture_upload_pitch_ok() drops it and the texture is never filled. That is
+ * Thumper's static/missing art.
+ *
+ * The fix belongs HERE because initWithData computes its whole copy layout from
+ * texture->pixelFormat(), which is still LOGICALLY BC. Decoding the data without
+ * also switching the layout to the PHYSICAL format would still stage BC-sized
+ * rows into an RGBA8 texture.
+ *
+ * ⚠️ LOGICAL vs PHYSICAL: the D3D resource keeps reporting BC everywhere — its
+ * description, pitches, subresources and SRVs are untouched. Only this upload
+ * path uses the physical RGBA8 layout. Surfacing RGBA8 to the Windows app would
+ * violate D3D semantics even where the game would not notice.
+ *
+ * ml653 census justifies the narrow scope: Thumper is BC1+BC3 only, 128 textures /
+ * 1,234 subresources / 30MB, all USAGE_DEFAULT written once at creation, zero
+ * UpdateSubresource/Copy, zero CPU access. Decode costs ~+119MB of RGBA8 (peak
+ * ~3.13GB vs a 4096MB jetsam) and is LOSSLESS, unlike an ETC2 re-encode. */
+
+static inline void bc_rgb565(uint16_t c, uint8_t *out) {
+  uint32_t r = (c >> 11) & 0x1f, g = (c >> 5) & 0x3f, b = c & 0x1f;
+  out[0] = (uint8_t)((r << 3) | (r >> 2));
+  out[1] = (uint8_t)((g << 2) | (g >> 4));
+  out[2] = (uint8_t)((b << 3) | (b >> 2));
+}
+
+/* One BC1 colour block -> 16 RGBA8 texels. `punchthrough` selects the 3-colour
+ * mode with a transparent index-3; BC3's embedded colour block never uses it. */
+static void bc1_block(const uint8_t *blk, uint8_t out[64], bool punchthrough) {
+  uint16_t c0 = (uint16_t)(blk[0] | (blk[1] << 8));
+  uint16_t c1 = (uint16_t)(blk[2] | (blk[3] << 8));
+  uint8_t p[4][4];
+  bc_rgb565(c0, p[0]); p[0][3] = 255;
+  bc_rgb565(c1, p[1]); p[1][3] = 255;
+  if (!punchthrough || c0 > c1) {
+    for (int i = 0; i < 3; i++) {
+      p[2][i] = (uint8_t)((2 * p[0][i] + p[1][i] + 1) / 3);
+      p[3][i] = (uint8_t)((p[0][i] + 2 * p[1][i] + 1) / 3);
+    }
+    p[2][3] = p[3][3] = 255;
+  } else {
+    for (int i = 0; i < 3; i++) {
+      p[2][i] = (uint8_t)((p[0][i] + p[1][i] + 1) / 2);
+      p[3][i] = 0;
+    }
+    p[2][3] = 255;
+    p[3][3] = 0;   /* the punch-through texel */
+  }
+  uint32_t idx = (uint32_t)(blk[4] | (blk[5] << 8) | (blk[6] << 16) | ((uint32_t)blk[7] << 24));
+  for (int t = 0; t < 16; t++) {
+    const uint8_t *src = p[(idx >> (t * 2)) & 3];
+    out[t * 4 + 0] = src[0]; out[t * 4 + 1] = src[1];
+    out[t * 4 + 2] = src[2]; out[t * 4 + 3] = src[3];
+  }
+}
+
+/* BC3 = 8-byte BC4-style alpha block + a BC1 colour block that is ALWAYS in
+ * 4-colour mode (no punch-through). */
+static void bc3_block(const uint8_t *blk, uint8_t out[64]) {
+  bc1_block(blk + 8, out, /*punchthrough=*/false);
+  uint8_t a[8];
+  a[0] = blk[0]; a[1] = blk[1];
+  if (a[0] > a[1]) {
+    for (int i = 1; i < 7; i++) a[i + 1] = (uint8_t)(((7 - i) * a[0] + i * a[1] + 3) / 7);
+  } else {
+    for (int i = 1; i < 5; i++) a[i + 1] = (uint8_t)(((5 - i) * a[0] + i * a[1] + 2) / 5);
+    a[6] = 0; a[7] = 255;
+  }
+  uint64_t bits = 0;
+  for (int i = 0; i < 6; i++) bits |= (uint64_t)blk[2 + i] << (8 * i);
+  for (int t = 0; t < 16; t++) out[t * 4 + 3] = a[(bits >> (t * 3)) & 7];
+}
+
+/* Decode a whole subresource. src_pitch is the guest's BC row pitch (bytes per
+ * ROW OF BLOCKS); dst is tightly packed RGBA8 at width*4. Edge blocks are
+ * decoded in full and clipped, which is what the BC spec requires for
+ * non-multiple-of-4 dimensions. */
+static void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+                            uint32_t height, bool is_bc3) {
+  const uint32_t bx_n = (width + 3) / 4, by_n = (height + 3) / 4;
+  const size_t blk_bytes = is_bc3 ? 16 : 8;
+  const size_t dst_pitch = (size_t)width * 4;
+  uint8_t texels[64];
+  for (uint32_t by = 0; by < by_n; by++) {
+    const uint8_t *row = src + (size_t)by * src_pitch;
+    for (uint32_t bx = 0; bx < bx_n; bx++) {
+      if (is_bc3) bc3_block(row + bx * blk_bytes, texels);
+      else        bc1_block(row + bx * blk_bytes, texels, /*punchthrough=*/true);
+      for (uint32_t ty = 0; ty < 4; ty++) {
+        const uint32_t y = by * 4 + ty;
+        if (y >= height) break;
+        for (uint32_t tx = 0; tx < 4; tx++) {
+          const uint32_t x = bx * 4 + tx;
+          if (x >= width) break;
+          memcpy(dst + (size_t)y * dst_pitch + (size_t)x * 4, texels + (ty * 4 + tx) * 4, 4);
+        }
+      }
+    }
+  }
+}
+
+static inline int bc_decode_kind(enum WMTPixelFormat f) {
+  switch (f) {
+  case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB: return 1;
+  case WMTPixelFormatBC3_RGBA: case WMTPixelFormatBC3_RGBA_sRGB: return 3;
+  default: return 0;
+  }
+}
+/* ===================== end ml654 BC1/BC3 -> RGBA8 DECODE ==================== */
+
 uint64_t
 ResourceInitializer::initWithData(
     const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
@@ -243,6 +358,35 @@ ResourceInitializer::initWithData(
   bool is_1d_tex = (texture->textureType() == WMTTextureType1D) || (texture->textureType() == WMTTextureType1DArray);
   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
   size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
+
+  /* ml654: BC decode. The Metal texture is PHYSICALLY RGBA8 (remap_unsupported_bc);
+   * only the D3D-visible format stays BC. Switch the layout to the physical format
+   * and feed decoded texels, or we stage BC-sized rows into an RGBA8 texture and
+   * the upload gets dropped. 3D is excluded — no BC volume textures observed, and
+   * guessing at slice pitches here is how you get silent corruption. */
+  std::unique_ptr<uint8_t[]> decoded;
+  const int bc_kind = bc_decode_kind(texture->pixelFormat());
+  if (bc_kind && !is_3d_tex && !device_.supportsBCTextureCompression()) {
+    const size_t out_bytes = (size_t)width_sub * height_sub * 4;
+    decoded.reset(new (std::nothrow) uint8_t[out_bytes]);
+    if (decoded) {
+      bc_decode_image((const uint8_t *)data, row_pitch, decoded.get(), width_sub, height_sub,
+                      bc_kind == 3);
+      data = decoded.get();
+      block_size = 1u;                 /* physical RGBA8 is not block-compressed */
+      texel_size = 4u;
+      row_pitch = (size_t)width_sub * 4;
+      depth_pitch = out_bytes;
+      static unsigned n;
+      if (n < 4 || (n & 0x7f) == 0)
+        ERR("[bc-decode] ml654 #", n, " ", (bc_kind == 3 ? "BC3" : "BC1"), " ", width_sub, "x",
+            height_sub, " level=", level, " slice=", slice, " -> RGBA8 ", out_bytes, "B");
+      n++;
+    } else {
+      ERR("[bc-decode] ml654 OOM decoding ", width_sub, "x", height_sub, " — upload skipped");
+    }
+  }
+
   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
   size_t bytes_per_row_increment = is_1d_tex ? bytes_per_row_needed : row_pitch;
   size_t bytes_per_row_valid = is_1d_tex ? bytes_per_row_needed : std::min(row_pitch, bytes_per_row_needed);

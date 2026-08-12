@@ -28,6 +28,24 @@ since it is for internal use only
 #include "util_math.hpp"
 #include "util_win32_compat.h"
 
+/* ml653: BC runtime-operation census. Defined in d3d11_device.cpp.
+ * Answers the one question ml652 could not: DEFAULT textures MAY take
+ * UpdateSubresource/copies after creation, and without these counters
+ * "all DEFAULT with initial data" cannot be narrowed to "written only once". */
+extern "C" void BCCensusRecordOp(unsigned int fmt, int op);
+namespace {
+inline unsigned int BCCensusFormatOf(ID3D11Resource *r) {
+  if (!r) return 0;
+  D3D11_RESOURCE_DIMENSION dim;
+  r->GetType(&dim);
+  if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return 0;   /* cheap reject: buffers/Map are hot */
+  D3D11_TEXTURE2D_DESC d {};
+  static_cast<ID3D11Texture2D *>(r)->GetDesc(&d);
+  return (unsigned int)d.Format;
+}
+} // namespace
+
+
 namespace dxmt {
 
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
@@ -1015,6 +1033,7 @@ public:
   void
   STDMETHODCALLTYPE
   CopyResource(ID3D11Resource *pDstResource, ID3D11Resource *pSrcResource) override {
+    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 1);  /* ml653 */
     std::lock_guard<mutex_t> lock(mutex);
 
     BlitObject Dst(device, pDstResource);
@@ -1071,6 +1090,7 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource *pSrcResource,
       UINT SrcSubresource, const D3D11_BOX *pSrcBox, UINT CopyFlags
   ) override {
+    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 2);  /* ml653 */
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!pDstResource)
@@ -1138,6 +1158,7 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
       UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
   ) override {
+    BCCensusRecordOp(BCCensusFormatOf(pDstResource), 0);  /* ml653 */
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!pDstResource)

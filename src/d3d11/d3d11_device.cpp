@@ -28,6 +28,164 @@
 
 namespace dxmt {
 
+/* ============================ ml652 BC FORMAT CENSUS ============================
+ * Read-only. Changes NO behaviour on any device — it exists to turn "implement
+ * BCn" into a specific, much smaller format set.
+ *
+ * Placed at the D3D layer on purpose. The BC identity does survive down to
+ * winemetal (to_metal_pixel_format() is where remap_unsupported_bc() runs), but
+ * usage, bind flags, CPU access, typeless/view relationships, initial-data
+ * presence and logical pitches only exist HERE. Counting at the Metal boundary
+ * would lose exactly the information needed to design the abstraction.
+ *
+ * Aggregated only — never a line per texture. Snapshots every N resources
+ * rather than at shutdown, because these runs frequently die abnormally and a
+ * shutdown-only census would be lost precisely when it matters.
+ *
+ * Existing behaviour for reference: iPhone GPUs report
+ * supportsBCTextureCompression = NO, so remap_unsupported_bc() swaps BC->RGBA8
+ * to make the descriptor validate, and texture_upload_pitch_ok() then DROPS the
+ * upload whose BC row pitch Metal would reject. The texture is created and
+ * never filled — that is Thumper's static/missing art. */
+namespace {
+
+struct BCCensusEntry {
+  uint32_t count;
+  uint64_t logical_bytes;
+  uint32_t max_w, max_h, max_mips, max_array;
+  uint32_t usage_default, usage_immutable, usage_dynamic, usage_staging;
+  uint32_t with_data, without_data;
+  uint32_t cpu_read, cpu_write;
+  uint32_t bind_srv, bind_rt, bind_uav;
+  uint32_t is_cube;
+};
+
+constexpr uint32_t kDxgiMax = 132;
+BCCensusEntry g_bc_census[kDxgiMax] {};
+/* ml653: runtime-operation counters. ml652 recorded creation-time properties ONLY,
+ * which is why "all DEFAULT" could not be narrowed to "only written at creation" —
+ * DEFAULT textures may still take UpdateSubresource/copies, and we had no way to see it. */
+uint64_t g_bc_op_update = 0, g_bc_op_copyres = 0, g_bc_op_copyregion = 0, g_bc_op_map = 0;
+uint32_t g_bc_srv_formats[kDxgiMax] {};
+uint64_t g_bc_resources_total = 0;
+uint64_t g_bc_subresources_total = 0;
+std::mutex g_bc_census_mutex;
+
+inline bool IsBCFormat(uint32_t f) { return (f >= 70 && f <= 84) || (f >= 94 && f <= 99); }
+
+/* 8 bytes per 4x4 block for BC1/BC4; 16 for BC2/BC3/BC5/BC6H/BC7. */
+inline uint32_t BCBlockBytes(uint32_t f) {
+  if ((f >= 70 && f <= 72) || (f >= 79 && f <= 81)) return 8;
+  return 16;
+}
+
+const char *BCName(uint32_t f) {
+  switch (f) {
+  case 70: return "BC1_TYPELESS";   case 71: return "BC1_UNORM";  case 72: return "BC1_UNORM_SRGB";
+  case 73: return "BC2_TYPELESS";   case 74: return "BC2_UNORM";  case 75: return "BC2_UNORM_SRGB";
+  case 76: return "BC3_TYPELESS";   case 77: return "BC3_UNORM";  case 78: return "BC3_UNORM_SRGB";
+  case 79: return "BC4_TYPELESS";   case 80: return "BC4_UNORM";  case 81: return "BC4_SNORM";
+  case 82: return "BC5_TYPELESS";   case 83: return "BC5_UNORM";  case 84: return "BC5_SNORM";
+  case 94: return "BC6H_TYPELESS";  case 95: return "BC6H_UF16";  case 96: return "BC6H_SF16";
+  case 97: return "BC7_TYPELESS";   case 98: return "BC7_UNORM";  case 99: return "BC7_UNORM_SRGB";
+  default: return "?";
+  }
+}
+
+void BCCensusDump(const char *why) {
+  /* ml653: DXMT's ERR() is str::format(...), which CONCATENATES its arguments — it is
+   * NOT printf. ml652 passed "%s: %llu" templates, so the placeholders printed
+   * literally and every value piled up at the end of the line. Interleave literals
+   * and values instead. */
+  ERR("[bc-census] ml653 ", why, ": ", g_bc_resources_total, " BC resources, ",
+      g_bc_subresources_total, " subresources");
+  uint64_t grand = 0;
+  for (uint32_t f = 0; f < kDxgiMax; f++) {
+    auto &e = g_bc_census[f];
+    if (!e.count) continue;
+    grand += e.logical_bytes;
+    ERR("[bc-census] ml653   ", BCName(f), " n=", e.count, " ", (e.logical_bytes >> 10),
+        "KB max=", e.max_w, "x", e.max_h, " mips=", e.max_mips, " arr=", e.max_array,
+        " cube=", e.is_cube, " | use def=", e.usage_default, " imm=", e.usage_immutable,
+        " dyn=", e.usage_dynamic, " stg=", e.usage_staging, " | data y=", e.with_data,
+        " n=", e.without_data, " | cpu r=", e.cpu_read, " w=", e.cpu_write,
+        " | bind srv=", e.bind_srv, " rt=", e.bind_rt, " uav=", e.bind_uav);
+  }
+  for (uint32_t f = 0; f < kDxgiMax; f++)
+    if (g_bc_srv_formats[f])
+      ERR("[bc-census] ml653   SRV view fmt ", f, " (", BCName(f), ") x", g_bc_srv_formats[f]);
+  /* THE question this build exists to answer. */
+  ERR("[bc-census] ml653   RUNTIME OPS on BC textures: UpdateSubresource=", g_bc_op_update,
+      " CopyResource=", g_bc_op_copyres, " CopySubresourceRegion=", g_bc_op_copyregion,
+      " Map=", g_bc_op_map);
+  ERR("[bc-census] ml653   TOTAL logical BC bytes = ", (grand >> 10), "KB");
+}
+
+void BCCensusRecord(const D3D11_TEXTURE2D_DESC1 *d, const D3D11_SUBRESOURCE_DATA *data) {
+  const uint32_t f = (uint32_t)d->Format;
+  if (!IsBCFormat(f) || f >= kDxgiMax) return;
+
+  const uint32_t bb = BCBlockBytes(f);
+  const uint32_t mips = d->MipLevels ? d->MipLevels : 1;
+  const uint32_t arr = d->ArraySize ? d->ArraySize : 1;
+  uint64_t bytes = 0;
+  for (uint32_t m = 0; m < mips; m++) {
+    uint32_t w = d->Width >> m, h = d->Height >> m;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    bytes += (uint64_t)((w + 3) / 4) * ((h + 3) / 4) * bb;
+  }
+  bytes *= arr;
+
+  std::lock_guard<std::mutex> lk(g_bc_census_mutex);
+  auto &e = g_bc_census[f];
+  e.count++;
+  e.logical_bytes += bytes;
+  if (d->Width > e.max_w) e.max_w = d->Width;
+  if (d->Height > e.max_h) e.max_h = d->Height;
+  if (mips > e.max_mips) e.max_mips = mips;
+  if (arr > e.max_array) e.max_array = arr;
+  if (d->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) e.is_cube++;
+  switch (d->Usage) {
+  case D3D11_USAGE_DEFAULT:   e.usage_default++; break;
+  case D3D11_USAGE_IMMUTABLE: e.usage_immutable++; break;
+  case D3D11_USAGE_DYNAMIC:   e.usage_dynamic++; break;
+  case D3D11_USAGE_STAGING:   e.usage_staging++; break;
+  }
+  if (data) e.with_data++; else e.without_data++;
+  if (d->CPUAccessFlags & D3D11_CPU_ACCESS_READ)  e.cpu_read++;
+  if (d->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) e.cpu_write++;
+  if (d->BindFlags & D3D11_BIND_SHADER_RESOURCE)  e.bind_srv++;
+  if (d->BindFlags & D3D11_BIND_RENDER_TARGET)    e.bind_rt++;
+  if (d->BindFlags & D3D11_BIND_UNORDERED_ACCESS) e.bind_uav++;
+
+  g_bc_resources_total++;
+  g_bc_subresources_total += (uint64_t)mips * arr;
+  if ((g_bc_resources_total % 64) == 0) BCCensusDump("periodic");
+}
+
+} // namespace
+
+/* ml653: reachable from d3d11_context_impl.cpp (different TU). */
+extern "C" void BCCensusRecordSRV(unsigned int fmt) {
+  if (!IsBCFormat(fmt) || fmt >= kDxgiMax) return;
+  std::lock_guard<std::mutex> lk(g_bc_census_mutex);
+  g_bc_srv_formats[fmt]++;
+}
+
+extern "C" void BCCensusRecordOp(unsigned int fmt, int op) {
+  if (!IsBCFormat(fmt)) return;
+  std::lock_guard<std::mutex> lk(g_bc_census_mutex);
+  switch (op) {
+  case 0: g_bc_op_update++; break;
+  case 1: g_bc_op_copyres++; break;
+  case 2: g_bc_op_copyregion++; break;
+  case 3: g_bc_op_map++; break;
+  }
+}
+/* ========================== end ml652 BC FORMAT CENSUS ========================= */
+
+
 const GUID kRenderdocUUID = {0xa7aa6116,
                              0x9c8d,
                              0x4bba,
@@ -862,6 +1020,8 @@ public:
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
 
+    BCCensusRecord(pDesc, pInitialData);   /* ml652: read-only, no behaviour change */
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
@@ -928,6 +1088,10 @@ public:
   HRESULT STDMETHODCALLTYPE CreateShaderResourceView1(
       ID3D11Resource *pResource, const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc,
       ID3D11ShaderResourceView1 **ppSRView) override {
+    /* ml653: ml652 declared g_bc_srv_formats but NEVER incremented it, so the
+     * typeless-resource vs view-format question went unanswered. */
+    if (pDesc) BCCensusRecordSRV((unsigned int)pDesc->Format);
+
     InitReturnPtr(ppSRView);
 
     if (!pResource)
