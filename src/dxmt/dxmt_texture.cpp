@@ -3,6 +3,7 @@
 #include "wsi_platform.hpp"
 #include <atomic>
 #include <cassert>
+#include "dxmt_mem_census.hpp"
 
 namespace dxmt {
 
@@ -67,6 +68,7 @@ TextureAllocation::TextureAllocation(
 };
 
 TextureAllocation::~TextureAllocation(){
+  mem_census_sub((MemOwner)census_owner_, census_bytes_);   /* ml677 */
 #ifdef __i386__
   wsi::aligned_free(mappedMemory);
 #endif
@@ -184,10 +186,18 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
     buffer_info.memory.set(wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE));
 #endif
     auto buffer = device_.newBuffer(buffer_info);
-    return new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
+    auto *ta = new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
+    ta->census_owner_ = MEMOWN_TEX_LINEAR;                 /* ml677 */
+    ta->census_bytes_ = bytes_per_image_;
+    mem_census_add(MEMOWN_TEX_LINEAR, ta->census_bytes_);
+    return ta;
   }
   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
-  return new TextureAllocation(this, std::move(texture), info, flags);
+  auto *ta = new TextureAllocation(this, std::move(texture), info, flags);
+  ta->census_owner_ = MEMOWN_TEX_PRIVATE;                  /* ml677 */
+  ta->census_bytes_ = mem_census_texture_bytes(info);
+  mem_census_add(MEMOWN_TEX_PRIVATE, ta->census_bytes_);
+  return ta;
 }
 
 Rc<TextureAllocation>

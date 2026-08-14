@@ -4,6 +4,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
 #include "util_likely.hpp"
+#include "dxmt_mem_census.hpp"
 
 
 namespace dxmt {
@@ -32,6 +33,7 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   texture_info.sample_count = 1;
   texture_info.array_length = 1;
   gamma_lut_texture_ = device.newTexture(texture_info);
+  mem_census_add(MEMOWN_PRESENTER, mem_census_texture_bytes(texture_info));  /* ml677 */
 }
 
 bool

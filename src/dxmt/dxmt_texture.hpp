@@ -78,6 +78,11 @@ public:
 class TextureAllocation : public Allocation {
   friend class Texture;
 
+public:
+  uint32_t census_owner_ = 0;   /* ml677: MemOwner this allocation was charged to */
+  uint64_t census_bytes_ = 0;   /* ml677: bytes to refund on destruction          */
+
+
   /**
    * notes on thread-safefy:
    * all states in `TextureAllocation` is either immutable or only accessed by `dxmt-encode-thread`

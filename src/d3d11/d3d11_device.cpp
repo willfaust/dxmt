@@ -171,75 +171,15 @@ void BCCensusRecord(const D3D11_TEXTURE2D_DESC1 *d, const D3D11_SUBRESOURCE_DATA
 
 } // namespace
 
-/* ---- ml670: PHYSICAL MIP CLAMP for BC textures -------------------------
- *
- * A15 cannot sample BC, so DXMT remaps BC -> RGBA8 and decodes at upload. That
- * is lossless but costs 4-8x the memory: Book of the Dead's census reaches
- * 351,197 KB of LOGICAL BC, which lands as ~1.79 GB of RGBA8 backing and
- * jetsams the app mid-load.
- *
- * Dropping the top mip leaves 1/4 of the pixels, so that backing falls to
- * ~0.45 GB. The texture keeps its full logical identity from the app's point of
- * view -- we shrink the PHYSICAL resource and then translate views so shader
- * mip indices still mean what the app intended.
- *
- * Eligibility is deliberately narrow. Anything that could observe the physical
- * layout (render target, UAV, CPU access, staging/dynamic, no initial data,
- * single mip) is left completely alone.
- *
- * ⚠️ D3D11 subresource index = mip + slice * MipLevels. Dropping a mip shifts
- * EVERY index, so initial data must be repacked per array slice -- a plain
- * pointer bump silently corrupts slice 1 onward. Cubes are just ArraySize 6 and
- * fall out of the same per-slice loop.
- *
- * ⚠️ USAGE_DEFAULT permits UpdateSubresource/CopySubresourceRegion, whose
- * indices we do NOT translate. This game's census shows zero such calls, but a
- * different one could, so those paths LOUDLY report a clamped target instead of
- * silently writing the wrong mip. Restricting to IMMUTABLE instead would be
- * safe by contract but would clamp nothing -- all 128 observed textures are
- * DEFAULT. */
-namespace {
+/* ml675: the ml670 mip clamp used to live here and was wrong twice over -- it
+ * handed the shrunken descriptor to the resource (so GetDesc reported 512x512
+ * for a logical 2048x2048 texture) and stored the bias in a process-global map
+ * keyed by COM pointer that was never erased on destroy, so a reused address
+ * inherited a stale clamp. Both defects are gone rather than patched: the clamp
+ * now happens in CreateDeviceTextureInternal, which already separates the
+ * logical descriptor from the Metal texture, and the bias is owned by the
+ * DeviceTexture. Runtime-op protection moved with it (TranslateSubresource). */
 
-std::mutex g_mipclamp_mutex;
-std::unordered_map<const void *, uint32_t> g_mipclamp;   /* resource -> levels dropped */
-uint64_t g_mipclamp_saved_kb = 0;
-uint32_t g_mipclamp_count = 0;
-
-uint32_t MipClampLevels() {
-  static int cached = -1;
-  if (cached < 0)
-    cached = std::max(0, std::min(4, Config::getInstance().getOption<int>("d3d11.mipClampBC", 0)));
-  return (uint32_t)cached;
-}
-
-bool MipClampEligible(const D3D11_TEXTURE2D_DESC1 *d, const D3D11_SUBRESOURCE_DATA *data) {
-  if (!MipClampLevels() || !data) return false;
-  if (!IsBCFormat((uint32_t)d->Format)) return false;
-  if (d->Usage != D3D11_USAGE_DEFAULT && d->Usage != D3D11_USAGE_IMMUTABLE) return false;
-  if (d->BindFlags != D3D11_BIND_SHADER_RESOURCE) return false;   /* no RT/UAV/DS */
-  if (d->CPUAccessFlags) return false;
-  if (d->MipLevels < 2) return false;              /* MipLevels==0 means "generate"; also excluded */
-  if (d->SampleDesc.Count > 1) return false;
-  if (d->Width < 8 || d->Height < 8) return false; /* keep the clamped top >= one 4x4 block */
-  return true;
-}
-
-uint32_t MipClampFor(const void *res) {
-  std::lock_guard<std::mutex> lk(g_mipclamp_mutex);
-  auto it = g_mipclamp.find(res);
-  return it == g_mipclamp.end() ? 0 : it->second;
-}
-
-} // namespace
-
-extern "C" void MipClampWarnRuntimeOp(const void *res, const char *op) {
-  if (!MipClampFor(res)) return;
-  static int warned;
-  if (warned++ < 16)
-    ERR("[mip-clamp] ml670 ", op, " on a CLAMPED resource ", res,
-        " -- subresource indices are NOT translated on this path; expect a wrong mip. "
-        "Add index translation or widen the eligibility exclusion.");
-}
 
 /* ml653: reachable from d3d11_context_impl.cpp (different TU). */
 extern "C" void BCCensusRecordSRV(unsigned int fmt) {
@@ -1097,51 +1037,11 @@ public:
 
     BCCensusRecord(pDesc, pInitialData);   /* ml652: read-only, no behaviour change */
 
-    /* ml670: shrink the PHYSICAL resource by dropping top mips. */
-    D3D11_TEXTURE2D_DESC1 clamped_desc;
-    std::vector<D3D11_SUBRESOURCE_DATA> clamped_data;
-    uint32_t clamp = 0;
-    if (MipClampEligible(pDesc, pInitialData)) {
-      const uint32_t mips = pDesc->MipLevels;
-      const uint32_t arr = pDesc->ArraySize ? pDesc->ArraySize : 1;
-      clamp = std::min(MipClampLevels(), mips - 1);          /* always keep >= 1 mip */
-      while (clamp && ((pDesc->Width >> clamp) < 4 || (pDesc->Height >> clamp) < 4))
-        clamp--;                                             /* never go below one block */
-      if (clamp) {
-        clamped_desc = *pDesc;
-        clamped_desc.Width  = std::max(1u, pDesc->Width  >> clamp);
-        clamped_desc.Height = std::max(1u, pDesc->Height >> clamp);
-        clamped_desc.MipLevels = mips - clamp;
-        /* index = mip + slice * MipLevels, so repack per slice -- a flat
-         * pointer bump would corrupt every slice after the first. */
-        clamped_data.resize((size_t)clamped_desc.MipLevels * arr);
-        for (uint32_t a = 0; a < arr; a++)
-          for (uint32_t m = 0; m < clamped_desc.MipLevels; m++)
-            clamped_data[m + (size_t)a * clamped_desc.MipLevels] =
-                pInitialData[(m + clamp) + (size_t)a * mips];
-        pDesc = &clamped_desc;
-        pInitialData = clamped_data.data();
-      }
-    }
-
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
-      case D3D11_USAGE_IMMUTABLE: {
-        HRESULT hr = CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
-        if (SUCCEEDED(hr) && clamp && ppTexture2D && *ppTexture2D) {
-          std::lock_guard<std::mutex> lk(g_mipclamp_mutex);
-          g_mipclamp[(const void *)*ppTexture2D] = clamp;
-          g_mipclamp_count++;
-          if (g_mipclamp_count <= 8 || (g_mipclamp_count % 64) == 0)
-            ERR("[mip-clamp] ml670 #", g_mipclamp_count, " dropped ", clamp,
-                " mip(s): ", clamped_desc.Width << clamp, "x", clamped_desc.Height << clamp,
-                " -> ", clamped_desc.Width, "x", clamped_desc.Height,
-                " mips ", clamped_desc.MipLevels + clamp, "->", clamped_desc.MipLevels,
-                " arr=", clamped_desc.ArraySize);
-        }
-        return hr;
-      }
+      case D3D11_USAGE_IMMUTABLE:
+        return CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
       case D3D11_USAGE_DYNAMIC: {
         HRESULT hr = CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
         if (SUCCEEDED(hr))
@@ -1215,31 +1115,8 @@ public:
     if (!ppSRView)
       return S_FALSE;
 
-    /* ml670: the app still describes views in LOGICAL mip numbers, but the
-     * physical resource lost its top level(s). Shift MostDetailedMip down and
-     * shrink MipLevels to match. A null pDesc needs nothing -- the default view
-     * already spans exactly the mips the resource physically has. */
-    D3D11_SHADER_RESOURCE_VIEW_DESC1 xlated;
-    if (pDesc) {
-      uint32_t clamp = MipClampFor((const void *)pResource);
-      if (clamp && (pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D ||
-                    pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ||
-                    pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE ||
-                    pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY)) {
-        xlated = *pDesc;
-        /* every dimension above keeps MostDetailedMip/MipLevels at the same
-         * offsets in the union, so Texture2D is a valid accessor for all. */
-        uint32_t most = xlated.Texture2D.MostDetailedMip;
-        uint32_t count = xlated.Texture2D.MipLevels;
-        xlated.Texture2D.MostDetailedMip = most > clamp ? most - clamp : 0;
-        if (count != (uint32_t)-1) {
-          uint32_t drop = most < clamp ? clamp - most : 0;
-          xlated.Texture2D.MipLevels = count > drop ? count - drop : 1;
-        }
-        pDesc = &xlated;
-      }
-    }
-
+    /* ml675: SRV mip translation now happens inside DeviceTexture, where the
+     * bias is owned and both a logical and a physical descriptor are kept. */
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateShaderResourceView(pDesc, ppSRView);
   }
 

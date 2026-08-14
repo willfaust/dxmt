@@ -127,7 +127,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
 #endif
     Subresource subresource;
     subresource.buffer = new Buffer(buf_len, pDevice->GetMTLDevice());
-    subresource.buffer->rename(subresource.buffer->allocate(buffer_flags));
+    subresource.buffer->rename(subresource.buffer->allocate(buffer_flags, "tex_dynamic:subresource"));
     subresource.dynamic = new DynamicBuffer(subresource.buffer.ptr(), buffer_flags);
     subresource.bytes_per_row = bpr;
     subresource.bytes_per_depth = bpi;

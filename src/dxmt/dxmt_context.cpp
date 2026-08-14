@@ -7,6 +7,7 @@
 #include "wsi_platform.hpp"
 #include <cstdint>
 #include <cfloat>
+#include "dxmt_mem_census.hpp"
 
 namespace dxmt {
 
@@ -39,6 +40,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
   dummy_cbuffer_info_.options = WMTResourceOptionCPUCacheModeWriteCombined | WMTResourceStorageModeShared |
                                 WMTResourceHazardTrackingModeUntracked;
   dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
+  mem_census_add(MEMOWN_CONTEXT, dummy_cbuffer_info_.length);  /* ml677 */
   std::memset(dummy_cbuffer_info_.memory.get(), 0, 65536);
   cpu_buffer_chunks_.emplace_back();
 };

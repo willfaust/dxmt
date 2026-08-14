@@ -5,6 +5,8 @@
 #include "util_math.hpp"
 #include <cstdint>
 #include <mutex>
+#include "dxmt_mem_census.hpp"
+#include "dxmt_bcn.hpp"
 
 namespace dxmt {
 
@@ -290,37 +292,131 @@ static void bc3_block(const uint8_t *blk, uint8_t out[64]) {
  * ROW OF BLOCKS); dst is tightly packed RGBA8 at width*4. Edge blocks are
  * decoded in full and clipped, which is what the BC spec requires for
  * non-multiple-of-4 dimensions. */
+/* Physical bytes per texel produced by each decode kind. */
+static inline uint32_t bc_decode_texel_size(int kind) {
+  switch (kind) {
+  case 4: case 14: return 1;   /* BC4 -> R8  */
+  case 5: case 15: return 2;   /* BC5 -> RG8 */
+  default:         return 4;   /* BC1/2/3/7 -> RGBA8 */
+  }
+}
+
 static void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
-                            uint32_t height, bool is_bc3) {
+                            uint32_t height, int kind) {
   const uint32_t bx_n = (width + 3) / 4, by_n = (height + 3) / 4;
-  const size_t blk_bytes = is_bc3 ? 16 : 8;
-  const size_t dst_pitch = (size_t)width * 4;
+  const size_t blk_bytes = (kind == 1 || kind == 4 || kind == 14) ? 8 : 16;
+  const uint32_t tsz = bc_decode_texel_size(kind);
+  const size_t dst_pitch = (size_t)width * tsz;
   uint8_t texels[64];
   for (uint32_t by = 0; by < by_n; by++) {
     const uint8_t *row = src + (size_t)by * src_pitch;
     for (uint32_t bx = 0; bx < bx_n; bx++) {
-      if (is_bc3) bc3_block(row + bx * blk_bytes, texels);
-      else        bc1_block(row + bx * blk_bytes, texels, /*punchthrough=*/true);
+      const uint8_t *b = row + bx * blk_bytes;
+      switch (kind) {
+      case 1:  bcn_bc1_block(b, texels, /*punchthrough=*/true); break;
+      case 2:  bcn_bc2_block(b, texels); break;
+      case 3:  bcn_bc3_block(b, texels); break;
+      case 4:  bcn_bc4_block(b, texels, false); break;
+      case 14: bcn_bc4_block(b, texels, true);  break;
+      case 5:  bcn_bc5_block(b, texels, false); break;
+      case 15: bcn_bc5_block(b, texels, true);  break;
+      case 7:  bcn_bc7_block(b, texels); break;
+      default: memset(texels, 0, sizeof(texels)); break;
+      }
       for (uint32_t ty = 0; ty < 4; ty++) {
         const uint32_t y = by * 4 + ty;
         if (y >= height) break;
         for (uint32_t tx = 0; tx < 4; tx++) {
           const uint32_t x = bx * 4 + tx;
           if (x >= width) break;
-          memcpy(dst + (size_t)y * dst_pitch + (size_t)x * 4, texels + (ty * 4 + tx) * 4, 4);
+          memcpy(dst + (size_t)y * dst_pitch + (size_t)x * tsz,
+                 texels + (size_t)(ty * 4 + tx) * tsz, tsz);
         }
       }
     }
   }
 }
 
+
+/* ml676: which REMAPPED formats came from a BC source we cannot decode yet, and
+ * what does one physical texel cost. Mirrors remap_unsupported_bc() in
+ * winemetal_unix.c -- BC4->R8, BC5->RG8, BC7->RGBA8, BC6H->RGBA16F. BC1/BC3
+ * also remap to RGBA8 but they DO decode, so they never reach here. */
+static inline bool bc_is_unsupported_src(enum WMTPixelFormat f) {
+  /* Test the SOURCE format: texture->pixelFormat() is still the BC format here
+   * (remap_unsupported_bc runs later, when the MTLTexture is created), which is
+   * exactly why bc_decode_kind can match on BC1/BC3 at all. */
+  switch (f) {
+  case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat:
+    return true;                 /* ml679: the only format still synthesised */
+  default:
+    return false;
+  }
+}
+
+/* Physical texel size AFTER remap_unsupported_bc: BC4->R8, BC5->RG8,
+ * BC6H->RGBA16F, BC7/BC2->RGBA8. */
+static inline uint32_t bc_fill_texel_size(enum WMTPixelFormat f) {
+  switch (f) {
+  case WMTPixelFormatBC4_RUnorm:  case WMTPixelFormatBC4_RSnorm:    return 1;
+  case WMTPixelFormatBC5_RGUnorm: case WMTPixelFormatBC5_RGSnorm:   return 2;
+  case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat: return 8;
+  default:                                                          return 4;
+  }
+}
+
+/* Deterministic, obviously-synthetic, and different per format so the screen
+ * names the culprit. Varies slightly per mip so mip selection is visible too. */
+static void bc_fill_pattern(enum WMTPixelFormat f, uint8_t *dst, uint32_t w, uint32_t h, uint32_t level) {
+  const uint32_t cell = 16u >> (level > 3 ? 3 : level);
+  for (uint32_t y = 0; y < h; y++) {
+    for (uint32_t x = 0; x < w; x++) {
+      const bool on = (((x / (cell ? cell : 1)) ^ (y / (cell ? cell : 1))) & 1u) != 0;
+      switch (f) {
+      case WMTPixelFormatBC4_RUnorm: case WMTPixelFormatBC4_RSnorm:
+        dst[(size_t)y * w + x] = on ? 0xC0 : 0x40;                    /* mid-grey mask */
+        break;
+      case WMTPixelFormatBC5_RGUnorm: case WMTPixelFormatBC5_RGSnorm: {
+        uint8_t *p = dst + ((size_t)y * w + x) * 2;
+        p[0] = 0x80; p[1] = 0x80;                                     /* flat normal */
+        break;
+      }
+      case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat: {
+        /* ml677 A/B: was (0.125, 0.5, 1.0) -- a strong blue. BC6H is Unity's
+         * sky and reflection probes, so that fill became the ambient light for
+         * the whole scene and everything read blue. Neutral grey (0.25) tests
+         * that directly: if the blue cast goes away, BC6H was the cause; if it
+         * survives, the tint is coming from somewhere else entirely. */
+        uint16_t *p = (uint16_t *)(dst + ((size_t)y * w + x) * 8);
+        p[0] = 0x3400; p[1] = 0x3400; p[2] = 0x3400; p[3] = 0x3C00;   /* neutral grey 0.25 */
+        break;
+      }
+      default: {
+        uint8_t *p = dst + ((size_t)y * w + x) * 4;
+        p[0] = on ? 0xFF : 0x00; p[1] = 0x00; p[2] = on ? 0xFF : 0x00; p[3] = 0xFF; /* magenta checks */
+        break;
+      }
+      }
+    }
+  }
+}
+
+/* ml679: 1=BC1 2=BC2 3=BC3 4=BC4u 5=BC5u 7=BC7 14=BC4s 15=BC5s. BC6H returns 0
+ * and is still handled by the deterministic fill above. */
 static inline int bc_decode_kind(enum WMTPixelFormat f) {
   switch (f) {
   case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB: return 1;
+  case WMTPixelFormatBC2_RGBA: case WMTPixelFormatBC2_RGBA_sRGB: return 2;
   case WMTPixelFormatBC3_RGBA: case WMTPixelFormatBC3_RGBA_sRGB: return 3;
+  case WMTPixelFormatBC4_RUnorm:  return 4;
+  case WMTPixelFormatBC4_RSnorm:  return 14;
+  case WMTPixelFormatBC5_RGUnorm: return 5;
+  case WMTPixelFormatBC5_RGSnorm: return 15;
+  case WMTPixelFormatBC7_RGBAUnorm: case WMTPixelFormatBC7_RGBAUnorm_sRGB: return 7;
   default: return 0;
   }
 }
+
 /* ===================== end ml654 BC1/BC3 -> RGBA8 DECODE ==================== */
 
 uint64_t
@@ -365,22 +461,75 @@ ResourceInitializer::initWithData(
    * the upload gets dropped. 3D is excluded — no BC volume textures observed, and
    * guessing at slice pitches here is how you get silent corruption. */
   std::unique_ptr<uint8_t[]> decoded;
+  /* ---- ml676: NEVER UPLOAD RAW BC BYTES AS UNCOMPRESSED TEXELS ----------
+   *
+   * remap_unsupported_bc() swaps every BC format for an uncompressed one on
+   * A15, but bc_decode_kind() only knows BC1 and BC3. BC4/BC5/BC6H/BC7 fell
+   * straight through this branch and were uploaded ANYWAY -- compressed block
+   * bytes written into a texture that Metal now believes is RGBA8/R8/RG8/
+   * RGBA16F.
+   *
+   * That is not merely ugly. The staging suballocation is sized from the
+   * COMPRESSED byte count while the copy is issued for the DECODED extent, so
+   * Metal reads past the allocation: 4x over for BC7, 4x for BC4 (1 byte/px
+   * physical vs 0.5 compressed), 8x for BC6H. It stays inside the 32MB staging
+   * block, but it crosses into neighbouring or stale texture contents -- an
+   * out-of-bounds read, and the source of the striped garbage seen in Book of
+   * the Dead's control overlay (a BC7 block-row is exactly one RGBA8 pixel row,
+   * so the data filled full width at quarter height).
+   *
+   * Until each format has a real decoder, synthesise a full-size deterministic
+   * pattern in the CORRECT physical format. Bounded, obviously synthetic, and
+   * diagnostic: if geometry lights up in these colours then missing BC formats
+   * are the whole story, and if it stays black the problem is elsewhere. */
+  if (!is_3d_tex && !device_.supportsBCTextureCompression() &&
+      bc_decode_kind(texture->pixelFormat()) == 0 && bc_is_unsupported_src(texture->pixelFormat())) {
+    /* ml679: BC1/BC2/BC3/BC4/BC5/BC7 all decode for real now, so only BC6H
+     * still reaches this fill. Keeping the path (rather than deleting it) is
+     * what guarantees no raw BC bytes are ever uploaded for a format we have
+     * not yet implemented -- that was a memory-safety bug, not a cosmetic one. */
+    const uint32_t fill_texel = bc_fill_texel_size(texture->pixelFormat());
+    const size_t out_bytes = (size_t)width_sub * height_sub * fill_texel;
+    decoded.reset(new (std::nothrow) uint8_t[out_bytes]);
+    if (!decoded) {
+      ERR("[bc-fill] ml676 OOM for ", width_sub, "x", height_sub, " -- upload SKIPPED (was unsafe)");
+      return 0;
+    }
+    bc_fill_pattern(texture->pixelFormat(), decoded.get(), width_sub, height_sub, level);
+    data = decoded.get();
+    block_size = 1u;
+    texel_size = fill_texel;
+    row_pitch = (size_t)width_sub * fill_texel;
+    depth_pitch = out_bytes;
+    static unsigned fn;
+    if (fn < 6 || (fn & 0xff) == 0)
+      ERR("[bc-fill] ml676 #", fn, " unsupported BC fmt=", (unsigned)texture->pixelFormat(), " ",
+          width_sub, "x", height_sub, " level=", level, " -> ", fill_texel, "B/texel pattern (",
+          out_bytes, "B). Raw-BC upload suppressed.");
+    fn++;
+  }
+
   const int bc_kind = bc_decode_kind(texture->pixelFormat());
   if (bc_kind && !is_3d_tex && !device_.supportsBCTextureCompression()) {
-    const size_t out_bytes = (size_t)width_sub * height_sub * 4;
+    const uint32_t out_texel = bc_decode_texel_size(bc_kind);
+    const size_t out_bytes = (size_t)width_sub * height_sub * out_texel;
     decoded.reset(new (std::nothrow) uint8_t[out_bytes]);
     if (decoded) {
-      bc_decode_image((const uint8_t *)data, row_pitch, decoded.get(), width_sub, height_sub,
-                      bc_kind == 3);
+      bc_decode_image((const uint8_t *)data, row_pitch, decoded.get(), width_sub, height_sub, bc_kind);
       data = decoded.get();
-      block_size = 1u;                 /* physical RGBA8 is not block-compressed */
-      texel_size = 4u;
-      row_pitch = (size_t)width_sub * 4;
+      block_size = 1u;                 /* decoded output is not block-compressed */
+      texel_size = out_texel;
+      row_pitch = (size_t)width_sub * out_texel;
       depth_pitch = out_bytes;
+      static const char *const kName[] = {
+        "?", "BC1", "BC2", "BC3", "BC4u", "BC5u", "?", "BC7",
+        "?", "?", "?", "?", "?", "?", "BC4s", "BC5s"
+      };
       static unsigned n;
-      if (n < 4 || (n & 0x7f) == 0)
-        ERR("[bc-decode] ml654 #", n, " ", (bc_kind == 3 ? "BC3" : "BC1"), " ", width_sub, "x",
-            height_sub, " level=", level, " slice=", slice, " -> RGBA8 ", out_bytes, "B");
+      if (n < 6 || (n & 0x1ff) == 0)
+        ERR("[bc-decode] ml679 #", n, " ", kName[bc_kind & 15], " ", width_sub, "x",
+            height_sub, " level=", level, " slice=", slice, " -> ", out_texel, "B/texel ",
+            out_bytes, "B");
       n++;
     } else {
       ERR("[bc-decode] ml654 OOM decoding ", width_sub, "x", height_sub, " — upload skipped");
@@ -537,6 +686,7 @@ ResourceInitializer::allocateZeroBuffer(size_t size) {
     buffer_info.memory.set(nullptr);
     buffer_info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;
     zero_buffer_ = device_.newBuffer(buffer_info);
+    mem_census_add(MEMOWN_INIT_UPLOAD, buffer_info.length);  /* ml677 */
     zero_buffer_size_ = size;
 
     fill->type = WMTBlitCommandFillBuffer;

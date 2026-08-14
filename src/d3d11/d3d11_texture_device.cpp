@@ -7,6 +7,7 @@
 #include "dxmt_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
+#include "config/config.hpp"   /* ml675: d3d11.mipClampBC */
 
 namespace dxmt {
 
@@ -17,6 +18,12 @@ class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
   Rc<Texture> underlying_texture_;
   Rc<RenamableTexturePool> renamable_;
+  /* ml675: top mip levels dropped from the PHYSICAL Metal texture. The D3D
+   * descriptor this object reports stays LOGICAL, so GetDesc keeps telling the
+   * application the size it asked for. ml670 got this wrong -- it handed the
+   * shrunken descriptor to the resource, so a 2048x2048 texture reported itself
+   * as 512x512 and any UI computing layout from GetDesc came out wrong. */
+  uint32_t mip_bias_ = 0;
   float min_lod = 0.0;
   D3DKMT_HANDLE local_kmt_ = 0;
   D3DKMT_HANDLE global_kmt_ = 0;
@@ -158,6 +165,24 @@ public:
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
       underlying_texture_(std::move(u_texture)), local_kmt_(localHandle), global_kmt_(globalHandle) {}
 
+  /* ml675: the bias lives on the resource, not in a process-global pointer map.
+   * ml670 keyed it on the COM pointer and never erased on destruction, so a
+   * reused address inherited a stale clamp. Ownership here makes that
+   * impossible by construction. */
+  uint32_t MipBias() const { return mip_bias_; }
+  void SetMipBias(uint32_t bias) { mip_bias_ = bias; }
+
+  /* Logical subresource -> physical, or ~0u when the level was clamped away.
+   * USAGE_DEFAULT legally permits UpdateSubresource/CopySubresourceRegion, and
+   * those indices shift when mips are dropped. Book of the Dead measured zero
+   * such calls, but "measured zero" is not "cannot happen". */
+  uint32_t TranslateSubresource(uint32_t logical, uint32_t logicalMips) const {
+    if (!mip_bias_) return logical;
+    uint32_t mip = logical % logicalMips, slice = logical / logicalMips;
+    if (mip < mip_bias_) return ~0u;                 /* level does not exist physically */
+    return (mip - mip_bias_) + slice * (logicalMips - mip_bias_);
+  }
+
   ~DeviceTexture() {
     if (local_kmt_) {
       D3DKMT_DESTROYALLOCATION destroy = {};
@@ -250,8 +275,36 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    /* ml675: TWO descriptors. finalDesc is LOGICAL and is what the view reports
+     * from GetDesc; physDesc is the translated copy that addresses the smaller
+     * Metal texture. Storing the translated one in the COM view would just move
+     * ml670's abstraction leak from resource GetDesc to SRV GetDesc.
+     *
+     * A null caller descriptor has already been expanded by
+     * ExtractEntireResourceViewDescription into a full LOGICAL view, so it needs
+     * translating too -- it is not a pass-through case. */
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 physDesc = finalDesc;
+    uint32_t physMips = this->desc.MipLevels;
+    if (mip_bias_) {
+      physMips = this->desc.MipLevels > mip_bias_ ? this->desc.MipLevels - mip_bias_ : 1;
+      uint32_t most = physDesc.Texture2D.MostDetailedMip;
+      uint32_t count = physDesc.Texture2D.MipLevels;
+      physDesc.Texture2D.MostDetailedMip = most > mip_bias_ ? most - mip_bias_ : 0;
+      if (count != (uint32_t)-1) {
+        uint32_t drop = most < mip_bias_ ? mip_bias_ - most : 0;
+        physDesc.Texture2D.MipLevels = count > drop ? count - drop : 1;
+      }
+      if (physDesc.Texture2D.MostDetailedMip >= physMips) {
+        static uint32_t oob_n;
+        if (oob_n++ < 8)
+          ERR("[mip-clamp] ml675 SRV MostDetailedMip ", physDesc.Texture2D.MostDetailedMip,
+              " >= physical mips ", physMips, " after bias ", mip_bias_, " -- clamping");
+        physDesc.Texture2D.MostDetailedMip = physMips - 1;
+        physDesc.Texture2D.MipLevels = 1;
+      }
+    }
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->underlying_texture_.ptr(), finalDesc, descriptor
+            this->m_parent, physMips, arraySize, this->underlying_texture_.ptr(), physDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture SRV");
       return E_FAIL;
@@ -363,6 +416,14 @@ struct SharedResourceData {
   } desc;
 };
 
+
+/* ml675: BC formats DXGI-wise. Kept local -- the census copy in d3d11_device.cpp
+ * lives in an anonymous namespace and is not linkable from here. */
+static inline bool IsBCFormatForClamp(uint32_t f) {
+  return (f >= 70 && f <= 84) ||    /* BC1..BC5 incl. typeless/sRGB */
+         (f >= 94 && f <= 99);      /* BC6H, BC7 */
+}
+
 template <typename tag>
 HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
                                     const typename tag::DESC1 *pDesc,
@@ -373,8 +434,50 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDesc, &finalDesc, &info))) {
     return E_INVALIDARG;
   }
+
+  /* ---- ml675: PHYSICAL mip clamp, decided here rather than in the device ----
+   *
+   * A15 cannot sample BC, so BC formats are decoded to RGBA8 at upload and cost
+   * 4-8x their compressed size. Dropping top mips is the cheapest way back under
+   * the jetsam limit.
+   *
+   * This function already had the right abstraction: finalDesc is the LOGICAL
+   * normalised descriptor the resource reports, and `info` describes the Metal
+   * texture. ml670 clamped one layer up in CreateTexture2D1 and passed the
+   * shrunken descriptor onward, which made GetDesc lie to the application.
+   * Eligibility and the clamp amount are computed from the normalised LOGICAL
+   * descriptor; only `info` and the upload loop see reduced numbers. */
+  uint32_t mip_bias = 0;
+  typename tag::DESC1 physDesc = finalDesc;
+  if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
+    static int cached_clamp = -1;
+    if (cached_clamp < 0)
+      cached_clamp = std::max(0, std::min(4, Config::getInstance().getOption<int>("d3d11.mipClampBC", 0)));
+    if (cached_clamp && pInitialData && IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
+        (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
+        finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
+        finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
+        finalDesc.Width >= 8 && finalDesc.Height >= 8) {
+      mip_bias = std::min((uint32_t)cached_clamp, finalDesc.MipLevels - 1);
+      while (mip_bias && ((finalDesc.Width >> mip_bias) < 4 || (finalDesc.Height >> mip_bias) < 4))
+        mip_bias--;
+      if (mip_bias) {
+        physDesc.Width     = std::max(1u, finalDesc.Width  >> mip_bias);
+        physDesc.Height    = std::max(1u, finalDesc.Height >> mip_bias);
+        physDesc.MipLevels = finalDesc.MipLevels - mip_bias;
+        info.width              = physDesc.Width;
+        info.height             = physDesc.Height;
+        info.mipmap_level_count = physDesc.MipLevels;
+        static uint32_t clamp_n;
+        if (++clamp_n <= 8 || (clamp_n % 256) == 0)
+          ERR("[mip-clamp] ml675 #", clamp_n, " logical ", finalDesc.Width, "x", finalDesc.Height,
+              " mips ", finalDesc.MipLevels, " -> physical ", physDesc.Width, "x", physDesc.Height,
+              " mips ", physDesc.MipLevels, " arr=", finalDesc.ArraySize);
+      }
+    }
+  }
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
-                            !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+                            !(physDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
 
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
@@ -382,12 +485,18 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   auto initialize = [&](Rc<TextureAllocation> &&allocation) {
     texture->rename(std::move(allocation));
     if (!pInitialData) {
-      for (auto sub : EnumerateSubresources(finalDesc)) {
+      for (auto sub : EnumerateSubresources(physDesc)) {
         initializer.initWithZero(texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel);
       }
     } else {
-      for (auto sub : EnumerateSubresources(finalDesc)) {
-        auto &data = pInitialData[sub.SubresourceId];
+      for (auto sub : EnumerateSubresources(physDesc)) {
+        /* ml675: subresource index is mip + slice * MipLevels, so a clamp shifts
+         * EVERY index. Walk the PHYSICAL subresources but read the caller's
+         * LOGICAL array -- correct for arrays and cubes alike, since D3D counts
+         * cube faces in ArraySize. A flat pointer bump would corrupt every slice
+         * after the first. */
+        auto &data = pInitialData[(sub.MipLevel + mip_bias) +
+                                  (size_t)sub.ArraySlice * finalDesc.MipLevels];
         initializer.initWithData(
             texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel, data.pSysMem, data.SysMemPitch,
             data.SysMemSlicePitch
@@ -451,10 +560,12 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     // TODO: handle keyed mutex
 
     initialize(std::move(allocation));
-    *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
-        ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
-                                   create.hGlobalShare, pDevice))
-    );
+    {
+      auto *tex = ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
+                                             create.hGlobalShare, pDevice));
+      tex->SetMipBias(mip_bias);
+      *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(tex);
+    }
     return S_OK;
   }
 
@@ -465,12 +576,14 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   if (single_subresource && (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
     Rc<RenamableTexturePool> renamable = new RenamableTexturePool(texture.ptr(), 32, flags);
     initialize(renamable->getNext(0));
-    *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
-        ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(renamable), pDevice)));
+    auto *tex = ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(renamable), pDevice));
+    tex->SetMipBias(mip_bias);
+    *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(tex);
   } else {
     initialize(texture->allocate(flags));
-    *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
-        ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
+    auto *tex = ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice));
+    tex->SetMipBias(mip_bias);
+    *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(tex);
   }
   return S_OK;
 }

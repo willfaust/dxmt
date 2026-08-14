@@ -6,6 +6,7 @@
 #include "util_math.hpp"
 #include <mutex>
 #include <queue>
+#include "dxmt_mem_census.hpp"
 
 namespace dxmt {
 
@@ -96,11 +97,14 @@ public:
     void *mapped_address;
 
     ~Block() {
+      mem_census_sub(MEMOWN_STAGING_RING, census_bytes);   /* ml677 */
+      census_bytes = 0;
       if (mapped_address) {
         free(mapped_address);
         mapped_address = nullptr;
       }
     };
+    uint64_t census_bytes = 0;                             /* ml677 */
 
     Block() = default;
 
@@ -109,6 +113,8 @@ public:
       buffer = std::move(move.buffer);
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
+      census_bytes = move.census_bytes;                    /* ml677: move the debt too */
+      move.census_bytes = 0;
       move.mapped_address = nullptr;
     };
   };
@@ -123,6 +129,8 @@ public:
     info.length = block_size;
     block.buffer = device_.newBuffer(info);
     block.gpu_address = info.gpu_address;
+    block.census_bytes = block_size;                       /* ml677 */
+    mem_census_add(MEMOWN_STAGING_RING, block_size);
     return block;
   };
 

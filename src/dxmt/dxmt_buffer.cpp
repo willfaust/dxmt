@@ -6,6 +6,7 @@
 #include "wsi_platform.hpp"
 #include <cassert>
 #include <mutex>
+#include "dxmt_mem_census.hpp"
 
 namespace dxmt {
 
@@ -27,12 +28,28 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_.memory.set(placed_buffer);
   }
   obj_ = device.newBuffer(info_);
+  g_live_bufalloc.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
+  census_bytes_ = info_.length;                            /* ml677 */
+  census_storage_ = ((uint32_t)info_.options >> 4) & 3;    /* ml678 storage mode */
+  census_flags_ = flags_.raw();
+  /* ml682: level 1 = whoever called Buffer::allocate, which is the interesting
+   * frame (level 0 would just be Buffer::allocate itself, identical for all). */
+  /* ml683: charging moved to Buffer::allocate, where the SITE LABEL is known.
+   * Allocations created outside that path stay uncharged and show up as the
+   * gap between mem-census buffer live and the sum of the site rows. */
+  mem_census_add(MEMOWN_BUFFER, census_bytes_);
+  mem_census_buffer_detail(census_bytes_, census_storage_, census_flags_, 1);
+  mem_census_set_device(&device);
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
   depkey = EncoderDepSet::generateNewKey(global_buffer_seq.fetch_add(1));
 };
 
 BufferAllocation::~BufferAllocation() {
+  g_live_bufalloc.destroyed.fetch_add(1, std::memory_order_relaxed);  /* ml684 */
+  mem_census_sub(MEMOWN_BUFFER, census_bytes_);            /* ml677 */
+  if (census_site_) buf_site_sub((uint64_t)(uintptr_t)census_site_, census_bytes_);  /* ml683 */
+  mem_census_buffer_detail(census_bytes_, census_storage_, census_flags_, 0);  /* ml678 */
   if (placed_buffer) {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
@@ -129,7 +146,7 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
 }
 
 Rc<BufferAllocation>
-Buffer::allocate(Flags<BufferAllocationFlag> flags) {
+Buffer::allocate(Flags<BufferAllocationFlag> flags, const char *site) {
   WMTResourceOptions options = WMTResourceStorageModeShared;
   if (flags.test(BufferAllocationFlag::GpuReadonly)) {
     options |= WMTResourceHazardTrackingModeUntracked;
@@ -147,11 +164,17 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   info.memory.set(0);
   info.length = length_;
   info.options = options;
-  return new BufferAllocation(device_, info, flags);
+  {
+    auto *ba = new BufferAllocation(device_, info, flags);
+    ba->census_site_ = site;                       /* ml683 */
+    buf_site_add((uint64_t)(uintptr_t)site, ba->census_bytes_);
+    return ba;
+  }
 };
 
 Rc<BufferAllocation>
 Buffer::rename(Rc<BufferAllocation> &&newAllocation) {
+  g_mem_census.buf_renames.fetch_add(1, std::memory_order_relaxed);   /* ml678 */
   Rc<BufferAllocation> old = std::move(current_);
   current_ = std::move(newAllocation);
   return old;

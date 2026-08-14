@@ -330,7 +330,29 @@ static bool query_bc_support(void) {
 
 MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
   enum WMTPixelFormat stripped = (enum WMTPixelFormat)ORIGINAL_FORMAT(format);
-  stripped = remap_unsupported_bc(stripped, query_bc_support());
+  {
+    /* ml678: prove sRGB survives the BC remap instead of reading the switch and
+     * assuming. A BC1_sRGB landing in a linear RGBA8 would wash every albedo
+     * out -- one candidate for the flat look that remains after the BC6H fix. */
+    enum WMTPixelFormat before = stripped;
+    stripped = remap_unsupported_bc(stripped, query_bc_support());
+    if (before != stripped) {
+      static struct { unsigned s, d, n; } tbl[24];
+      static unsigned tn;
+      unsigned i;
+      for (i = 0; i < tn; i++) if (tbl[i].s == before && tbl[i].d == stripped) break;
+      if (i == tn && tn < 24) { tbl[tn].s = before; tbl[tn].d = stripped; tbl[tn].n = 0; tn++; }
+      if (i < 24) {
+        tbl[i].n++;
+        if (tbl[i].n == 1 || (tbl[i].n % 512) == 0)
+          fprintf(stderr, "[bc-remap] ml678 %u -> %u  n=%u  (sRGB-in=%d sRGB-out=%d)\n",
+                  before, stripped, tbl[i].n,
+                  (int)(before == WMTPixelFormatBC1_RGBA_sRGB || before == WMTPixelFormatBC2_RGBA_sRGB ||
+                        before == WMTPixelFormatBC3_RGBA_sRGB || before == WMTPixelFormatBC7_RGBAUnorm_sRGB),
+                  (int)(stripped == WMTPixelFormatRGBA8Unorm_sRGB));
+      }
+    }
+  }
   return (MTLPixelFormat)stripped;
 }
 

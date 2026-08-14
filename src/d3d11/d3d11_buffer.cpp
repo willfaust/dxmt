@@ -93,7 +93,7 @@ public:
       flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
     }
-    auto allocation = buffer_->allocate(flags);
+    auto allocation = buffer_->allocate(flags, "d3d11_buffer:CreateBuffer");
     auto &initializer = device->GetDXMTDevice().queue().initializer;
     if (pInitialData) {
       allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
@@ -251,7 +251,7 @@ public:
       viewElementWidth = finalDesc.Buffer.NumElements * (desc.StructureByteStride >> 2);
       if (finalDesc.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) {
         counter = new dxmt::Buffer(sizeof(uint32_t), m_parent->GetMTLDevice());
-        counter->rename(counter->allocate(BufferAllocationFlag::GpuManaged));
+        counter->rename(counter->allocate(BufferAllocationFlag::GpuManaged, "d3d11_buffer:counter"));
       }
     } else if (finalDesc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
       if (!allow_raw_view)

@@ -44,6 +44,12 @@ struct BufferView {
 };
 
 class BufferAllocation : public Allocation {
+public:
+  uint64_t census_bytes_ = 0;   /* ml677 */
+  uint32_t census_storage_ = 0; /* ml678 */
+  uint32_t census_flags_ = 0;   /* ml678 */
+  const char *census_site_ = nullptr;   /* ml683: creation site label */
+
   friend class Buffer;
 
 public:
@@ -133,7 +139,11 @@ public:
     return current_.ptr();
   }
 
-  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  /* ml683: __builtin_return_address(1) gave systematic but UNVERIFIABLE
+   * addresses -- nearest-symbol resolved 998MB to a pipeline constructor,
+   * which makes no sense. An explicit literal at each call site removes the
+   * guesswork entirely. */
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, const char *site = "?");
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

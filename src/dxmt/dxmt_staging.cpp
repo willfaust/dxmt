@@ -80,7 +80,7 @@ StagingResource::allocate(uint64_t coherent_seq_id) {
 #ifdef __i386__
     flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
-    buffer_pool.push_back(buffer_->allocate(flags));
+    buffer_pool.push_back(buffer_->allocate(flags, "StagingResource::pool"));
     ret = buffer_pool.size() - 1;
   }
   return ret;
