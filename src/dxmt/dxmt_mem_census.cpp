@@ -151,10 +151,17 @@ dyn_census_report(void) {
  * and then never implemented it, so the census reported REQUESTED capacity while
  * reading as though it were physical footprint. Metal's own number is the only
  * thing that reconciles our owner totals against tag 100. */
-static WMT::Device *g_census_device;
+/* ml696: ml678 stored &device -- a pointer to a BY-VALUE CONSTRUCTOR PARAMETER,
+ * so it dangled the moment BufferAllocation's constructor returned. Every census
+ * report since then called currentAllocatedSize() through a stack address that
+ * had been reused, which is why this line always printed 0MB and why Thumper
+ * died on a SIGTRAP inside a system library on a non-guest thread. WMT::Device
+ * is a thin handle wrapper, so hold it by VALUE. */
+static WMT::Device g_census_device {};
+static bool g_census_device_valid = false;
 
 void
-mem_census_set_device(WMT::Device *d) { g_census_device = d; }
+mem_census_set_device(WMT::Device d) { g_census_device = d; g_census_device_valid = true; }
 
 void
 mem_census_report(const char *why) {
@@ -164,7 +171,7 @@ mem_census_report(const char *why) {
     tp += g_mem_census.peak[i].load(std::memory_order_relaxed);
     tr += g_mem_census.requested[i].load(std::memory_order_relaxed);
   }
-  uint64_t metal = g_census_device ? g_census_device->currentAllocatedSize() : 0;
+  uint64_t metal = g_census_device_valid ? g_census_device.currentAllocatedSize() : 0;
   ERR("[mem-census] ml678 why=", why, " LIVE=", tl >> 20, "MB peak-sum=", tp >> 20,
       "MB requested=", tr >> 20, "MB | METAL currentAllocatedSize=", metal >> 20,
       "MB (authoritative; our LIVE is requested capacity, not residency)");

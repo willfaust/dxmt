@@ -39,7 +39,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
    * gap between mem-census buffer live and the sum of the site rows. */
   mem_census_add(MEMOWN_BUFFER, census_bytes_);
   mem_census_buffer_detail(census_bytes_, census_storage_, census_flags_, 1);
-  mem_census_set_device(&device);
+  mem_census_set_device(device);   /* ml696 */
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
   depkey = EncoderDepSet::generateNewKey(global_buffer_seq.fetch_add(1));

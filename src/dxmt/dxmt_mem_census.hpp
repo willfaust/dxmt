@@ -201,7 +201,7 @@ mem_census_buffer_detail(uint64_t bytes, uint32_t storage_mode, uint32_t flag_bi
 }
 
 void mem_census_report(const char *why);
-void mem_census_set_device(WMT::Device *d);   /* ml678 */
+void mem_census_set_device(WMT::Device d);    /* ml696: BY VALUE, never a pointer */
 
 inline void
 mem_census_add(MemOwner o, uint64_t bytes) {
