@@ -44,6 +44,21 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   Logger::info(
       str::format("Maximum supported feature level: ", maxFeatureLevel));
 
+  /* iOS-Mythic ml709: report the GPU's real capabilities once, at device creation.
+   *
+   * A15 cannot sample BC at all (supportsBCTextureCompression = NO), which is why
+   * remap_unsupported_bc() swaps BC->RGBA8 and the upload is dropped. Whether newer
+   * Apple GPUs lift that is unknown to us, and guessing decides whether BCn transcode
+   * is mandatory or dead weight on those parts. Log it rather than infer it. */
+  {
+    auto dev = dxgi_adapter->GetMTLDevice();
+    Logger::err(str::format(
+        "[gpu-caps] ml709 BC=", dev.supportsBCTextureCompression() ? 1 : 0,
+        " Apple7=", dev.supportsFamily(WMTGPUFamilyApple7) ? 1 : 0,
+        " Apple8=", dev.supportsFamily(WMTGPUFamilyApple8) ? 1 : 0,
+        " Apple9=", dev.supportsFamily(WMTGPUFamilyApple9) ? 1 : 0));
+  }
+
   for (uint32_t flId = 0; flId < FeatureLevels; flId++) {
     minFeatureLevel = pFeatureLevels[flId];
 
