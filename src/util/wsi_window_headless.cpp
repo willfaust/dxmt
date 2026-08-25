@@ -7,7 +7,7 @@
  *
  * See <https://github.com/doitsujin/dxvk/blob/master/LICENSE>
  *
- * iOS-Mythic 2026-05-13: Synthetic monitor / no-op fullscreen so Thumper-
+ * iOS-Madeira 2026-05-13: Synthetic monitor / no-op fullscreen so Thumper-
  * style games can negotiate display mode without DISP_CHANGE_BADMODE.
  * Pairs with wsi_monitor_headless.cpp (1024x768 @ 60Hz synthetic monitor).
  */
@@ -24,7 +24,7 @@ namespace dxmt::wsi {
 static HMONITOR const kSyntheticMonitor = reinterpret_cast<HMONITOR>(1);
 
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
-  /* iOS-Mythic 2026-07-07 (task #24): report the REAL client size (user32
+  /* iOS-Madeira 2026-07-07 (task #24): report the REAL client size (user32
    * works fine now) so swapchains match the window instead of a hardcoded
    * 1024x768 that predates the 960x540 virtual desktop. Fall back to the
    * screen size if the window query fails. */

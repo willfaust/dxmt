@@ -44,7 +44,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   Logger::info(
       str::format("Maximum supported feature level: ", maxFeatureLevel));
 
-  /* iOS-Mythic ml709: report the GPU's real capabilities once, at device creation.
+  /* iOS-Madeira ml709: report the GPU's real capabilities once, at device creation.
    *
    * A15 cannot sample BC at all (supportsBCTextureCompression = NO), which is why
    * remap_unsupported_bc() swaps BC->RGBA8 and the upload is dropped. Whether newer

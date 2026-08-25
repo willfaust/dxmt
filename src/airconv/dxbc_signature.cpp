@@ -168,7 +168,7 @@ void handle_signature_vs(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+      /* iOS-Madeira 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
        * wiring it through airconv is a larger change. Silently drop the
        * output — culling is a rasterizer optimization, so omitting it
        * just means a few extra primitives reach the fragment stage. The
@@ -844,7 +844,7 @@ void handle_signature_ds(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+      /* iOS-Madeira 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
        * wiring it through airconv is a larger change. Silently drop the
        * output — culling is a rasterizer optimization, so omitting it
        * just means a few extra primitives reach the fragment stage. The
@@ -1073,7 +1073,7 @@ handle_signature_gs(
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE:
-      /* iOS-Mythic 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
+      /* iOS-Madeira 2026-05-13: Metal 2.4+ exposes [[cull_distance]] but
        * wiring it through airconv is a larger change. Silently drop the
        * output — culling is a rasterizer optimization, so omitting it
        * just means a few extra primitives reach the fragment stage. The

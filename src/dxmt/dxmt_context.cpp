@@ -695,7 +695,7 @@ std::unique_ptr<VisibilityResultReadback>
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
 
-  /* iOS-Mythic 2026-07-03: drain autoreleased thunk objects once per flush.
+  /* iOS-Madeira 2026-07-03: drain autoreleased thunk objects once per flush.
    * Everything created through the winemetal unix thunks in this function —
    * render/compute/blit encoders, and critically the CAMetalDrawable from
    * Presenter::encodeCommands — is returned autoreleased onto a Wine pthread
@@ -913,7 +913,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto drawable = data->presenter->encodeCommands(cmdbuf, {}, data->backbuffer, data->metadata);
       auto t1 = clock::now();
       currentFrameStatistics().drawable_blocking_interval += (t1 - t0);
-      /* iOS-Mythic 2026-07-03 EXPERIMENT: always plain presentDrawable.
+      /* iOS-Madeira 2026-07-03 EXPERIMENT: always plain presentDrawable.
        * presentDrawableAfterMinimumDuration schedules each frame relative
        * to the PREVIOUS frame's completed on-glass presentation. On iOS 27
        * our layer's presentations only complete when the render server is

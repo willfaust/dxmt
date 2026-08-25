@@ -732,7 +732,7 @@ public:
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
 
-    /* iOS-Mythic 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
+    /* iOS-Madeira 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
      * ceiling. Splits each frame into time spent INSIDE Present1 (our
      * present path: SyncFrame wait, Commit, PresentBoundary) vs OUTSIDE
      * (game sim/render/its own frame limiter). gap≈50ms with inside≈0 ⇒
@@ -740,24 +740,24 @@ public:
      * Also logs the SyncInterval the game passes (3 @60Hz would = 20). */
     {
       auto now = std::chrono::steady_clock::now();
-      if (mythic_gap_last_entry_.time_since_epoch().count() != 0) {
-        double gap_ms = std::chrono::duration<double, std::milli>(now - mythic_gap_last_entry_).count();
-        mythic_gap_sum_ms_ += gap_ms;
-        mythic_gap_max_ms_ = std::max(mythic_gap_max_ms_, gap_ms);
+      if (madeira_gap_last_entry_.time_since_epoch().count() != 0) {
+        double gap_ms = std::chrono::duration<double, std::milli>(now - madeira_gap_last_entry_).count();
+        madeira_gap_sum_ms_ += gap_ms;
+        madeira_gap_max_ms_ = std::max(madeira_gap_max_ms_, gap_ms);
       }
-      mythic_gap_last_entry_ = now;
-      mythic_gap_sync_min_ = std::min(mythic_gap_sync_min_, SyncInterval);
-      mythic_gap_sync_max_ = std::max(mythic_gap_sync_max_, SyncInterval);
-      if ((++mythic_gap_count_ % 64) == 0) {
+      madeira_gap_last_entry_ = now;
+      madeira_gap_sync_min_ = std::min(madeira_gap_sync_min_, SyncInterval);
+      madeira_gap_sync_max_ = std::max(madeira_gap_sync_max_, SyncInterval);
+      if ((++madeira_gap_count_ % 64) == 0) {
         Logger::info(std::format(
             "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
             "inside_max={:.1f}ms sync_interval={}..{}",
-            mythic_gap_count_, mythic_gap_sum_ms_ / 64.0, mythic_gap_max_ms_,
-            mythic_inside_sum_ms_ / 64.0, mythic_inside_max_ms_,
-            mythic_gap_sync_min_, mythic_gap_sync_max_));
-        mythic_gap_sum_ms_ = 0; mythic_gap_max_ms_ = 0;
-        mythic_inside_sum_ms_ = 0; mythic_inside_max_ms_ = 0;
-        mythic_gap_sync_min_ = ~0u; mythic_gap_sync_max_ = 0;
+            madeira_gap_count_, madeira_gap_sum_ms_ / 64.0, madeira_gap_max_ms_,
+            madeira_inside_sum_ms_ / 64.0, madeira_inside_max_ms_,
+            madeira_gap_sync_min_, madeira_gap_sync_max_));
+        madeira_gap_sum_ms_ = 0; madeira_gap_max_ms_ = 0;
+        madeira_inside_sum_ms_ = 0; madeira_inside_max_ms_ = 0;
+        madeira_gap_sync_min_ = ~0u; madeira_gap_sync_max_ = 0;
       }
     }
 
@@ -846,9 +846,9 @@ public:
 
     {
       double inside_ms = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - mythic_gap_last_entry_).count();
-      mythic_inside_sum_ms_ += inside_ms;
-      mythic_inside_max_ms_ = std::max(mythic_inside_max_ms_, inside_ms);
+          std::chrono::steady_clock::now() - madeira_gap_last_entry_).count();
+      madeira_inside_sum_ms_ += inside_ms;
+      madeira_inside_max_ms_ = std::max(madeira_inside_max_ms_, inside_ms);
     }
 
     return hr;
@@ -912,19 +912,19 @@ public:
         std::min(frame.clear_pass_count - frame.clear_pass_optimized, 999u), std::min(frame.clear_pass_optimized, 99u)
     ));
 
-    /* iOS-Mythic 2026-07-03: dump the same frame statistics to the log every
+    /* iOS-Madeira 2026-07-03: dump the same frame statistics to the log every
      * 64 frames — the HUD is invisible without MTL_HUD_ENABLED, and these
      * numbers split the measured ~10-12ms-per-draw frame cost into
      * game/encode/commit/GPU-sync so the bottleneck is attributable from a
      * pulled device log alone. Averages are per-frame, in ms. */
     {
-      static uint64_t mythic_stats_frame = 0;
-      if ((++mythic_stats_frame % 64) == 0) {
+      static uint64_t madeira_stats_frame = 0;
+      if ((++madeira_stats_frame % 64) == 0) {
         Logger::info(std::format(
             "[FRAME_STATS] #{} cmdbufs={} commit_avg={:.2f}ms sync_cnt={} sync_avg={:.2f}ms "
             "event_stall_max={} latency_avg={:.2f}ms enc_prep={:.2f}ms enc_flush={:.2f}ms "
             "drawable_block={:.2f}ms renderpass={}+{} clear={}+{}",
-            mythic_stats_frame, frame.command_buffer_count,
+            madeira_stats_frame, frame.command_buffer_count,
             average.commit_interval.count() / 1000000.0,
             frame.sync_count,
             average.sync_interval.count() / 1000000.0,
@@ -1109,11 +1109,11 @@ private:
 
   /* [PRESENT_GAP] accumulators — Present1 is only called from the game
    * thread, so plain members are fine. */
-  std::chrono::steady_clock::time_point mythic_gap_last_entry_{};
-  uint64_t mythic_gap_count_ = 0;
-  double mythic_gap_sum_ms_ = 0, mythic_gap_max_ms_ = 0;
-  double mythic_inside_sum_ms_ = 0, mythic_inside_max_ms_ = 0;
-  UINT mythic_gap_sync_min_ = ~0u, mythic_gap_sync_max_ = 0;
+  std::chrono::steady_clock::time_point madeira_gap_last_entry_{};
+  uint64_t madeira_gap_count_ = 0;
+  double madeira_gap_sum_ms_ = 0, madeira_gap_max_ms_ = 0;
+  double madeira_inside_sum_ms_ = 0, madeira_inside_max_ms_ = 0;
+  UINT madeira_gap_sync_min_ = ~0u, madeira_gap_sync_max_ = 0;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   HWND hWnd;
   HMONITOR monitor_;
@@ -1144,7 +1144,7 @@ CreateSwapChain(
     return DXGI_ERROR_INVALID_CALL;
   InitReturnPtr(ppSwapChain);
 
-  /* Mythic-iOS: Wine runs the game as a thread inside the host app, so the
+  /* Madeira-iOS: Wine runs the game as a thread inside the host app, so the
    * HWND's "process" and GetCurrentProcess() can legitimately disagree in
    * ways that don't map to a real cross-process scenario. Skip the check. */
 

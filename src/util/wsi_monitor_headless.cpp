@@ -7,7 +7,7 @@
  *
  * See <https://github.com/doitsujin/dxvk/blob/master/LICENSE>
  *
- * iOS-Mythic note 2026-05-13: Was all-nullptr stub which caused
+ * iOS-Madeira note 2026-05-13: Was all-nullptr stub which caused
  * IDXGIAdapter::EnumOutputs to return DXGI_ERROR_NOT_FOUND. Thumper
  * then stored NULL in a global IDXGIOutput slot and crashed calling
  * vtable[7] (GetDesc) through NULL. Implements a synthetic single
@@ -23,7 +23,7 @@ namespace dxmt::wsi {
  * dereference HMONITOR. */
 static HMONITOR const kSyntheticMonitor = reinterpret_cast<HMONITOR>(1);
 
-/* iOS-Mythic 2026-07-07 (task #24): the hardcoded 1024x768 predates the
+/* iOS-Madeira 2026-07-07 (task #24): the hardcoded 1024x768 predates the
  * 960x540 virtual desktop — user32 (GetSystemMetrics/GetMonitorInfo) and
  * DXGI disagreed on the screen size, games booted at a mode that crops on
  * the desktop, and Thumper's video-settings page fataled (ExitProcess -1)
