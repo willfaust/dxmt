@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cfloat>
 #include "dxmt_mem_census.hpp"
+#include "config/config.hpp"   /* ml754 */
 
 namespace dxmt {
 
@@ -807,7 +808,36 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       encoder.setVertexBuffer(gpu_buffer_, 0, 30);
       encoder.setFragmentBuffer(gpu_buffer_, 0, 29);
       encoder.setFragmentBuffer(gpu_buffer_, 0, 30);
-      if (data->use_geometry || data->use_tessellation) {
+      /* ml754: SKIP MESH BINDINGS WHEN THE DEVICE HAS NO MESH TRANSPORT.
+       *
+       * setObjectBuffer/setMeshBuffer are how DXMT feeds its object/mesh
+       * lowering of D3D11 geometry shaders and tessellation. Apple's
+       * PARAVIRTUAL Metal device implements none of it -- no mesh PSO creation,
+       * no mesh encoder methods, no APV command packets -- so this line reaches
+       * Metal's abstract selector and raises NSInvalidArgumentException, which
+       * nobody catches and libc++abi turns into a process abort. That is what
+       * killed a UE4 title on the research VM after it had already loaded
+       * assets and gone to a black screen.
+       *
+       * ⚠️ respondsToSelector: answers YES here -- Metal DECLARES the selector
+       * even though the paravirtual class does not implement it -- so runtime
+       * probing cannot gate this. Opt in explicitly with
+       * d3d11.noMeshShaders=1 instead, which leaves every real device
+       * untouched.
+       *
+       * Skipping the BINDINGS stops the abort; the draw itself will render
+       * nothing useful, which is the point -- it tells us whether the affected
+       * draws even matter for reaching a menu before anyone invests in the
+       * compute fallback. */
+      static const int no_mesh =
+          Config::getInstance().getOption<int>("d3d11.noMeshShaders", 0);
+      if (no_mesh && (data->use_geometry || data->use_tessellation)) {
+        static std::atomic<uint32_t> skipped{0};
+        uint32_t n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & 0x3FF) == 0)
+          ERR("[mesh-skip] ml754 suppressed ", n, " mesh-bound draw setups (",
+              data->use_tessellation ? "tessellation" : "geometry", ")");
+      } else if (data->use_geometry || data->use_tessellation) {
         encoder.setObjectBuffer(gpu_buffer_, 0, 16);
         encoder.setObjectBuffer(gpu_buffer_, 0, 21); // draw arguments
         if (data->use_tessellation) {

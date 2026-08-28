@@ -149,6 +149,15 @@ public:
           device_->GetMTLDevice().newRenderPipelineState(info, err);
     }
     if (state_rasterization_ == nullptr) {
+      /* ml754: classify -- see the GEOMETRY counterpart in
+       * d3d11_pipeline_gs.cpp. Tessellation needs hull, tess-coord, domain and
+       * compaction stages, so it is a far larger fallback to build than the
+       * geometry path; this counter decides whether it is required at all. */
+      {
+        static std::atomic<uint32_t> n{0};
+        ERR("[mesh-fail] ml754 kind=TESSELLATION #",
+            n.fetch_add(1, std::memory_order_relaxed) + 1);
+      }
       ERR("Failed to create tessellation raster PSO: ",
           err.description().getUTF8String());
     }

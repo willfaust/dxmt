@@ -114,7 +114,24 @@ public:
     state_mesh_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
 
     if (state_mesh_ == nullptr) {
-      ERR("Failed to create mesh PSO: ", err.description().getUTF8String());
+      /* ml754: say WHICH stage needed the mesh pipeline.
+       *
+       * DXMT lowers D3D11 geometry shaders AND tessellation onto Metal
+       * object/mesh shaders, and the paravirtual Metal device in the research
+       * VM implements neither -- not merely hidden behind capability reporting:
+       * AppleParavirtDevice has no mesh PSO creation and
+       * AppleParavirtRenderCommandEncoder has no setObjectBuffer/setMeshBuffer,
+       * so the APV transport carries no mesh packets at all. respondsToSelector:
+       * answers YES because Metal DECLARES the selector, which is a metadata
+       * trap, not a capability.
+       *
+       * Whether that matters depends entirely on which stage a title actually
+       * needs: a geometry-shader compute fallback is a contained project, while
+       * tessellation needs hull/tess-coord/domain/compaction stages. This
+       * counter is what decides which one is worth building. */
+      static std::atomic<uint32_t> n{0};
+      ERR("[mesh-fail] ml754 kind=GEOMETRY #", n.fetch_add(1, std::memory_order_relaxed) + 1,
+          " -- ", err.description().getUTF8String());
       return this;
     }
     return this;
