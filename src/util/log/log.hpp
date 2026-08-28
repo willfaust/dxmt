@@ -61,6 +61,13 @@ private:
 
   bool m_initialized = false;
   PFN_wineLogOutput m_wineLogOutput = nullptr;
+  /* ml752: set only when a file log is actually opened. `if (m_fileStream)`
+   * evaluates std::ofstream's operator bool, and ofstream VIRTUALLY inherits
+   * basic_ios -- so that load reads a vbase offset from the vtable at a
+   * NEGATIVE offset. With a null vtable it faults at exactly -24, which is the
+   * crash that replaced the real "failed to create D3D11 device" message on a
+   * virtual Metal device. A plain bool cannot fault. */
+  bool m_fileStreamOpen = false;
 
   void emitMsg(LogLevel level, const std::string &message);
 

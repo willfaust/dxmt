@@ -1,6 +1,7 @@
 #include "ftl.hpp"
 #include "dxmt_format.hpp"
 #include "util_error.hpp"
+#include "log/log.hpp"   /* ml752 */
 #include "dxgi.h"
 #include <cassert>
 #include <cstdint>
@@ -33,7 +34,30 @@ constexpr FormatCapability APPLE_INT_FORMAT_CAP_32 =
 
 void
 FormatCapabilityInspector::Inspect(WMT::Device device) {
-  if (device.supportsFamily(WMTGPUFamilyApple7)) {
+  /* ml752: accept an UNRECOGNISED Metal device instead of rejecting it.
+   *
+   * This function knew only Apple7+ and Mac2 and threw MTLD3DError("Invalid
+   * MTLDevice") otherwise. A virtualised Metal device advertises NEITHER, so
+   * device construction threw at the very end -- after the worker threads had
+   * been created and torn down -- and the only surviving evidence was a fixed
+   * "Failed to create D3D11 device" string, because the throw's own message was
+   * never printed.
+   *
+   * Falling back to the Apple7 table is a guess about FORMAT capabilities only.
+   * It cannot engage on real hardware, where Apple7 is always true, so it
+   * changes nothing on a physical device by construction. Genuine runtime
+   * queries such as supportsBCTextureCompression() are untouched and still
+   * answer for themselves. */
+  const bool apple7 = device.supportsFamily(WMTGPUFamilyApple7);
+  const bool mac2 = device.supportsFamily(WMTGPUFamilyMac2);
+  const bool unknown_family = !apple7 && !mac2;
+
+  if (unknown_family)
+    Logger::warn("[gpu-caps] ml752 device reports neither Apple7 nor Mac2 -- "
+                 "assuming the Apple7 format table. Formats may be advertised "
+                 "that this device cannot actually sample.");
+
+  if (apple7 || unknown_family) {
     // Apple 7: M1
     APPEND_CAP(WMTPixelFormatA8Unorm, ALL_CAP | TEXTURE_BUFFER_ALL_CAP)
     APPEND_CAP(WMTPixelFormatR8Unorm, ALL_CAP | TEXTURE_BUFFER_ALL_CAP)

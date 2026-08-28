@@ -66,8 +66,10 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 #endif
       auto path = getFileName(m_fileName);
 
-      if (!path.empty())
+      if (!path.empty()) {
         m_fileStream = std::ofstream(str::topath(path.c_str()).c_str());
+        m_fileStreamOpen = true;   /* ml752 */
+      }
     }
 
     std::stringstream stream(message);
@@ -86,7 +88,8 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
           std::cerr << adjusted;
       }
 
-      if (m_fileStream)
+      /* ml752: guard on the bool, NOT on the stream -- see log.hpp. */
+      if (m_fileStreamOpen)
         m_fileStream << adjusted;
     }
   }

@@ -56,7 +56,12 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
         "[gpu-caps] ml709 BC=", dev.supportsBCTextureCompression() ? 1 : 0,
         " Apple7=", dev.supportsFamily(WMTGPUFamilyApple7) ? 1 : 0,
         " Apple8=", dev.supportsFamily(WMTGPUFamilyApple8) ? 1 : 0,
-        " Apple9=", dev.supportsFamily(WMTGPUFamilyApple9) ? 1 : 0));
+        " Apple9=", dev.supportsFamily(WMTGPUFamilyApple9) ? 1 : 0,
+        /* ml752: Mac2 was missing, and it is the OTHER family
+         * FormatCapabilityInspector::Inspect() accepts -- so a device reporting
+         * Apple7=0 Apple8=0 Apple9=0 told us nothing about whether it would be
+         * rejected. A virtual Metal device advertises neither. */
+        " Mac2=", dev.supportsFamily(WMTGPUFamilyMac2) ? 1 : 0));
   }
 
   for (uint32_t flId = 0; flId < FeatureLevels; flId++) {
@@ -83,7 +88,33 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
 
     return device->QueryInterface(IID_PPV_ARGS(ppDevice));
   } catch (const MTLD3DError &e) {
-    Logger::err("D3D11CoreCreateDevice: Failed to create D3D11 device");
+    /* ml752: report WHAT failed, and do not use Logger to do it.
+     *
+     * This catch printed a fixed string, so the actual reason -- thrown from
+     * deep inside device construction -- never reached the log. Worse, on a
+     * virtual Metal device the Logger call ITSELF crashed here: std::ofstream
+     * virtually inherits basic_ios, so `if (m_fileStream)` loads the vbase
+     * offset from the vtable at a NEGATIVE offset, and with a null vtable that
+     * faults at exactly -24 (p1=0xffffffffffffffe8, d3d11+0x125d44). The device
+     * failure was invisible and the crash that replaced it pointed at the
+     * logger rather than the cause. Go straight to Wine's debug output. */
+    {
+      const char *what = e.message().c_str();
+      char buf[512];
+      snprintf(buf, sizeof(buf),
+               "err:   [d3d11-fail] ml752 D3D11CoreCreateDevice failed: %s\n",
+               what ? what : "(no message)");
+#ifdef _WIN32
+      HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+      PFN_wineLogOutput out = ntdll ? reinterpret_cast<PFN_wineLogOutput>(
+                                          GetProcAddress(ntdll, "__wine_dbg_output"))
+                                    : nullptr;
+      if (out) out(buf);
+      else fputs(buf, stderr);
+#else
+      fputs(buf, stderr);
+#endif
+    }
     return E_FAIL;
   }
 }
