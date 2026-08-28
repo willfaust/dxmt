@@ -140,4 +140,20 @@ private:
   AllocationRefTracking ref_tracker;
 };
 
+/* ml743: the BC decoder is shared with the streamed-upload path.
+ *
+ * A15 cannot sample BC, so remap_unsupported_bc() creates these textures with
+ * an uncompressed physical format. Creation-time uploads decode here; uploads
+ * that arrive later through UpdateSubresource had no decode at all and wrote
+ * raw block bytes into an RGBA8 texture -- full width at quarter height, which
+ * is what the striped, vertically squashed artwork looked like. A UE4 title
+ * creates almost every BC texture empty and streams it (3,760 updates against
+ * 13 creation-time uploads), so that path is the normal one, not the exception.
+ *
+ * kind: 1=BC1 2=BC2 3=BC3 4=BC4u 5=BC5u 7=BC7 14=BC4s 15=BC5s, 0 = not decodable. */
+int bc_decode_kind(enum WMTPixelFormat f);
+uint32_t bc_decode_texel_size(int kind);
+void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+                     uint32_t height, int kind);
+
 } // namespace dxmt

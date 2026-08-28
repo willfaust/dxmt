@@ -149,6 +149,20 @@ public:
     return info_.pixel_format;
   }
 
+  /* ml745: how many top mip levels this texture does NOT physically have.
+   *
+   * The D3D-visible descriptor keeps its full mip count; only the Metal texture
+   * is smaller. Uploads therefore arrive with LOGICAL mip indices and must be
+   * shifted down by this much, and uploads to a level below it dropped entirely.
+   * The equivalent value on the D3D wrapper is unreachable from the context, and
+   * WMTTextureInfo crosses the wine/unix ABI boundary, so it lives here.
+   *
+   * Logical mip N has exactly the dimensions of physical mip N-bias, so only the
+   * INDEX shifts -- extents and pitches computed from the logical descriptor stay
+   * correct. */
+  uint32_t mipBias() const { return mip_bias_; }
+  void setMipBias(uint32_t bias) { mip_bias_ = bias; }
+
   WMTTextureType
   textureType(TextureViewKey view) {
     std::shared_lock<dxmt::shared_mutex> lock(mutex_);
@@ -231,6 +245,7 @@ private:
   void prepareAllocationViews(TextureAllocation* allocation);
 
   WMTTextureInfo info_;
+  uint32_t mip_bias_ = 0;          /* ml745, see mipBias() */
   unsigned bytes_per_image_ = 0;
   unsigned bytes_per_row_ = 0;
 

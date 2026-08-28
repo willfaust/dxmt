@@ -293,7 +293,7 @@ static void bc3_block(const uint8_t *blk, uint8_t out[64]) {
  * decoded in full and clipped, which is what the BC spec requires for
  * non-multiple-of-4 dimensions. */
 /* Physical bytes per texel produced by each decode kind. */
-static inline uint32_t bc_decode_texel_size(int kind) {
+uint32_t bc_decode_texel_size(int kind) {
   switch (kind) {
   case 4: case 14: return 1;   /* BC4 -> R8  */
   case 5: case 15: return 2;   /* BC5 -> RG8 */
@@ -301,7 +301,7 @@ static inline uint32_t bc_decode_texel_size(int kind) {
   }
 }
 
-static void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
                             uint32_t height, int kind) {
   const uint32_t bx_n = (width + 3) / 4, by_n = (height + 3) / 4;
   const size_t blk_bytes = (kind == 1 || kind == 4 || kind == 14) ? 8 : 16;
@@ -403,7 +403,7 @@ static void bc_fill_pattern(enum WMTPixelFormat f, uint8_t *dst, uint32_t w, uin
 
 /* ml679: 1=BC1 2=BC2 3=BC3 4=BC4u 5=BC5u 7=BC7 14=BC4s 15=BC5s. BC6H returns 0
  * and is still handled by the deterministic fill above. */
-static inline int bc_decode_kind(enum WMTPixelFormat f) {
+int bc_decode_kind(enum WMTPixelFormat f) {
   switch (f) {
   case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB: return 1;
   case WMTPixelFormatBC2_RGBA: case WMTPixelFormatBC2_RGBA_sRGB: return 2;

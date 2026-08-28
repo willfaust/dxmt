@@ -453,7 +453,13 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     static int cached_clamp = -1;
     if (cached_clamp < 0)
       cached_clamp = std::max(0, std::min(4, Config::getInstance().getOption<int>("d3d11.mipClampBC", 0)));
-    if (cached_clamp && pInitialData && IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
+    /* ml745: pInitialData is NO LONGER required. Requiring it meant the clamp
+     * could never fire for a title that creates BC textures empty and streams
+     * them later -- the case that actually matters here: 13 textures arrived
+     * with initial data against 2,025 streamed updates. Those updates carry
+     * LOGICAL mip indices, which UpdateTexture now translates through the bias,
+     * dropping levels that no longer exist physically. */
+    if (cached_clamp && IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
         (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
         finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
         finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
@@ -479,6 +485,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
                             !(physDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
+  /* ml745: the immediate context resolves streamed uploads through the dxmt
+   * Texture, not the D3D wrapper, so the bias must be visible there too. */
+  texture->setMipBias(mip_bias);
 
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
 

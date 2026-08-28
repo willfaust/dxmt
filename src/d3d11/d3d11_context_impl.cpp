@@ -14,6 +14,7 @@ since it is for internal use only
 #include "d3d11_interfaces.hpp"
 #include "d3d11_private.h"
 #include "d3d11_context_state.hpp"
+#include "dxmt_resource_initializer.hpp"   /* ml743: shared BC decoder */
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_query.hpp"
@@ -578,6 +579,55 @@ public:
     Invalid = false;
   }
 };
+
+/* ml744: aggregate outcome of the streamed BC decode. Per-call logging only ever
+ * showed the first handful of tiny mips, which cannot answer "did the texture I
+ * am looking at decode?" -- counts by format plus a failure tally can. */
+inline std::atomic<uint32_t> g_bc_stream_ok[16];
+inline std::atomic<uint32_t> g_bc_stream_fail{0};
+/* ml745: clamp accounting. `xlated` are uploads retargeted to a surviving mip;
+ * `dropped` are uploads to a level the clamp removed. Both being zero while the
+ * clamp is enabled means no clamped texture was ever streamed to. */
+inline std::atomic<uint32_t> g_bc_clamp_xlated{0};
+inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
+/* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
+ * indices, so every copy touching a clamped texture landed on the wrong level --
+ * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
+ * resource path because the failure modes differ: tex->tex needs only the index
+ * shift, whereas a BC *staging* source carries block bytes that would be written
+ * into a physically-RGBA8 texture (the ml743 defect, in the copy path). */
+inline std::atomic<uint32_t> g_cp_xlated{0};      /* index shifted, executed   */
+inline std::atomic<uint32_t> g_cp_dropped{0};     /* logical mip below a bias  */
+inline std::atomic<uint32_t> g_cp_tex_tex{0};
+inline std::atomic<uint32_t> g_cp_stg_tex{0};
+inline std::atomic<uint32_t> g_cp_tex_stg{0};
+inline std::atomic<uint32_t> g_cp_stg_stg{0};
+inline std::atomic<uint32_t> g_cp_bc_stg_unsupported{0};
+inline std::atomic<uint32_t> g_cp_bc_stg_decoded{0};   /* ml747 */
+inline std::atomic<uint32_t> g_cp_bc_stg_fail{0};      /* ml747 */
+
+inline void BCStreamReport() {
+  static std::atomic<uint32_t> tick{0};
+  if ((tick.fetch_add(1, std::memory_order_relaxed) & 0x3FF) != 0)
+    return;
+  static const char *const kName[16] = {"?","BC1","BC2","BC3","BC4u","BC5u","?","BC7",
+                                        "?","?","?","?","?","?","BC4s","BC5s"};
+  uint32_t total = 0;
+  for (int i = 0; i < 16; i++) total += g_bc_stream_ok[i].load(std::memory_order_relaxed);
+  ERR("[bc-stream] ml744 decoded total=", total,
+      " BC1=", g_bc_stream_ok[1].load(), " BC2=", g_bc_stream_ok[2].load(),
+      " BC3=", g_bc_stream_ok[3].load(), " BC4u=", g_bc_stream_ok[4].load(),
+      " BC5u=", g_bc_stream_ok[5].load(), " BC7=", g_bc_stream_ok[7].load(),
+      " | ALLOC-FAIL=", g_bc_stream_fail.load(),
+      " | ml745 clamp xlated=", g_bc_clamp_xlated.load(),
+      " dropped=", g_bc_clamp_dropped.load(),
+      " | ml746 copy xlated=", g_cp_xlated.load(), " dropped=", g_cp_dropped.load(),
+      " paths tex<-tex=", g_cp_tex_tex.load(), " tex<-stg=", g_cp_stg_tex.load(),
+      " stg<-tex=", g_cp_tex_stg.load(), " stg<-stg=", g_cp_stg_stg.load(),
+      " BCstg-unsup=", g_cp_bc_stg_unsupported.load(),
+      " | ml747 BCstg decoded=", g_cp_bc_stg_decoded.load(),
+      " fail=", g_cp_bc_stg_fail.load());
+}
 
 struct DXMT_DRAW_ARGUMENTS {
   uint32_t VertexCount;
@@ -1159,6 +1209,7 @@ public:
       UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
   ) override {
     BCCensusRecordOp(BCCensusFormatOf(pDstResource), 0);  /* ml653 */
+    BCStreamReport();  /* ml744 */
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!pDstResource)
@@ -3554,6 +3605,47 @@ public:
   CopyTexture(TextureCopyCommand &&cmd) {
     if (cmd.Invalid)
       return;
+
+    /* ml746: TRANSLATE MIP INDICES THROUGH EACH TEXTURE'S OWN CLAMP.
+     *
+     * TextureCopyCommand derives MipLevel from the LOGICAL descriptor, which a
+     * clamp deliberately leaves at full mip count, so an unclamped copy targets
+     * the wrong physical level. Source and destination are translated
+     * INDEPENDENTLY and a differing bias is NOT an error: physical mip L-b has
+     * dimensions (base >> b) >> (L-b) == base >> L, i.e. exactly logical mip L,
+     * so a bias-0 texture can validly copy its logical mip 3 into a bias-2
+     * texture's physical mip 1 with no rescaling. cmd.SrcSize/DstOrigin come
+     * from those same logical extents and therefore stay correct.
+     *
+     * Staging resources are never clamped; GetTexture() returns null for them,
+     * so they take bias 0, which is what we want. Drop only when a requested
+     * logical level sits below its own texture's bias -- it does not exist. */
+    {
+      uint32_t src_bias = 0, dst_bias = 0;
+      if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
+      if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
+      if (src_bias || dst_bias) {
+        if (cmd.Src.MipLevel < src_bias || cmd.Dst.MipLevel < dst_bias) {
+          g_cp_dropped.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        cmd.Src.MipLevel -= src_bias;
+        cmd.Dst.MipLevel -= dst_bias;
+        g_cp_xlated.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    /* Classify the resource path so the counters say which shapes actually
+     * occur; the failure modes are not the same for each. */
+    {
+      const bool sd = !!GetStagingResource(cmd.pDst, cmd.DstSubresource);
+      const bool ss = !!GetStagingResource(cmd.pSrc, cmd.SrcSubresource);
+      if (sd && ss)       g_cp_stg_stg.fetch_add(1, std::memory_order_relaxed);
+      else if (sd)        g_cp_tex_stg.fetch_add(1, std::memory_order_relaxed);
+      else if (ss)        g_cp_stg_tex.fetch_add(1, std::memory_order_relaxed);
+      else                g_cp_tex_tex.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) != (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)) {
       if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
         return CopyTextureFromCompressed(std::move(cmd));
@@ -3650,6 +3742,73 @@ public:
           });
           return;
         }
+        /* ml747: BC STAGING SOURCE -> PHYSICALLY-UNCOMPRESSED TEXTURE: DECODE.
+         *
+         * Staging resources are never remapped, so they hold compressed BLOCK
+         * bytes, while on a GPU without BC the destination texture physically
+         * is RGBA8/RG8. The blit below computes a block offset and block pitch
+         * and writes those bytes straight in -- the ml743 defect, in the copy
+         * path. Mip translation alone cannot repair it.
+         *
+         * ml746 guarded and counted this instead of decoding, on the reasoning
+         * that the census reports Map=0 so the shape might not occur. It does:
+         * the guard fired 298 times, exactly equal to every staging->texture
+         * copy, so all of them wrote nothing and left those regions blank.
+         * Map=0 only says the title never CPU-MAPS a BC texture; it can still
+         * fill staging by other means. Decode for real.
+         *
+         * The read is CPU-side at CALL time, matching the UpdateSubresource
+         * path, which is correct when staging was filled by the CPU before the
+         * copy. Content produced by a GPU readback into staging would not be
+         * ready here -- that shape is not known to occur and would need the
+         * decode moved onto the GPU timeline. */
+        if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) &&
+            !device->GetMTLDevice().supportsBCTextureCompression()) {
+          const int bc_kind = bc_decode_kind(cmd.SrcFormat.PixelFormat);
+          const void *base = staging_src->mappedImmediateMemory();
+          if (!bc_kind || !base || cmd.SrcSize.depth != 1 ||
+              !cmd.SrcSize.width || !cmd.SrcSize.height) {
+            g_cp_bc_stg_unsupported.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
+          const uint32_t tsz = bc_decode_texel_size(bc_kind);
+          const size_t dec_pitch = (size_t)cmd.SrcSize.width * tsz;
+          const size_t dec_slice = dec_pitch * cmd.SrcSize.height;
+          std::unique_ptr<uint8_t[]> dec(new (std::nothrow) uint8_t[dec_slice]);
+          if (!dec) {
+            g_cp_bc_stg_fail.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
+          /* Block coordinates, exactly as the untranslated path computed them. */
+          const size_t src_off = (size_t)cmd.SrcOrigin.z * staging_src->bytesPerImage +
+                                 ((size_t)cmd.SrcOrigin.y >> 2) * staging_src->bytesPerRow +
+                                 ((size_t)cmd.SrcOrigin.x >> 2) * cmd.SrcFormat.BytesPerTexel;
+          bc_decode_image((const uint8_t *)base + src_off, staging_src->bytesPerRow,
+                          dec.get(), cmd.SrcSize.width, cmd.SrcSize.height, bc_kind);
+
+          SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+          auto [decoded_buffer, decoded_offset] = AllocateStagingBuffer(dec_slice, 16);
+          decoded_buffer.updateContents(decoded_offset, dec.get(), dec_slice);
+          EmitOP([dst_ = std::move(dst), decoded_buffer, decoded_offset, dec_pitch,
+                  dec_slice, cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+            auto dst_tex = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice,
+                                      DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+            auto &c = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+            c.type = WMTBlitCommandCopyFromBufferToTexture;
+            c.src = decoded_buffer;
+            c.src_offset = decoded_offset;
+            c.bytes_per_row = (uint32_t)dec_pitch;
+            c.bytes_per_image = (uint32_t)dec_slice;
+            c.size = cmd.SrcSize;
+            c.dst = dst_tex;
+            c.slice = cmd.Dst.ArraySlice;
+            c.level = cmd.Dst.MipLevel;
+            c.origin = cmd.DstOrigin;
+          });
+          g_cp_bc_stg_decoded.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+
         // copy from staging to default
         SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseCopySource(staging_src);
@@ -3860,6 +4019,81 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
 
     if (auto dst = GetTexture(cmd.pDst)) {
+      /* ml745: TRANSLATE THE MIP INDEX THROUGH THE CLAMP.
+       *
+       * When a BC texture is clamped, the D3D-visible descriptor keeps its full
+       * mip count and only the Metal texture is smaller, so uploads still arrive
+       * with LOGICAL indices. Logical mip N has exactly the dimensions of
+       * physical mip N-bias, so extents, origins and pitches computed from the
+       * logical descriptor remain correct -- only the INDEX shifts. Levels above
+       * the bias no longer exist physically and are dropped; the clamped texture
+       * simply starts at what used to be mip `bias`.
+       *
+       * Without this every streamed update would land on the wrong mip, which is
+       * worse than not clamping at all. */
+      const uint32_t mip_bias = dst->mipBias();
+      if (mip_bias) {
+        if (cmd.Dst.MipLevel < mip_bias) {
+          g_bc_clamp_dropped.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        cmd.Dst.MipLevel -= mip_bias;
+        g_bc_clamp_xlated.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      /* ml743: DECODE BC ON THE STREAMED PATH TOO.
+       *
+       * cmd.DstFormat comes from MTLQueryDXGIFormat() on the D3D format, so for a
+       * BC resource it describes BLOCKS -- block pitch, height/4 rows. But this
+       * GPU cannot sample BC, so the texture underneath was created with an
+       * uncompressed physical format by remap_unsupported_bc(). Staging block
+       * bytes and blitting them into that texture writes a block row as a single
+       * pixel row: content lands full width at quarter height, striped, which is
+       * exactly how a UE4 title's menu art rendered.
+       *
+       * Creation-time uploads already decode. Streamed ones did not, and streaming
+       * is the normal path -- that title issued 3,760 UpdateSubresource calls
+       * against 13 textures created with initial data.
+       *
+       * Decode into a temporary image and stage THAT, with the physical pitch and
+       * full row count. Only when the nominal format is BC and the physical one is
+       * not; anything else keeps the original path byte for byte. */
+      std::unique_ptr<uint8_t[]> bc_decoded;
+      /* The gate is a DEVICE CAPABILITY, not a format comparison. Texture objects
+       * here still record the BC format -- remap_unsupported_bc() runs deeper, in
+       * the Metal layer -- so comparing the texture's format against the command's
+       * finds them equal and never fires. This mirrors the creation-time path,
+       * which gates on !supportsBCTextureCompression() for exactly that reason. */
+      const int bc_kind = (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)
+                              ? bc_decode_kind(cmd.DstFormat.PixelFormat)
+                              : 0;
+      if (bc_kind && cmd.DstSize.depth == 1 &&
+          !device->GetMTLDevice().supportsBCTextureCompression() &&
+          cmd.DstSize.width && cmd.DstSize.height) {
+        const uint32_t tsz = bc_decode_texel_size(bc_kind);
+        const size_t dec_pitch = (size_t)cmd.DstSize.width * tsz;
+        const size_t dec_slice = dec_pitch * cmd.DstSize.height;
+        bc_decoded.reset(new (std::nothrow) uint8_t[dec_slice]);
+        if (!bc_decoded) {
+          /* ml744: FAIL SAFE. Falling through here would upload the raw block
+           * bytes into an uncompressed texture -- exactly the corruption this
+           * decode exists to prevent, reappearing only under memory pressure and
+           * therefore intermittently. With this title sitting near 3.9GB and
+           * textures up to 8160x8160, the allocation genuinely can fail. Skip the
+           * upload instead: a texture that keeps its previous contents is a far
+           * better failure than one filled with garbage. */
+          g_bc_stream_fail.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, bc_decoded.get(),
+                        cmd.DstSize.width, cmd.DstSize.height, bc_kind);
+        pSrcData = bc_decoded.get();
+        SrcRowPitch = (UINT)dec_pitch;
+        SrcDepthPitch = (UINT)dec_slice;
+        cmd.EffectiveBytesPerRow = (uint32_t)dec_pitch;
+        cmd.EffectiveRows = cmd.DstSize.height;
+        g_bc_stream_ok[bc_kind & 15].fetch_add(1, std::memory_order_relaxed);
+      }
       auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
       auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
       if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
@@ -3911,6 +4145,27 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
 
     if (auto dst = GetTexture(cmd.pDst)) {
+      /* ml745: TRANSLATE THE MIP INDEX THROUGH THE CLAMP.
+       *
+       * When a BC texture is clamped, the D3D-visible descriptor keeps its full
+       * mip count and only the Metal texture is smaller, so uploads still arrive
+       * with LOGICAL indices. Logical mip N has exactly the dimensions of
+       * physical mip N-bias, so extents, origins and pitches computed from the
+       * logical descriptor remain correct -- only the INDEX shifts. Levels above
+       * the bias no longer exist physically and are dropped; the clamped texture
+       * simply starts at what used to be mip `bias`.
+       *
+       * Without this every streamed update would land on the wrong mip, which is
+       * worse than not clamping at all. */
+      const uint32_t mip_bias = dst->mipBias();
+      if (mip_bias) {
+        if (cmd.Dst.MipLevel < mip_bias) {
+          g_bc_clamp_dropped.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        cmd.Dst.MipLevel -= mip_bias;
+        g_bc_clamp_xlated.fetch_add(1, std::memory_order_relaxed);
+      }
 
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
