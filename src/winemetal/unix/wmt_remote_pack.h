@@ -18,7 +18,7 @@
 #ifndef WMT_REMOTE_PACK_H
 #define WMT_REMOTE_PACK_H
 
-#include "../../../../research/remote-metal/wmt_pack.h"
+#include "../../../../remote-metal/wmt_pack.h"
 #include "winemetal.h"
 
 static inline enum wmtw_pack_status

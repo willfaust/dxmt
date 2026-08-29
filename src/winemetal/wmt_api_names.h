@@ -3,7 +3,7 @@
 #ifndef WMT_API_NAMES_H
 #define WMT_API_NAMES_H
 
-#define WMT_API_COUNT 114
+#define WMT_API_COUNT 127
 
 static const char *const wmt_api_names[WMT_API_COUNT] = {
     "NSObject_retain",
@@ -80,8 +80,21 @@ static const char *const wmt_api_names[WMT_API_COUNT] = {
     "MetalLayer_getProps",
     "CreateMetalViewFromHWND",
     "ReleaseMetalView",
+    "thunk_SM50Initialize",
+    "thunk_SM50Destroy",
+    "thunk_SM50Compile",
+    "thunk_SM50GetCompiledBitcode",
+    "thunk_SM50DestroyBitcode",
+    "thunk_SM50GetErrorMessage",
+    "thunk_SM50FreeError",
+    "thunk_SM50CompileGeometryPipelineVertex",
+    "thunk_SM50CompileGeometryPipelineGeometry",
+    "<null slot>",
+    "thunk_SM50CompileTessellationPipelineHull",
+    "thunk_SM50CompileTessellationPipelineDomain",
     "MTLCommandEncoder_setLabel",
     "MTLDevice_setShouldMaximizeConcurrentCompilation",
+    "thunk_SM50GetArgumentsInfo",
     "MTLCommandBuffer_error",
     "MTLCommandBuffer_logs",
     "MTLLogContainer_enumerate",

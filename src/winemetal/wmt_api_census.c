@@ -19,20 +19,41 @@ static int g_on = -1;
 /* Bounded first-call sequence: the ORDER of the control plane is what has to
  * be reimplemented, and a frequency table alone does not show it. */
 #define FIRSTN 96
-static unsigned short g_first[FIRSTN];
+#define FIRST_EMPTY 0xffffu
+/* Atomic slots with a sentinel. Claiming the index atomically is not enough:
+ * the reporter could read a claimed slot before its value was written and
+ * print whatever was there. Each slot is now atomic and starts EMPTY, so a
+ * half-published entry is visibly missing rather than silently wrong. */
+static atomic_ushort g_first[FIRSTN];
 static atomic_uint g_first_len;
+static atomic_int g_first_init;
 
 /* Classification. A call can be more than one thing; the label names its
  * primary role for the purpose of redirecting the control plane. */
+/* Producers are named EXPLICITLY. Two heuristic attempts were both wrong:
+ * `strstr(n,"new")==n` matched nothing (every entry is Class_newThing), and
+ * broadening to "CommandEncoder" then swept in endEncoding and encodeCommands,
+ * which consume an encoder rather than produce one. A census exists to be read,
+ * and a confidently wrong label is worse than a missing one. */
+static int is_producer(const char *n) {
+    static const char *const P[] = {
+        "MTLCopyAllDevices", "NSArray_object", "NSString_string", "NSString_alloc_init",
+        "NSAutoreleasePool_alloc_init", "MTLDevice_newCommandQueue",
+        "MTLCommandQueue_commandBuffer", "MTLCommandBuffer_renderCommandEncoder",
+        "MTLCommandBuffer_computeCommandEncoder", "MTLCommandBuffer_blitCommandEncoder",
+        "MTLDevice_newBuffer", "MTLDevice_newTexture", "MTLDevice_newLibrary",
+        "MTLLibrary_newFunction", "MTLDevice_newRenderPipelineState",
+        "MTLDevice_newComputePipelineState", "MTLDevice_newDepthStencilState",
+        "MTLDevice_newSamplerState", "MTLDevice_newSharedEvent",
+        "MTLDevice_newBinaryArchive", "MTLTexture_newTextureView",
+        "MetalLayer_nextDrawable", "MetalDrawable_texture", 0
+    };
+    for (int i = 0; P[i]; i++) if (strcmp(n, P[i]) == 0) return 1;
+    return 0;
+}
+
 static const char *classify(const char *n) {
-    /* `strstr(n,"new") == n` required the NAME to start with "new", which no
-     * winemetal entry does -- they are all Class_newThing. That mislabelled
-     * every real producer as a consumer. Match the substring anywhere. */
-    if (strstr(n, "new") || strstr(n, "New") || strstr(n, "Copy") ||
-        strstr(n, "alloc") || strstr(n, "Create") ||
-        strstr(n, "commandBuffer") || strstr(n, "CommandEncoder") ||
-        strstr(n, "nextDrawable") || strstr(n, "Drawable_texture") ||
-        strstr(n, "NSArray_object") || strstr(n, "NSString_string")) return "PRODUCER";
+    if (is_producer(n)) return "PRODUCER";
     if (strstr(n, "retain") || strstr(n, "release"))          return "lifetime";
     if (strstr(n, "commit") || strstr(n, "waitUntil") ||
         strstr(n, "Event") || strstr(n, "Fence"))             return "sync";
@@ -59,10 +80,12 @@ static void wmt_api_report(void) {
     }
     fprintf(stderr, "[api-census] %u of %d entries used\n", used, WMT_API_COUNT);
     unsigned fl = atomic_load(&g_first_len);
+    if (fl > FIRSTN) fl = FIRSTN;
     if (fl) {
         fprintf(stderr, "[api-census] first %u calls (control-plane ORDER):\n", fl);
         for (unsigned i = 0; i < fl; i++) {
-            unsigned code = g_first[i];
+            unsigned short code = atomic_load(&g_first[i]);
+            if (code == FIRST_EMPTY) { fprintf(stderr, "[api-census]     %2u. <pending>\n", i); continue; }
             fprintf(stderr, "[api-census]     %2u. %s\n", i,
                     code < WMT_API_COUNT ? wmt_api_names[code] : "?");
         }
@@ -78,7 +101,16 @@ void wmt_api_census_note(unsigned code) {
     if (__builtin_expect(g_on != 1, 1)) return;
     if (code < WMT_API_COUNT) atomic_fetch_add(&g_calls[code], 1);
     unsigned long t = atomic_fetch_add(&g_total, 1) + 1;
-    unsigned fl = atomic_load(&g_first_len);
-    if (fl < FIRSTN) { g_first[fl] = (unsigned short)code; atomic_store(&g_first_len, fl + 1); }
-    if (t == 1 || (t % 20000) == 0) wmt_api_report();
+    /* Claim a slot atomically. Load-then-store races between threads and can
+     * drop or duplicate entries in the very sequence the control plane has to
+     * be reimplemented from. */
+    if (!atomic_exchange(&g_first_init, 1))
+        for (int i = 0; i < FIRSTN; i++) atomic_store(&g_first[i], FIRST_EMPTY);
+    unsigned slot = atomic_fetch_add(&g_first_len, 1);
+    if (slot < FIRSTN) atomic_store(&g_first[slot], (unsigned short)code);
+
+    /* Report often enough that the last checkpoint is close to the end. atexit
+     * never fires here -- iOS apps are killed, not exited -- so "the whole run"
+     * can only ever mean "the latest checkpoint", and 20,000 was too coarse. */
+    if (t == 1 || t == 100 || t == 1000 || (t % 5000) == 0) wmt_api_report();
 }

@@ -13,7 +13,17 @@ text = open(src).read()
 m = re.search(r'const void \*__wine_unix_call_funcs\[\] = \{(.*?)\n\};', text, re.S)
 if not m:
     sys.exit("dispatch table not found in %s" % src)
-names = re.findall(r'&_([A-Za-z0-9_]+)', m.group(1))
+# EVERY slot, in order, whatever its shape. Matching only `&_Name` silently
+# dropped 12 thunk_SM50* entries and a NULL at slots 74+, which does not shorten
+# the table -- it SHIFTS every name after that point onto the wrong slot. A
+# census that misnames what it counts is worse than no census.
+raw = re.findall(r'^\s*(&?[A-Za-z0-9_]+|NULL)\s*,', m.group(1), re.M)
+names = []
+for e in raw:
+    if e == 'NULL':
+        names.append('<null slot>')
+    else:
+        names.append(e.lstrip('&').lstrip('_'))
 
 out = os.path.join(os.path.dirname(__file__), 'wmt_api_names.h')
 with open(out, 'w') as f:
