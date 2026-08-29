@@ -25,7 +25,12 @@ static inline enum wmtw_pack_status
 wmtw_pack_render(const struct wmtcmd_base *head, struct wmtw_packer *p,
                  struct wmtw_pack_result *res)
 {
+    /* Tortoise and hare. The tortoise must NOT advance on the first step:
+     * starting both at head and advancing both immediately makes them equal
+     * after one step, which reports every list of two or more nodes as
+     * cyclic. */
     const struct wmtcmd_base *slow = head;
+    int advance_slow = 0;
     uint32_t idx = 0;
     res->encoder_kind = 0;
 
@@ -152,8 +157,8 @@ wmtw_pack_render(const struct wmtcmd_base *head, struct wmtw_packer *p,
 
         c = (const struct wmtcmd_base *)c->next.ptr;
         idx++;
-        /* Floyd: advance the slow pointer every other step. */
-        if (idx & 1) { if (slow) slow = (const struct wmtcmd_base *)slow->next.ptr; }
+        if (advance_slow && slow) slow = (const struct wmtcmd_base *)slow->next.ptr;
+        advance_slow = !advance_slow;
         if (c && c == slow) { res->status = WMTW_PACK_CYCLE; res->record_index = idx;
                               res->opcode = c->type; return WMTW_PACK_CYCLE; }
     }
