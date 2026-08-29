@@ -25,13 +25,18 @@ static atomic_uint g_first_len;
 /* Classification. A call can be more than one thing; the label names its
  * primary role for the purpose of redirecting the control plane. */
 static const char *classify(const char *n) {
-    if (strstr(n, "new") == n || strstr(n, "New") || strstr(n, "Copy") == n ||
-        strstr(n, "alloc") || strstr(n, "Create"))            return "PRODUCER";
+    /* `strstr(n,"new") == n` required the NAME to start with "new", which no
+     * winemetal entry does -- they are all Class_newThing. That mislabelled
+     * every real producer as a consumer. Match the substring anywhere. */
+    if (strstr(n, "new") || strstr(n, "New") || strstr(n, "Copy") ||
+        strstr(n, "alloc") || strstr(n, "Create") ||
+        strstr(n, "commandBuffer") || strstr(n, "CommandEncoder") ||
+        strstr(n, "nextDrawable") || strstr(n, "Drawable_texture") ||
+        strstr(n, "NSArray_object") || strstr(n, "NSString_string")) return "PRODUCER";
     if (strstr(n, "retain") || strstr(n, "release"))          return "lifetime";
     if (strstr(n, "commit") || strstr(n, "waitUntil") ||
         strstr(n, "Event") || strstr(n, "Fence"))             return "sync";
-    if (strstr(n, "Drawable") || strstr(n, "present") ||
-        strstr(n, "Layer"))                                   return "present";
+    if (strstr(n, "present") || strstr(n, "Layer"))           return "present";
     if (strstr(n, "Bytes") || strstr(n, "Contents") ||
         strstr(n, "replaceRegion") || strstr(n, "getBytes"))  return "bulk-memory";
     if (strstr(n, "supports") || strstr(n, "status") ||
