@@ -683,6 +683,24 @@ _MTLBuffer_newTexture(void *obj) {
   struct unixcall_mtlbuffer_newtexture *params = obj;
   id<MTLBuffer> buffer = (id<MTLBuffer>)params->buffer;
   struct WMTTextureInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    uint8_t buf[sizeof(struct rm_buf_texture) + sizeof(struct WMTTextureInfo)];
+    struct rm_buf_texture *a = (void *)buf;
+    a->buffer = params->buffer; a->offset = params->offset;
+    a->bytes_per_row = params->bytes_per_row;
+    memcpy(buf + sizeof *a, info, sizeof *info);
+    struct rm_ret_handle_u64 r;
+    if (wmtr_call(RM_OP_BUFFER_NEW_TEXTURE, buf, sizeof buf, &r, sizeof r, 0) == RM_OK && r.handle) {
+      params->ret = r.handle;
+      info->gpu_resource_id = r.value;
+    } else {
+      params->ret = 0; info->gpu_resource_id = 0;
+      fprintf(stderr, "[wmt-remote] host could not make a buffer-backed %ux%u texture\n",
+              info->width, info->height);
+    }
+    info->mach_port = 0;
+    return STATUS_SUCCESS;
+  }
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
 
@@ -754,6 +772,12 @@ _MTLTexture_newTextureView(void *obj) {
 static NTSTATUS
 _MTLDevice_minimumLinearTextureAlignmentForPixelFormat(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle_u64 a = { params->handle, params->arg };
+    struct rm_ret_u64 r;
+    params->ret = (wmtr_call(RM_OP_MIN_LINEAR_ALIGN, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.value : 256;
+    return STATUS_SUCCESS;
+  }
   params->ret = [(id<MTLDevice>)params->handle minimumLinearTextureAlignmentForPixelFormat:to_metal_pixel_format(params->arg)];
   return STATUS_SUCCESS;
 }
@@ -884,6 +908,12 @@ _MTLDevice_newComputePipelineState(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoder(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle a = { params->handle };
+    struct rm_ret_handle r;
+    params->ret = (wmtr_call(RM_OP_BLIT_ENCODER, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.handle : 0;
+    return STATUS_SUCCESS;
+  }
   params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoder];
   return STATUS_SUCCESS;
 }
@@ -1349,10 +1379,60 @@ static inline void wmt_census_scissors(unsigned long n) {
     wmt_scissor_calls++; if (n > wmt_scissor_max) wmt_scissor_max = n;
 }
 
+/* Size of one blit command struct, by type. Zero for anything unknown: a
+ * guessed size would copy the wrong bytes onto the wire, and a blit that
+ * silently copies garbage is far worse than one that reports itself missing. */
+static uint32_t wmt_blit_cmd_size(unsigned type) {
+    switch (type) {
+    case WMTBlitCommandNop:                       return sizeof(struct wmtcmd_blit_nop);
+    case WMTBlitCommandCopyFromBufferToBuffer:    return sizeof(struct wmtcmd_blit_copy_from_buffer_to_buffer);
+    case WMTBlitCommandCopyFromBufferToTexture:   return sizeof(struct wmtcmd_blit_copy_from_buffer_to_texture);
+    case WMTBlitCommandCopyFromTextureToBuffer:   return sizeof(struct wmtcmd_blit_copy_from_texture_to_buffer);
+    case WMTBlitCommandCopyFromTextureToTexture:  return sizeof(struct wmtcmd_blit_copy_from_texture_to_texture);
+    case WMTBlitCommandGenerateMipmaps:           return sizeof(struct wmtcmd_blit_generate_mipmaps);
+    case WMTBlitCommandWaitForFence:
+    case WMTBlitCommandUpdateFence:               return sizeof(struct wmtcmd_blit_fence_op);
+    case WMTBlitCommandFillBuffer:                return sizeof(struct wmtcmd_blit_fillbuffer);
+    default:                                      return 0;
+    }
+}
+
 static NTSTATUS
 _MTLBlitCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
+  if (wmtr_enabled()) {
+    /* Blit commands carry only handles and scalars, so each struct travels
+     * verbatim as {type, size, bytes}; the guest-pointer `next` is not sent.
+     * That keeps this in step with the descriptor path rather than inventing a
+     * second serialiser to drift. */
+    static _Thread_local uint8_t *bbuf;
+    if (!bbuf) bbuf = malloc(WMTW_MAX_BATCH_BYTES);
+    if (!bbuf) return STATUS_SUCCESS;
+    struct rm_arg_handle *ha = (void *)bbuf;
+    ha->handle = params->encoder;
+    size_t off = sizeof *ha;
+    for (const struct wmtcmd_base *c = next; c; c = c->next.ptr) {
+      uint32_t sz = wmt_blit_cmd_size(c->type);
+      if (!sz) {
+        static unsigned told;
+        if (told++ < 8)
+          fprintf(stderr, "[wmt-remote] blit command type %u has no known size -- NOT sent, "
+                          "its destination will be stale\n", (unsigned)c->type);
+        continue;
+      }
+      if (off + 8 + sz > WMTW_MAX_BATCH_BYTES) break;
+      *(uint32_t *)(bbuf + off) = c->type;
+      *(uint32_t *)(bbuf + off + 4) = sz;
+      memcpy(bbuf + off + 8, c, sz);
+      off += 8 + sz;
+    }
+    if (off > sizeof *ha) {
+      struct rm_ret_u64 rr;
+      wmtr_call(RM_OP_BLIT_INTO, bbuf, (uint32_t)off, &rr, sizeof rr, 0);
+    }
+    return STATUS_SUCCESS;
+  }
   wmt_census_batch(next, 2);
   id<MTLBlitCommandEncoder> encoder = (id<MTLBlitCommandEncoder>)params->encoder;
   while (next) {
@@ -1552,10 +1632,20 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     struct wmtw_packer pk = { rec, WMTW_MAX_BATCH_BYTES, 0, side, WMTW_MAX_SIDECAR_BYTES, 0, 0 };
     struct wmtw_pack_result pr;
     if (wmtw_pack_render(next, &pk, &pr) != WMTW_PACK_OK) {
-      static unsigned reported;
-      if (reported++ < 8)
-        fprintf(stderr, "[wmt-remote] pack failed: %s at record %u (opcode %u)\n",
-                wmtw_pack_strerror(pr.status), pr.record_index, pr.opcode);
+      /* Report each MISSING OPCODE once, not the first eight failures.
+       * A pack failure drops the whole batch, so one unsupported command
+       * removes every draw in it -- and reporting only the first occurrence
+       * hides the rest behind it, costing a run per gap. */
+      static unsigned seen[64]; static unsigned seen_n; static unsigned long dropped;
+      dropped++;
+      unsigned k = 0;
+      for (; k < seen_n; k++) if (seen[k] == pr.opcode) break;
+      if (k == seen_n && seen_n < 64) {
+        seen[seen_n++] = pr.opcode;
+        fprintf(stderr, "[wmt-remote] pack: UNSUPPORTED render opcode %u (%s) -- batch dropped, "
+                        "%u distinct opcode(s) missing so far, %lu batches lost\n",
+                pr.opcode, wmtw_pack_strerror(pr.status), seen_n, dropped);
+      }
       return STATUS_SUCCESS;
     }
     uint32_t total = (uint32_t)(sizeof(struct rm_arg_handle) + sizeof(struct wmtw_batch)
@@ -2157,6 +2247,12 @@ _MTLDevice_supportsBCTextureCompression(void *obj) {
 static NTSTATUS
 _MTLDevice_supportsTextureSampleCount(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle_u64 a = { params->handle, params->arg };
+    struct rm_ret_u64 r;
+    params->ret = (wmtr_call(RM_OP_SUPPORTS_SAMPLE_COUNT, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.value : 0;
+    return STATUS_SUCCESS;
+  }
   params->ret = [(id<MTLDevice>)params->handle supportsTextureSampleCount:params->arg];
   return STATUS_SUCCESS;
 }
@@ -2759,6 +2855,20 @@ thunk_SM50CompileGeometryPipelineGeometry(void *args) {
 static NTSTATUS
 _MTLCommandEncoder_setLabel(void *args) {
   struct unixcall_generic_obj_obj_noret *params = args;
+  if (wmtr_enabled()) {
+    /* The label is a GUEST-LOCAL NSString (NSString_* stays local), so its
+     * bytes travel; the encoder handle is already a host handle. */
+    const char *lbl = params->arg ? [(NSString *)params->arg UTF8String] : NULL;
+    size_t n = lbl ? strlen(lbl) : 0;
+    if (n && n < 512) {
+      uint8_t buf[sizeof(struct rm_arg_handle) + 512];
+      struct rm_arg_handle *a = (void *)buf;
+      a->handle = params->handle;
+      memcpy(buf + sizeof *a, lbl, n);
+      wmtr_call(RM_OP_SET_LABEL, buf, (uint32_t)(sizeof *a + n), 0, 0, 0);
+    }
+    return STATUS_SUCCESS;
+  }
   [(id<MTLCommandEncoder>)params->handle setLabel:(NSString *)params->arg];
   return STATUS_SUCCESS;
 }
@@ -3843,21 +3953,21 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newSamplerState,
     &_MTLDevice_newDepthStencilState,
     &_MTLDevice_newTexture,
-    &_rmg_MTLBuffer_newTexture,
+    &_MTLBuffer_newTexture,
     &_MTLTexture_newTextureView,
-    &_rmg_MTLDevice_minimumLinearTextureAlignmentForPixelFormat,
+    &_MTLDevice_minimumLinearTextureAlignmentForPixelFormat,
     &_MTLDevice_newLibrary,
     &_MTLLibrary_newFunction,
     &_NSString_lengthOfBytesUsingEncoding,
     &_rmg_NSObject_description,
     &_MTLDevice_newComputePipelineState,
-    &_rmg_MTLCommandBuffer_blitCommandEncoder,
+    &_MTLCommandBuffer_blitCommandEncoder,
     &_rmg_MTLCommandBuffer_computeCommandEncoder,
     &_MTLCommandBuffer_renderCommandEncoder,
     &_MTLCommandEncoder_endEncoding,
     &_MTLDevice_newRenderPipelineState,
     &_rmg_MTLDevice_newMeshRenderPipelineState,
-    &_rmg_MTLBlitCommandEncoder_encodeCommands,
+    &_MTLBlitCommandEncoder_encodeCommands,
     &_rmg_MTLComputeCommandEncoder_encodeCommands,
     &_MTLRenderCommandEncoder_encodeCommands,
     &_rmg_MTLTexture_pixelFormat,
@@ -3872,7 +3982,7 @@ const void *__wine_unix_call_funcs[] = {
     &_rmg_MTLCommandBuffer_presentDrawableAfterMinimumDuration,
     &_MTLDevice_supportsFamily,
     &_MTLDevice_supportsBCTextureCompression,
-    &_rmg_MTLDevice_supportsTextureSampleCount,
+    &_MTLDevice_supportsTextureSampleCount,
     &_MTLDevice_hasUnifiedMemory,
     &_rmg_MTLCaptureManager_sharedCaptureManager,
     &_rmg_MTLCaptureManager_startCapture,
@@ -3907,7 +4017,7 @@ const void *__wine_unix_call_funcs[] = {
     NULL,
     &thunk_SM50CompileTessellationPipelineHull,
     &thunk_SM50CompileTessellationPipelineDomain,
-    &_rmg_MTLCommandEncoder_setLabel,
+    &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk_SM50GetArgumentsInfo,
     &_rmg_MTLCommandBuffer_error,
@@ -3915,9 +4025,9 @@ const void *__wine_unix_call_funcs[] = {
     &_rmg_MTLLogContainer_enumerate,
     &_rmg_CGColorSpace_checkColorSpaceSupported,
     &_rmg_MetalLayer_setColorSpace,
-    &_rmg_WMTGetPrimaryDisplayId,
+    &_WMTGetPrimaryDisplayId,
     &_rmg_WMTGetSecondaryDisplayId,
-    &_rmg_WMTGetDisplayDescription,
+    &_WMTGetDisplayDescription,
     &_MetalLayer_getEDRValue,
     &_MTLLibrary_newFunctionWithConstants,
     &_rmg_WMTQueryDisplaySetting,
@@ -3974,21 +4084,21 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newSamplerState,
     &_MTLDevice_newDepthStencilState,
     &_MTLDevice_newTexture,
-    &_rmg_MTLBuffer_newTexture,
+    &_MTLBuffer_newTexture,
     &_MTLTexture_newTextureView,
-    &_rmg_MTLDevice_minimumLinearTextureAlignmentForPixelFormat,
+    &_MTLDevice_minimumLinearTextureAlignmentForPixelFormat,
     &_MTLDevice_newLibrary,
     &_MTLLibrary_newFunction,
     &_NSString_lengthOfBytesUsingEncoding,
     &_rmg_NSObject_description,
     &_MTLDevice_newComputePipelineState,
-    &_rmg_MTLCommandBuffer_blitCommandEncoder,
+    &_MTLCommandBuffer_blitCommandEncoder,
     &_rmg_MTLCommandBuffer_computeCommandEncoder,
     &_MTLCommandBuffer_renderCommandEncoder,
     &_MTLCommandEncoder_endEncoding,
     &_MTLDevice_newRenderPipelineState,
     &_rmg_MTLDevice_newMeshRenderPipelineState,
-    &_rmg_MTLBlitCommandEncoder_encodeCommands,
+    &_MTLBlitCommandEncoder_encodeCommands,
     &_rmg_MTLComputeCommandEncoder_encodeCommands,
     &_MTLRenderCommandEncoder_encodeCommands,
     &_rmg_MTLTexture_pixelFormat,
@@ -4003,7 +4113,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_MTLCommandBuffer_presentDrawableAfterMinimumDuration,
     &_MTLDevice_supportsFamily,
     &_MTLDevice_supportsBCTextureCompression,
-    &_rmg_MTLDevice_supportsTextureSampleCount,
+    &_MTLDevice_supportsTextureSampleCount,
     &_MTLDevice_hasUnifiedMemory,
     &_rmg_MTLCaptureManager_sharedCaptureManager,
     &_rmg_MTLCaptureManager_startCapture,
@@ -4038,7 +4148,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     NULL,
     &thunk32_SM50CompileTessellationPipelineHull,
     &thunk32_SM50CompileTessellationPipelineDomain,
-    &_rmg_MTLCommandEncoder_setLabel,
+    &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk32_SM50GetArgumentsInfo,
     &_rmg_MTLCommandBuffer_error,
@@ -4046,9 +4156,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_MTLLogContainer_enumerate,
     &_rmg_CGColorSpace_checkColorSpaceSupported,
     &_rmg_MetalLayer_setColorSpace,
-    &_rmg_WMTGetPrimaryDisplayId,
+    &_WMTGetPrimaryDisplayId,
     &_rmg_WMTGetSecondaryDisplayId,
-    &_rmg_WMTGetDisplayDescription,
+    &_WMTGetDisplayDescription,
     &_MetalLayer_getEDRValue,
     &_MTLLibrary_newFunctionWithConstants,
     &_rmg_WMTQueryDisplaySetting,

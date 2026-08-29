@@ -63,6 +63,12 @@ wmtw_pack_render(const struct wmtcmd_base *head, struct wmtw_packer *p,
             w->offset = b->offset; w->index = b->index;
             break;
         }
+        case WMTRenderCommandSetFragmentBufferOffset: {
+            const struct wmtcmd_render_setbufferoffset *b = (const void *)c;
+            ALLOC(setfragmentbufferoffset, WMTW_OP_SetFragmentBufferOffset);
+            w->offset = b->offset; w->index = b->index;
+            break;
+        }
         case WMTRenderCommandSetFragmentBuffer: {
             const struct wmtcmd_render_setbuffer *b = (const void *)c;
             ALLOC(setfragmentbuffer, WMTW_OP_SetFragmentBuffer);

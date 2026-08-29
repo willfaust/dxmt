@@ -28,6 +28,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include "../../../../remote-metal/protocol.h"
 
 static int  wmtr_fd   = -1;
@@ -58,6 +59,10 @@ static uint32_t wmtr_call(uint16_t op, const void *arg, uint32_t alen,
     if (out && ocap) memset(out, 0, ocap);
     if (olen) *olen = 0;
     pthread_mutex_lock(&wmtr_lock);
+    /* Every call is serialised, so ONE slow reply stalls the whole process.
+     * A silent stall is indistinguishable from a hang, so time the call and
+     * name the opcode when it is pathological. */
+    struct timeval t_begin; gettimeofday(&t_begin, 0);
     struct rm_hdr h = { RM_MAGIC, RM_VERSION, op, ++wmtr_seq, 0, alen, 0 };
     uint32_t status = 0xffffffffu;
     if (wmtr_wr(&h, sizeof h)) goto out;
@@ -94,6 +99,17 @@ static uint32_t wmtr_call(uint16_t op, const void *arg, uint32_t alen,
     }
     status = r.status;
 out:
+    {
+        struct timeval t_end; gettimeofday(&t_end, 0);
+        double dt = (t_end.tv_sec - t_begin.tv_sec) * 1000.0
+                  + (t_end.tv_usec - t_begin.tv_usec) / 1000.0;
+        if (dt > 250.0) {
+            static unsigned told;
+            if (told++ < 16)
+                fprintf(stderr, "[wmt-remote] SLOW call: opcode %u took %.0f ms -- every other "
+                                "winemetal call waited on it\n", op, dt);
+        }
+    }
     pthread_mutex_unlock(&wmtr_lock);
     return status;
 }
@@ -228,7 +244,52 @@ struct wmtr_buf {
     uint32_t options;
     int      cpu_visible;
     int      owned;       /* did WE allocate the shadow?       */
+    uint64_t *page_sum;   /* last-uploaded checksum per 64K page */
+    uint32_t  pages;
 };
+
+/* Upload only what CHANGED.
+ *
+ * The flush was pessimistic by design: every live CPU-visible buffer, in full,
+ * before every commit. That is correct and was the right thing to get a frame
+ * on screen, but it sends the same unchanged megabytes every frame. Hashing a
+ * 64K page costs a linear read at memory bandwidth; sending it costs a network
+ * round trip, so comparing first is far cheaper than uploading blindly.
+ *
+ * Page-granular rather than whole-buffer: a ring allocator touches a small
+ * moving window of a large buffer, so whole-buffer comparison would resend
+ * everything for a few changed bytes. */
+#define WMTR_PAGE 65536u
+
+static uint64_t wmtr_page_sum(const uint8_t *p, size_t n) {
+    /* Every byte is covered -- a missed change shows as a stale frame, not an
+     * error, so this must not sample. But it runs over every live buffer every
+     * frame, so the PER-BYTE COST IS THE FRAME BUDGET: a byte-at-a-time FNV is
+     * a serial multiply chain at a couple of GB/s, which cost ~190ms a frame
+     * here. Four independent lanes over 64-bit words keeps the same coverage
+     * while letting the CPU issue the multiplies in parallel. */
+    uint64_t a = 0x9e3779b97f4a7c15ull, b = 0xc2b2ae3d27d4eb4full;
+    uint64_t c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
+    size_t i = 0;
+    while (i + 32 <= n) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + i,      8); memcpy(&w1, p + i + 8,  8);
+        memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
+        a = (a ^ w0) * 0x100000001b3ull;
+        b = (b ^ w1) * 0x100000001b3ull;
+        c = (c ^ w2) * 0x100000001b3ull;
+        d = (d ^ w3) * 0x100000001b3ull;
+        i += 32;
+    }
+    uint64_t tail = 0;
+    for (; i < n; i++) tail = (tail ^ p[i]) * 0x100000001b3ull;
+    uint64_t hsum = a ^ (b << 1) ^ (c << 2) ^ (d << 3) ^ tail ^ (uint64_t)n;
+    return hsum ? hsum : 1;   /* 0 means "never hashed" */
+}
+
+/* Bytes considered vs bytes actually sent, so the saving is measured. */
+static unsigned long long wmtr_flush_seen, wmtr_flush_sent;
+static unsigned long wmtr_flush_n;
 #define WMTR_BUFS_MAX 4096
 static struct wmtr_buf wmtr_bufs[WMTR_BUFS_MAX];
 static unsigned wmtr_bufs_n;
@@ -258,6 +319,7 @@ static void wmtr_buf_remove(uint64_t handle) {
     for (unsigned i = 0; i < wmtr_bufs_n; i++) {
         if (wmtr_bufs[i].handle != handle) continue;
         if (wmtr_bufs[i].owned) free(wmtr_bufs[i].shadow);
+        free(wmtr_bufs[i].page_sum);
         wmtr_bufs[i] = wmtr_bufs[--wmtr_bufs_n];
         break;
     }
@@ -297,6 +359,38 @@ static void wmtr_flush_buffers(void) {
     for (unsigned i = 0; i < n; i++) {
         struct wmtr_buf *b = &wmtr_bufs[i];
         if (!b->cpu_visible || !b->shadow || !b->length) continue;
+        wmtr_flush_seen += b->length;
+
+        if (!b->page_sum) {
+            b->pages = (uint32_t)((b->length + WMTR_PAGE - 1) / WMTR_PAGE);
+            b->page_sum = calloc(b->pages, sizeof *b->page_sum);
+        }
+        if (b->page_sum) {
+            /* Send only pages whose contents differ from what the host holds,
+             * coalescing neighbours so one changed run is one message. */
+            uint32_t p0 = 0;
+            while (p0 < b->pages) {
+                size_t off = (size_t)p0 * WMTR_PAGE;
+                size_t len = b->length - off < WMTR_PAGE ? (size_t)(b->length - off) : WMTR_PAGE;
+                uint64_t sum = wmtr_page_sum((const uint8_t *)b->shadow + off, len);
+                if (sum == b->page_sum[p0]) { p0++; continue; }
+                uint32_t p1 = p0;
+                size_t run = 0;
+                while (p1 < b->pages) {
+                    size_t o2 = (size_t)p1 * WMTR_PAGE;
+                    size_t l2 = b->length - o2 < WMTR_PAGE ? (size_t)(b->length - o2) : WMTR_PAGE;
+                    uint64_t s2 = wmtr_page_sum((const uint8_t *)b->shadow + o2, l2);
+                    if (p1 != p0 && s2 == b->page_sum[p1]) break;
+                    b->page_sum[p1] = s2; run += l2; p1++;
+                }
+                if (wmtr_buf_upload(b->handle, (const uint8_t *)b->shadow + off,
+                                    off, run) != 0) failed++;
+                else wmtr_flush_sent += run;
+                p0 = p1;
+            }
+            continue;
+        }
+
         if (wmtr_buf_upload(b->handle, b->shadow, 0, b->length) != 0) {
             failed++;
             /* Name the buffer, not just the count: a vertex buffer that never
@@ -310,6 +404,11 @@ static void wmtr_flush_buffers(void) {
                         b->options);
         }
     }
+    if ((++wmtr_flush_n % 60) == 0)
+        fprintf(stderr, "[wmt-remote] flush #%lu: %u buffers, %llu MB considered, "
+                        "%llu MB sent (%.1f%%)\n", wmtr_flush_n, n,
+                wmtr_flush_seen >> 20, wmtr_flush_sent >> 20,
+                wmtr_flush_seen ? 100.0 * wmtr_flush_sent / wmtr_flush_seen : 0.0);
     pthread_mutex_unlock(&wmtr_bufs_lock);
     if (failed) {
         static unsigned reported;

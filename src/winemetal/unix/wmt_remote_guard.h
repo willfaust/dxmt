@@ -2,22 +2,6 @@
  * Regenerate whenever __wine_unix_call_funcs[] or the routed set changes.
  * Do not hand-edit. */
 
-static NTSTATUS _rmg_MTLBuffer_newTexture(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_mtlbuffer_newtexture *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("MTLBuffer_newTexture");
-  }
-  return _MTLBuffer_newTexture(obj);
-}
-static NTSTATUS _rmg_MTLDevice_minimumLinearTextureAlignmentForPixelFormat(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_uint64_uint64_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("MTLDevice_minimumLinearTextureAlignmentForPixelFormat");
-  }
-  return _MTLDevice_minimumLinearTextureAlignmentForPixelFormat(obj);
-}
 static NTSTATUS _rmg_NSObject_description(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_generic_obj_obj_ret *p = obj;
@@ -25,14 +9,6 @@ static NTSTATUS _rmg_NSObject_description(void *obj) {
     return wmtr_unimplemented("NSObject_description");
   }
   return _NSObject_description(obj);
-}
-static NTSTATUS _rmg_MTLCommandBuffer_blitCommandEncoder(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_obj_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("MTLCommandBuffer_blitCommandEncoder");
-  }
-  return _MTLCommandBuffer_blitCommandEncoder(obj);
 }
 static NTSTATUS _rmg_MTLCommandBuffer_computeCommandEncoder(void *obj) {
   if (wmtr_enabled()) {
@@ -50,12 +26,6 @@ static NTSTATUS _rmg_MTLDevice_newMeshRenderPipelineState(void *obj) {
     return wmtr_unimplemented("MTLDevice_newMeshRenderPipelineState");
   }
   return _MTLDevice_newMeshRenderPipelineState(obj);
-}
-static NTSTATUS _rmg_MTLBlitCommandEncoder_encodeCommands(void *obj) {
-  if (wmtr_enabled()) {
-    return wmtr_unimplemented("MTLBlitCommandEncoder_encodeCommands");
-  }
-  return _MTLBlitCommandEncoder_encodeCommands(obj);
 }
 static NTSTATUS _rmg_MTLComputeCommandEncoder_encodeCommands(void *obj) {
   if (wmtr_enabled()) {
@@ -108,14 +78,6 @@ static NTSTATUS _rmg_MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *
     return wmtr_unimplemented("MTLCommandBuffer_presentDrawableAfterMinimumDuration");
   }
   return _MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj);
-}
-static NTSTATUS _rmg_MTLDevice_supportsTextureSampleCount(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_uint64_uint64_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("MTLDevice_supportsTextureSampleCount");
-  }
-  return _MTLDevice_supportsTextureSampleCount(obj);
 }
 static NTSTATUS _rmg_MTLCaptureManager_sharedCaptureManager(void *obj) {
   if (wmtr_enabled()) {
@@ -183,12 +145,6 @@ static NTSTATUS _rmg_MTLDevice_supportsFXTemporalScaler(void *obj) {
   }
   return _MTLDevice_supportsFXTemporalScaler(obj);
 }
-static NTSTATUS _rmg_MTLCommandEncoder_setLabel(void *obj) {
-  if (wmtr_enabled()) {
-    return wmtr_unimplemented("MTLCommandEncoder_setLabel");
-  }
-  return _MTLCommandEncoder_setLabel(obj);
-}
 static NTSTATUS _rmg_MTLCommandBuffer_error(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_generic_obj_obj_ret *p = obj;
@@ -229,14 +185,6 @@ static NTSTATUS _rmg_MetalLayer_setColorSpace(void *obj) {
   }
   return _MetalLayer_setColorSpace(obj);
 }
-static NTSTATUS _rmg_WMTGetPrimaryDisplayId(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("WMTGetPrimaryDisplayId");
-  }
-  return _WMTGetPrimaryDisplayId(obj);
-}
 static NTSTATUS _rmg_WMTGetSecondaryDisplayId(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_generic_obj_ret *p = obj;
@@ -244,12 +192,6 @@ static NTSTATUS _rmg_WMTGetSecondaryDisplayId(void *obj) {
     return wmtr_unimplemented("WMTGetSecondaryDisplayId");
   }
   return _WMTGetSecondaryDisplayId(obj);
-}
-static NTSTATUS _rmg_WMTGetDisplayDescription(void *obj) {
-  if (wmtr_enabled()) {
-    return wmtr_unimplemented("WMTGetDisplayDescription");
-  }
-  return _WMTGetDisplayDescription(obj);
 }
 static NTSTATUS _rmg_WMTQueryDisplaySetting(void *obj) {
   if (wmtr_enabled()) {

@@ -70,6 +70,11 @@ ROUTED = {
     '_MTLDevice_newTexture', '_MTLTexture_replaceRegion', '_MTLTexture_newTextureView',
     # layer properties: the guest's requested drawable size must reach the host
     '_MetalLayer_setProps', '_MetalLayer_getProps',
+    # a real title's delta: blit stream and the device queries it divides by
+    '_MTLCommandBuffer_blitCommandEncoder', '_MTLBlitCommandEncoder_encodeCommands',
+    '_MTLDevice_minimumLinearTextureAlignmentForPixelFormat',
+    '_MTLDevice_supportsTextureSampleCount', '_MTLBuffer_newTexture',
+    '_MTLCommandEncoder_setLabel',
 }
 
 # Deliberately NOT guarded -- these belong on whichever machine runs the guest.
@@ -102,7 +107,16 @@ ROUTED = {
 LOCAL_OK = re.compile(r'^(thunk_SM50|CacheReader_|CacheWriter_|DispatchData_|'
                       r'NSAutoreleasePool_|SharedEventListener_|NSString_|'
                       r'WMTSetMetalShaderCachePath|WMTQueryDisplaySettingForLayer|'
-                      r'MetalLayer_getEDRValue|DeveloperHUDProperties_)')
+                      r'MetalLayer_getEDRValue|DeveloperHUDProperties_|'
+                      r'WMTGetPrimaryDisplayId|WMTGetDisplayDescription)')
+#
+# ⛔ A call may only be listed above if it NEVER DEREFERENCES ITS HANDLE on iOS.
+# In remote mode every handle is a host pointer, so running such a call locally
+# dereferences another machine's address. MetalLayer_setColorSpace,
+# MTLCommandBuffer_logs and MTLCommandEncoder_setLabel were briefly listed here
+# and crashed the instant a window was created. The two that remain are safe:
+# WMTGetPrimaryDisplayId ignores its handle entirely and returns CGMainDisplayID,
+# and WMTGetDisplayDescription's body is #if !TARGET_OS_IOS.
 
 def main():
     text = open(SRC).read()
