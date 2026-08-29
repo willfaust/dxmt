@@ -894,6 +894,11 @@ static unsigned short wmt_first_seq[64];
 static unsigned wmt_first_len;
 static int wmt_first_kind = -1;
 
+/* Report PERIODICALLY, not only at exit. iOS apps are killed or backgrounded,
+ * not cleanly exited, so an atexit-only summary never fires -- the first run
+ * armed the census, counted commands, and printed nothing. */
+static void wmt_census_report(void);
+
 static void wmt_census_report(void) {
     if (wmt_census_on != 1) return;
     fprintf(stderr, "\n[cmd-census] ml758 batches render=%lu compute=%lu blit=%lu\n",
@@ -943,6 +948,15 @@ static inline void wmt_census_batch(const struct wmtcmd_base *head, int kind) {
     if (capture) wmt_first_len = (unsigned)(n < 64 ? n : 64);
     wmt_records_total += n;
     if (n > wmt_records_max) wmt_records_max = n;
+
+    /* First batch, then every 512, then at exit. The first tells us the census
+     * is live and shows a real batch shape immediately; the cadence keeps a
+     * long-running app reporting without flooding the log. */
+    {
+        static unsigned long ticks;
+        unsigned long t = ++ticks;
+        if (t == 1 || (t & 0x1FF) == 0) wmt_census_report();
+    }
 }
 
 static inline void wmt_census_sidecar_bytes(unsigned long len) {
