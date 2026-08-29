@@ -1,7 +1,8 @@
 winemetal_src = [
   'main.c',
   'airconv_thunks.c',
-  'winemetal_thunks.c'
+  'winemetal_thunks.c',
+  'wmt_api_census.c'
 ]
 
 winemetal_ld_args = []

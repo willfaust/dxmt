@@ -9,11 +9,35 @@
 #include "assert.h"
 #include "string.h"
 
+/* ml761: top-level API census.
+ *
+ * Counts every call across the single PE->unix boundary, so all 114 entries
+ * are measured consistently rather than by instrumenting call sites one at a
+ * time. Names come from wmt_api_names.h, generated from the same dispatch
+ * table the codes index -- a second hand-numbered list would drift and
+ * silently attribute calls to the wrong function.
+ *
+ * This exists because a packed command batch carries GUEST handles, which are
+ * raw pointer casts and meaningless on another machine. Before resource
+ * creation can be redirected, we need to know exactly which calls produce and
+ * consume handles in a real workload -- the same reason the command census
+ * came before the wire schema.
+ *
+ * Atomic counters, summary only. Pipeline and resource work may be
+ * multithreaded even where rendering is not, and per-call logging would
+ * distort the very workload being measured.
+ */
+#include "wmt_api_names.h"
+#include <stdatomic.h>
+
+extern void wmt_api_census_note(unsigned code);
+
 #ifdef NDEBUG
-#define UNIX_CALL(code, params) WINE_UNIX_CALL(code, params)
+#define UNIX_CALL(code, params) do { wmt_api_census_note(code); WINE_UNIX_CALL(code, params); } while (0)
 #else
 #define UNIX_CALL(code, params)                                                                                        \
   {                                                                                                                    \
+    wmt_api_census_note(code);                                                                                         \
     NTSTATUS status = WINE_UNIX_CALL(code, params);                                                                    \
     assert(!status && "unix call failed");                                                                             \
   }
