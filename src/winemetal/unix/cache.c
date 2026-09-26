@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#include <TargetConditionals.h>
 #include "sqlite3.h"
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
@@ -16,26 +17,43 @@
 @interface CacheReader () {
   sqlite3 *_db;
   sqlite3_stmt *_stmt;
+  uint64_t _hits, _misses;
+  bool _stats;
 }
 @end
 
 static inline NSString *
 resolve_cache_dir(NSString *path, bool path_is_file) {
+  if (!path.length) return nil;
   if (![path hasPrefix:@"/"]) {
+    NSString *base = nil;
+#if TARGET_OS_IPHONE
+    const char *option = getenv("DXMT_IOS_CACHE_DIR");
+    if (!option || strcmp(option, "0")) {
+      // Darwin's per-user cache confstr is not available in the iOS sandbox.
+      base = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+      static dispatch_once_t once;
+      dispatch_once(&once, ^{
+        NSLog(@"[shader-cache] ml1160 app cache directory %@", base ? @"available" : @"unavailable");
+      });
+    }
+#endif
+    if (!base) {
     char buf[PATH_MAX];
     size_t len = confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
 
-    if (!len) {
+    if (!len || len > sizeof(buf)) {
       return nil;
     }
 
-    NSString *base = [NSString stringWithUTF8String:buf];
+    base = [NSString stringWithUTF8String:buf];
+    }
     path = [base stringByAppendingPathComponent:path];
   }
-  [[NSFileManager defaultManager] createDirectoryAtPath:path_is_file ? [path stringByDeletingLastPathComponent] : path
+  if (![[NSFileManager defaultManager] createDirectoryAtPath:path_is_file ? [path stringByDeletingLastPathComponent] : path
                             withIntermediateDirectories:YES
                                              attributes:nil
-                                                  error:nil];
+                                                  error:nil]) return nil;
   return path;
 }
 
@@ -43,6 +61,8 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 
 - (instancetype)initWithPath:(NSString *)path version:(uint64_t)version {
   if ((self = [super init])) {
+    const char *stats = getenv("DXMT_CACHE_STATS");
+    _stats = !stats || strcmp(stats, "0");
     NSString *dbPath = resolve_cache_dir(path, true);
     if (!dbPath) {
       NSLog(@"[CacheReader] Failed to resolve cache path");
@@ -78,6 +98,12 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     result = dispatch_data_create(bytes, len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
   }
   sqlite3_reset(_stmt);
+  if (_stats) {
+    if (result) ++_hits; else ++_misses;
+    uint64_t count = _hits + _misses;
+    if (count == 1 || count == 64 || count == 256 || !(count % 1024))
+      NSLog(@"[shader-cache] ml1160 hits=%llu misses=%llu", _hits, _misses);
+  }
   return result;
 }
 
@@ -231,8 +257,11 @@ _WMTSetMetalShaderCachePath(void *obj) {
   struct unixcall_setmetalcachepath *params = obj;
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   NSString *resolved_path = resolve_cache_dir(path, false);
-  MTLSetShaderCachePath(resolved_path);
-  params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
+  params->ret_success = 0;
+  if (resolved_path) {
+    MTLSetShaderCachePath(resolved_path);
+    params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
+  }
   [path release];
   return 0;
 };

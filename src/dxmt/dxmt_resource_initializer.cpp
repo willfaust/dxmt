@@ -234,107 +234,20 @@ ResourceInitializer::initWithZero(
  * UpdateSubresource/Copy, zero CPU access. Decode costs ~+119MB of RGBA8 (peak
  * ~3.13GB vs a 4096MB jetsam) and is LOSSLESS, unlike an ETC2 re-encode. */
 
-static inline void bc_rgb565(uint16_t c, uint8_t *out) {
-  uint32_t r = (c >> 11) & 0x1f, g = (c >> 5) & 0x3f, b = c & 0x1f;
-  out[0] = (uint8_t)((r << 3) | (r >> 2));
-  out[1] = (uint8_t)((g << 2) | (g >> 4));
-  out[2] = (uint8_t)((b << 3) | (b >> 2));
-}
+/* ml1012: the block decoders and the per-image loop BOTH live in dxmt_bcn.hpp
+ * now, so the D3D9 upload funnel reaches the same code this path does. What
+ * remains here are the two format predicates (which are about the REMAP, not
+ * about BC itself) and thin forwarders that keep this file's existing callers
+ * and dxmt_resource_initializer.hpp's declarations unchanged. */
 
-/* One BC1 colour block -> 16 RGBA8 texels. `punchthrough` selects the 3-colour
- * mode with a transparent index-3; BC3's embedded colour block never uses it. */
-static void bc1_block(const uint8_t *blk, uint8_t out[64], bool punchthrough) {
-  uint16_t c0 = (uint16_t)(blk[0] | (blk[1] << 8));
-  uint16_t c1 = (uint16_t)(blk[2] | (blk[3] << 8));
-  uint8_t p[4][4];
-  bc_rgb565(c0, p[0]); p[0][3] = 255;
-  bc_rgb565(c1, p[1]); p[1][3] = 255;
-  if (!punchthrough || c0 > c1) {
-    for (int i = 0; i < 3; i++) {
-      p[2][i] = (uint8_t)((2 * p[0][i] + p[1][i] + 1) / 3);
-      p[3][i] = (uint8_t)((p[0][i] + 2 * p[1][i] + 1) / 3);
-    }
-    p[2][3] = p[3][3] = 255;
-  } else {
-    for (int i = 0; i < 3; i++) {
-      p[2][i] = (uint8_t)((p[0][i] + p[1][i] + 1) / 2);
-      p[3][i] = 0;
-    }
-    p[2][3] = 255;
-    p[3][3] = 0;   /* the punch-through texel */
-  }
-  uint32_t idx = (uint32_t)(blk[4] | (blk[5] << 8) | (blk[6] << 16) | ((uint32_t)blk[7] << 24));
-  for (int t = 0; t < 16; t++) {
-    const uint8_t *src = p[(idx >> (t * 2)) & 3];
-    out[t * 4 + 0] = src[0]; out[t * 4 + 1] = src[1];
-    out[t * 4 + 2] = src[2]; out[t * 4 + 3] = src[3];
-  }
-}
-
-/* BC3 = 8-byte BC4-style alpha block + a BC1 colour block that is ALWAYS in
- * 4-colour mode (no punch-through). */
-static void bc3_block(const uint8_t *blk, uint8_t out[64]) {
-  bc1_block(blk + 8, out, /*punchthrough=*/false);
-  uint8_t a[8];
-  a[0] = blk[0]; a[1] = blk[1];
-  if (a[0] > a[1]) {
-    for (int i = 1; i < 7; i++) a[i + 1] = (uint8_t)(((7 - i) * a[0] + i * a[1] + 3) / 7);
-  } else {
-    for (int i = 1; i < 5; i++) a[i + 1] = (uint8_t)(((5 - i) * a[0] + i * a[1] + 2) / 5);
-    a[6] = 0; a[7] = 255;
-  }
-  uint64_t bits = 0;
-  for (int i = 0; i < 6; i++) bits |= (uint64_t)blk[2 + i] << (8 * i);
-  for (int t = 0; t < 16; t++) out[t * 4 + 3] = a[(bits >> (t * 3)) & 7];
-}
-
-/* Decode a whole subresource. src_pitch is the guest's BC row pitch (bytes per
- * ROW OF BLOCKS); dst is tightly packed RGBA8 at width*4. Edge blocks are
- * decoded in full and clipped, which is what the BC spec requires for
- * non-multiple-of-4 dimensions. */
 /* Physical bytes per texel produced by each decode kind. */
 uint32_t bc_decode_texel_size(int kind) {
-  switch (kind) {
-  case 4: case 14: return 1;   /* BC4 -> R8  */
-  case 5: case 15: return 2;   /* BC5 -> RG8 */
-  default:         return 4;   /* BC1/2/3/7 -> RGBA8 */
-  }
+  return bcn_texel_size(kind);
 }
 
 void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
                             uint32_t height, int kind) {
-  const uint32_t bx_n = (width + 3) / 4, by_n = (height + 3) / 4;
-  const size_t blk_bytes = (kind == 1 || kind == 4 || kind == 14) ? 8 : 16;
-  const uint32_t tsz = bc_decode_texel_size(kind);
-  const size_t dst_pitch = (size_t)width * tsz;
-  uint8_t texels[64];
-  for (uint32_t by = 0; by < by_n; by++) {
-    const uint8_t *row = src + (size_t)by * src_pitch;
-    for (uint32_t bx = 0; bx < bx_n; bx++) {
-      const uint8_t *b = row + bx * blk_bytes;
-      switch (kind) {
-      case 1:  bcn_bc1_block(b, texels, /*punchthrough=*/true); break;
-      case 2:  bcn_bc2_block(b, texels); break;
-      case 3:  bcn_bc3_block(b, texels); break;
-      case 4:  bcn_bc4_block(b, texels, false); break;
-      case 14: bcn_bc4_block(b, texels, true);  break;
-      case 5:  bcn_bc5_block(b, texels, false); break;
-      case 15: bcn_bc5_block(b, texels, true);  break;
-      case 7:  bcn_bc7_block(b, texels); break;
-      default: memset(texels, 0, sizeof(texels)); break;
-      }
-      for (uint32_t ty = 0; ty < 4; ty++) {
-        const uint32_t y = by * 4 + ty;
-        if (y >= height) break;
-        for (uint32_t tx = 0; tx < 4; tx++) {
-          const uint32_t x = bx * 4 + tx;
-          if (x >= width) break;
-          memcpy(dst + (size_t)y * dst_pitch + (size_t)x * tsz,
-                 texels + (size_t)(ty * 4 + tx) * tsz, tsz);
-        }
-      }
-    }
-  }
+  bcn_decode_image(src, src_pitch, dst, /*dst_pitch=*/0, width, height, kind);
 }
 
 
@@ -680,14 +593,34 @@ ResourceInitializer::allocateZeroBuffer(size_t size) {
       return {};
     }
 
+    /* MADEIRA ml1490: grow to the next power of two (at least 1 MB) instead of
+     * the exact request. Each growth above costs a flushInternal(), and a
+     * loading screen asking for slowly rising sizes regrew it 322 times on
+     * device. DXMT_ZERO_BUFFER_POW2=0 restores exact sizing. */
+    static const bool pow2 = [] {
+      const bool value = env::getEnvVar("DXMT_ZERO_BUFFER_POW2") != "0";
+      WARN("[zero-buffer] ml1490 pow2-growth=", value, " (DXMT_ZERO_BUFFER_POW2=0 disables)");
+      return value;
+    }();
+    size_t length = size;
+    if (pow2) {
+      length = size_t(1) << 20;
+      while (length < size)
+        length <<= 1;
+    }
     WMTBufferInfo buffer_info;
     buffer_info.gpu_address = 0;
-    buffer_info.length = size;
+    buffer_info.length = length;
     buffer_info.memory.set(nullptr);
     buffer_info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;
+    /* ml1490: the buffer being replaced is released with this assignment, so
+     * the census drops it here; it counted every buffer ever made as live. */
+    if (zero_buffer_census_)
+      mem_census_sub(MEMOWN_INIT_UPLOAD, zero_buffer_census_);
     zero_buffer_ = device_.newBuffer(buffer_info);
     mem_census_add(MEMOWN_INIT_UPLOAD, buffer_info.length);  /* ml677 */
-    zero_buffer_size_ = size;
+    zero_buffer_census_ = buffer_info.length;
+    zero_buffer_size_ = length;
 
     fill->type = WMTBlitCommandFillBuffer;
     fill->buffer = zero_buffer_;

@@ -9,6 +9,10 @@ util_src = files([
   # 'util_shared_res.cpp',
   # 'util_sleep.cpp',
   'util_bloom.cpp',
+  # MADEIRA (WOW64_DESIGN.md, ml1070): the wait-on-address backend behind
+  # dxmt::atomic_wait / atomic_notify_*, and the one line that says which
+  # backend a session is on.
+  'util_futex.cpp',
 
   'thread.cpp',
 
@@ -50,7 +54,22 @@ util_lib = static_library('util', util_src,
   include_directories : [ dxmt_include_path ],
 )
 
+# MADEIRA (WOW64_DESIGN.md, ml1070): util_futex.cpp calls RtlWaitOnAddress /
+# RtlWakeAddressSingle / RtlWakeAddressAll.  ntdll rather than the
+# api-ms-win-core-synch-l1-2-0 API set on purpose: kernelbase's WaitOnAddress
+# IS RtlWaitOnAddress and its two Wake entry points are literal forwards to
+# the Rtl ones, but ntdll.dll is always in the module list under its own name
+# while the API-set name has to survive an apiset lookup -- and a silently
+# failed apiset lookup is precisely the libc++ failure mode this replaces.
+# Declared on util_dep so every module that links util gets the import, and
+# only on a Windows host so the native build is untouched.
+util_futex_link_args = []
+if host_machine.system() == 'windows'
+  util_futex_link_args += [ '-lntdll' ]
+endif
+
 util_dep = declare_dependency(
   link_with           : [ util_lib ],
+  link_args           : util_futex_link_args,
   include_directories : [ include_directories('.') ],
 )

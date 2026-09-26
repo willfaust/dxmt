@@ -16,6 +16,10 @@
 
 #include "wsi_monitor.hpp"
 
+#include "util_env.hpp"
+#include "log/log.hpp"
+#include "util_string.hpp"
+
 namespace dxmt::wsi {
 
 /* Synthetic singleton monitor handle. Non-NULL so EnumOutputs sees a
@@ -38,6 +42,22 @@ static void getScreenSize(uint32_t *w, uint32_t *h) {
 }
 
 HMONITOR getDefaultMonitor() {
+  static const bool useIdentity = env::getEnvVar("DXMT_WSI_MONITOR_IDENTITY") != "0";
+  if (useIdentity) {
+    // DXGI_OUTPUT_DESC::Monitor must identify the same output as user32.
+    // A private sentinel prevents clients from matching the display even when
+    // its name and dimensions are correct.
+    HMONITOR monitor = ::MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (monitor) {
+      static const bool announced = [monitor] {
+        Logger::warn(str::format("[monitor-identity] ml1190 using user32 primary=", monitor,
+            " (DXMT_WSI_MONITOR_IDENTITY=0 restores the synthetic handle)"));
+        return true;
+      }();
+      (void)announced;
+      return monitor;
+    }
+  }
   return kSyntheticMonitor;
 }
 
@@ -45,11 +65,11 @@ HMONITOR enumMonitors(uint32_t index) {
   /* Only one synthetic monitor exists. */
   if (index != 0)
     return nullptr;
-  return kSyntheticMonitor;
+  return getDefaultMonitor();
 }
 
 bool getDisplayName(HMONITOR hMonitor, WCHAR (&Name)[32]) {
-  if (hMonitor != kSyntheticMonitor)
+  if (hMonitor != getDefaultMonitor())
     return false;
   /* Standard Windows display device name "\\.\DISPLAY1". */
   static const WCHAR kName[] = {'\\','\\','.','\\','D','I','S','P','L','A','Y','1', 0};
@@ -59,7 +79,7 @@ bool getDisplayName(HMONITOR hMonitor, WCHAR (&Name)[32]) {
 }
 
 bool getDesktopCoordinates(HMONITOR hMonitor, RECT *pRect) {
-  if (hMonitor != kSyntheticMonitor || !pRect)
+  if (hMonitor != getDefaultMonitor() || !pRect)
     return false;
   /* Real screen size from user32 — MUST agree with what win32u's virtual
    * monitor reports (sysparams_ios.c now serves the same values through
@@ -82,26 +102,46 @@ static inline void fillMode(WsiMode *pMode, uint32_t w, uint32_t h) {
   pMode->interlaced = false;
 }
 
-/* Mode list: classic small modes + the real desktop resolution (deduped),
- * all @ 60Hz 32bpp. Mirrors the win32u NtUserEnumDisplaySettings synth so
- * user32 and DXGI tell games the same story. Nothing larger than the
- * desktop — bigger modes crop on the virtual desktop surface. */
+/* iOS-Madeira 2026-09-16: the mode list used to be "640x480, 800x600 and
+ * whatever you are already running" -- THREE entries, at most. The win32u
+ * virtual monitor has offered a real mode table since 2026-09-14
+ * (build/win32u-unix/sysparams_ios.c, ios_standard_modes[]), so user32 and
+ * DXMT stopped telling applications the same story: EnumDisplaySettings
+ * listed 14+ modes and IDirect3D9::GetAdapterModeCount listed 3. An
+ * application that had saved 1024x768, or that walks EnumAdapterModes looking
+ * for the mode it wants before CreateDevice, found nothing and fell into its
+ * own "could not initialise the renderer" path.
+ *
+ * The two sources must agree, so ask the one authority there is:
+ * EnumDisplaySettingsExW IS the win32u table, verbatim -- no second copy to
+ * drift. */
 bool getDisplayMode(HMONITOR hMonitor, uint32_t modeNumber, WsiMode *pMode) {
-  if (hMonitor != kSyntheticMonitor || !pMode)
+  if (hMonitor != getDefaultMonitor() || !pMode)
     return false;
-  uint32_t sw, sh;
-  getScreenSize(&sw, &sh);
-  uint32_t widths[3]  = {640, 800, sw};
-  uint32_t heights[3] = {480, 600, sh};
-  uint32_t count = ((sw == 640 && sh == 480) || (sw == 800 && sh == 600)) ? 2 : 3;
-  if (modeNumber >= count)
+
+  DEVMODEW dm = {};
+  dm.dmSize = sizeof(dm);
+  /* NULL device = the primary display. win32u answers every name with the
+   * single virtual display, so the name never has to be resolved first. */
+  if (!::EnumDisplaySettingsExW(nullptr, (DWORD)modeNumber, &dm, 0))
     return false;
-  fillMode(pMode, widths[modeNumber], heights[modeNumber]);
+  if (!dm.dmPelsWidth || !dm.dmPelsHeight)
+    return false;
+
+  pMode->width = dm.dmPelsWidth;
+  pMode->height = dm.dmPelsHeight;
+  /* dmDisplayFrequency is 0 or 1 on a driver that does not track a rate;
+   * both mean "unspecified", and a 0/1 Hz mode is not something an
+   * application can select. */
+  pMode->refreshRate.numerator = (dm.dmDisplayFrequency > 1) ? dm.dmDisplayFrequency : 60;
+  pMode->refreshRate.denominator = 1;
+  pMode->bitsPerPixel = dm.dmBitsPerPel ? dm.dmBitsPerPel : 32;
+  pMode->interlaced = (dm.dmDisplayFlags & DM_INTERLACED) != 0;
   return true;
 }
 
 bool getCurrentDisplayMode(HMONITOR hMonitor, WsiMode *pMode) {
-  if (hMonitor != kSyntheticMonitor || !pMode)
+  if (hMonitor != getDefaultMonitor() || !pMode)
     return false;
   uint32_t sw, sh;
   getScreenSize(&sw, &sh);

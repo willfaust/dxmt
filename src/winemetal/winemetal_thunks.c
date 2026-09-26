@@ -1143,6 +1143,29 @@ MTLSharedEvent_waitUntilSignaledValue(obj_handle_t event, uint64_t value, uint64
   return params.ret_timeout;
 }
 
+/* MADEIRA (WOW64_DESIGN.md section 8.4, measurement 2): the empty unix call.
+ *
+ * WINE_UNIX_CALL directly rather than UNIX_CALL, on purpose and in both build
+ * configurations:
+ *
+ *  - UNIX_CALL calls wmt_api_census_note() first, and in a debug build also
+ *    asserts the status. This function exists to report a number in
+ *    nanoseconds; instrumenting the one call whose entire job is to be
+ *    measured would fold the census's own atomic add into the answer.
+ *  - The block is not read back, so there is no status to act on beyond what
+ *    the caller can see. A NULL slot (ntdll returns STATUS_INVALID_PARAMETER)
+ *    or an unbound unixlib would still fail loudly, because the benchmark
+ *    checks for an implausibly small ns/call rather than assuming success.
+ *
+ * Slot 150; see the tables in unix/winemetal_unix.c. */
+WINEMETAL_API void
+WMTNop(uint64_t a, uint64_t b) {
+  struct unixcall_d3d9_nop params;
+  params.arg0 = a;
+  params.arg1 = b;
+  WINE_UNIX_CALL(150, &params);
+}
+
 /* madeira-d3d12: runtime DXIL -> metallib conversion.
  *
  * Slot 127, appended. The argument block is described once in

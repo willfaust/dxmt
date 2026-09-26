@@ -111,11 +111,17 @@ ROUTED = {
 # a version that changes at random makes DXMT reconfigure presentation
 # repeatedly. Their layer dereferences are all inside `#if !TARGET_OS_IOS`, so
 # running them locally never touches a host handle.
+#
+# MADEIRA (WOW64_DESIGN.md section 8.4): d3d9_nop is the empty slot the
+# unix-call benchmark times. It has no handle to dereference and no output to
+# leave uninitialised, so the ⛔ rule below is satisfied trivially; guarding it
+# would mean the benchmark measured the guard rather than the crossing.
 LOCAL_OK = re.compile(r'^(madeira_ir_|thunk_SM50|CacheReader_|CacheWriter_|DispatchData_|'
                       r'NSAutoreleasePool_|SharedEventListener_|NSString_|'
                       r'WMTSetMetalShaderCachePath|WMTQueryDisplaySettingForLayer|'
                       r'MetalLayer_getEDRValue|DeveloperHUDProperties_|'
-                      r'WMTGetPrimaryDisplayId|WMTGetDisplayDescription)')
+                      r'WMTGetPrimaryDisplayId|WMTGetDisplayDescription|'
+                      r'd3d9_nop$)')
 #
 # ⛔ A call may only be listed above if it NEVER DEREFERENCES ITS HANDLE on iOS.
 # In remote mode every handle is a host pointer, so running such a call locally
@@ -125,18 +131,52 @@ LOCAL_OK = re.compile(r'^(madeira_ir_|thunk_SM50|CacheReader_|CacheWriter_|Dispa
 # WMTGetPrimaryDisplayId ignores its handle entirely and returns CGMainDisplayID,
 # and WMTGetDisplayDescription's body is #if !TARGET_OS_IOS.
 
+# MADEIRA (WOW64_DESIGN.md section 7.4, rule 6): there are TWO tables, and the
+# 32-bit one holds different entries -- a `_Foo32` variant that converts the
+# guest pointers embedded in a 32-bit caller's argument block before calling
+# `_Foo`. This script used to compute one `guarded` set from the 64-bit table
+# and then rewrite BOTH tables from it, so an `_rmg_Foo32` entry in the wow64
+# table was silently rewritten to `_Foo32` -- stripping the guard from exactly
+# the entries a 32-bit caller uses. The fix is a per-array wanted set plus the
+# base -> base32 mapping below: a 32-bit variant is guarded if and only if its
+# 64-bit twin is, so the two tables can never disagree about what is routed.
+def guard_body(name, st, zero):
+    body = ['static NTSTATUS _rmg%s(void *obj) {' % name,
+            '  if (wmtr_enabled()) {']
+    if zero:
+        body.append('    struct %s *p = obj;' % st)
+        for f in zero:
+            body.append('    p->%s = 0;   /* never hand back uninitialised stack */' % f)
+    body += ['    return wmtr_unimplemented("%s");' % name[1:],
+             '  }',
+             '  return %s(obj);' % name, '}']
+    return body
+
+
 def main():
     text = open(SRC).read()
     rets = ret_fields()
-    # struct used by each handler, read from its own body
+    # struct used by each handler, read from its own body. The same shape
+    # matches a 32-bit variant, which reuses the 64-bit block (the embedded
+    # pointers are WMTMemoryPointer, 8 bytes on both sides), so its outputs
+    # get zeroed by its guard as well.
     bodies = dict(re.findall(r'^(_[A-Za-z0-9_]+)\(void \*obj\) \{\s*\n\s*struct (unixcall_[A-Za-z0-9_]+) \*params = obj;',
                              text, re.M))
-    m = re.search(r'const void \*__wine_unix_call_funcs\[\] = \{(.*?)\n\};', text, re.S)
-    if not m:
-        sys.exit('dispatch table not found in %s' % SRC)
-    raw = re.findall(r'^\s*(&?[A-Za-z0-9_]+|NULL)\s*,', m.group(1), re.M)
 
-    out, n, guarded = [], 0, set()
+    def table(name):
+        m = re.search(r'const void \*%s\[\] = \{(.*?)\n\};' % name, text, re.S)
+        if not m:
+            sys.exit('%s not found in %s' % (name, SRC))
+        return re.findall(r'^\s*(&?[A-Za-z0-9_]+|NULL)\s*,', m.group(1), re.M)
+
+    raw = table('__wine_unix_call_funcs')
+    raw32 = table('__wine_unix_call_wow64_funcs')
+    if len(raw) != len(raw32):
+        sys.exit('the two tables disagree in length (%d vs %d): the slot number '
+                 'is the ABI, so a 32-bit variant must sit at the same index as '
+                 'its 64-bit twin' % (len(raw), len(raw32)))
+
+    out, n, guarded, guarded32 = [], 0, set(), set()
     for e in raw:
         if e == 'NULL' or not e.startswith('&'):
             continue
@@ -150,38 +190,54 @@ def main():
         if not re.search(r'^\s*(static\s+)?(NTSTATUS\s+)?%s\(' % re.escape(name), text, re.M):
             sys.exit('unresolvable handler: %s' % name)
         st = bodies.get(name)
-        zero = rets.get(st, []) if st else []
-        body = ['static NTSTATUS _rmg%s(void *obj) {' % name,
-                '  if (wmtr_enabled()) {']
-        if zero:
-            body.append('    struct %s *p = obj;' % st)
-            for f in zero:
-                body.append('    p->%s = 0;   /* never hand back uninitialised stack */' % f)
-        body += ['    return wmtr_unimplemented("%s");' % name[1:],
-                 '  }',
-                 '  return %s(obj);' % name, '}']
-        out += body
+        out += guard_body(name, st, rets.get(st, []) if st else [])
         guarded.add(name)
         n += 1
+
+    # Now the wow64 table. Anything it shares with the 64-bit table reuses that
+    # entry's decision (and its already-emitted guard); a `_Foo32` variant gets
+    # its own guard iff `_Foo` is guarded.
+    out32 = []
+    for e in raw32:
+        if e == 'NULL' or not e.startswith('&'):
+            continue
+        name = e.lstrip('&')
+        if name.startswith('_rmg'):
+            name = '_' + name[len('_rmg_'):]
+        if not name.endswith('32'):
+            continue                      # shared with the 64-bit table
+        twin = name[:-2]
+        if twin not in guarded:
+            continue
+        st = bodies.get(name)
+        out32 += guard_body(name, st, rets.get(st, []) if st else [])
+        guarded32.add(name)
+        n += 1
+    if out32:
+        # The variants they wrap only exist in a cross build (the wow64 table
+        # itself is #ifndef DXMT_NATIVE), so the wrappers must be too.
+        out += ['#ifndef DXMT_NATIVE'] + out32 + ['#endif /* DXMT_NATIVE */']
 
     # Rewrite the table entries too. Emitting guards without owning the table
     # let the two drift: names that became local kept pointing at wrappers that
     # were no longer generated. The generator owns both or neither.
-    def fix_table(m):
-        body = m.group(1)
-        def one(mm):
-            lead, name = mm.group(1), mm.group(2)
-            base = '_' + name[len('_rmg_'):] if name.startswith('_rmg_') else name
-            want = '_rmg' + base if base in guarded else base
-            return '%s&%s,' % (lead, want)
-        return m.group(0)[:m.start(1)-m.start(0)] + \
-               re.sub(r'^(\s*)&(_[A-Za-z0-9_]+),\s*$', one, body, flags=re.M) + \
-               m.group(0)[m.end(1)-m.start(0):]
+    def fix_table(wanted):
+        def sub(m):
+            body = m.group(1)
+            def one(mm):
+                lead, name = mm.group(1), mm.group(2)
+                base = '_' + name[len('_rmg_'):] if name.startswith('_rmg_') else name
+                want = '_rmg' + base if base in wanted else base
+                return '%s&%s,' % (lead, want)
+            return m.group(0)[:m.start(1)-m.start(0)] + \
+                   re.sub(r'^(\s*)&(_[A-Za-z0-9_]+),\s*$', one, body, flags=re.M) + \
+                   m.group(0)[m.end(1)-m.start(0):]
+        return sub
 
     text2 = re.sub(r'const void \*__wine_unix_call_funcs\[\] = \{(.*?)\n\};',
-                   fix_table, text, flags=re.S)
+                   fix_table(guarded), text, flags=re.S)
     text2 = re.sub(r'const void \*__wine_unix_call_wow64_funcs\[\] = \{(.*?)\n\};',
-                   fix_table, text2, flags=re.S)
+                   fix_table(guarded | guarded32), text2, flags=re.S)
     if text2 != text:
         open(SRC, 'w').write(text2)
 
@@ -191,7 +247,8 @@ def main():
                 ' * Regenerate whenever __wine_unix_call_funcs[] or the routed set changes.\n'
                 ' * Do not hand-edit. */\n\n')
         f.write('\n'.join(out) + '\n')
-    print('wrote %s with %d guards (%d routed, SM50 thunks intentionally local)'
-          % (os.path.relpath(dst, HERE), n, len(ROUTED)))
+    print('wrote %s with %d guards (%d of them 32-bit variants, %d routed, '
+          'SM50 thunks intentionally local)'
+          % (os.path.relpath(dst, HERE), n, len(guarded32), len(ROUTED)))
 
 main()

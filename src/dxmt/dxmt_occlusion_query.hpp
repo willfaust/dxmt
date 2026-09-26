@@ -126,6 +126,22 @@ public:
     seq_id_issued = seqId;
   }
 
+  /* iOS-Madeira ml998: account for a submission that produced NO visibility
+   * readback at all.  issue() cannot be used for that case -- there is no
+   * buffer to read and pointer arithmetic on nullptr is not a thing this code
+   * should do -- but the bookkeeping still has to happen, because getValue()
+   * reports a result only once seq_id_issued has caught up with seq_id_end.
+   * With nothing counted in this submission there is nothing to accumulate, so
+   * the running total is already the answer.  See the caller in
+   * ArgumentEncodingContext::flushCommands for why a query can end in such a
+   * submission and what it cost when it was simply dropped. */
+  void
+  issueEmpty(uint64_t seqId) {
+    assert(seqId >= seq_id_begin);
+    assert(seqId <= seq_id_end);
+    seq_id_issued = seqId;
+  }
+
   bool
   getValue(uint64_t *value) {
     if (seq_id_end <= seq_id_issued) {

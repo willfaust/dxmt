@@ -396,6 +396,17 @@ struct unixcall_mtlsharedevent_waituntilsignaledvalue {
   bool ret_timeout;
 };
 
+/* MADEIRA (WOW64_DESIGN.md section 8.4, measurement 2): argument block of the
+ * empty unix call. Two fixed-width 64-bit fields, so it is 16 bytes and
+ * layout-identical on i386 and on LP64 -- a realistic small block, and one
+ * with no embedded pointer, so the same handler serves both dispatch tables.
+ * Neither field is read or written; they exist so the measured call carries a
+ * block at all, the way every real slot does. */
+struct unixcall_d3d9_nop {
+  uint64_t arg0;
+  uint64_t arg1;
+};
+
 #pragma pack(pop)
 
 #endif

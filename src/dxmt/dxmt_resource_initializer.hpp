@@ -123,6 +123,7 @@ private:
   WMT::Reference<WMT::SharedEvent> upload_queue_event_;
   WMT::Reference<WMT::Buffer> zero_buffer_;
   size_t zero_buffer_size_ = 0;
+  uint64_t zero_buffer_census_ = 0; /* ml1490: bytes the census holds for zero_buffer_ */
   dxmt::mutex mutex_;
 
   void *cpu_command_heap;

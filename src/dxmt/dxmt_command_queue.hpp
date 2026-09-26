@@ -13,6 +13,7 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_cpu_fence.hpp"
+#include "util_futex.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

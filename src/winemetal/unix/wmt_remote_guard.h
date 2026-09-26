@@ -257,3 +257,111 @@ static NTSTATUS _rmg_MTLSharedEvent_waitUntilSignaledValue(void *obj) {
   }
   return _MTLSharedEvent_waitUntilSignaledValue(obj);
 }
+static NTSTATUS _rmg_MTLResidencySet_removeAllocation(void *obj) {
+  if (wmtr_enabled()) {
+    return wmtr_unimplemented("MTLResidencySet_removeAllocation");
+  }
+  return _MTLResidencySet_removeAllocation(obj);
+}
+static NTSTATUS _rmg_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtldevice_heaptexturesizealign *p = obj;
+    p->ret_size = 0;   /* never hand back uninitialised stack */
+    p->ret_align = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLDevice_heapTextureSizeAndAlign");
+  }
+  return _MTLDevice_heapTextureSizeAndAlign(obj);
+}
+static NTSTATUS _rmg_MTLDevice_newPlacementHeap(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtldevice_newplacementheap *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLDevice_newPlacementHeap");
+  }
+  return _MTLDevice_newPlacementHeap(obj);
+}
+static NTSTATUS _rmg_MTLHeap_newTextureAtOffset(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtlheap_newtextureatoffset *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLHeap_newTextureAtOffset");
+  }
+  return _MTLHeap_newTextureAtOffset(obj);
+}
+static NTSTATUS _rmg_madeira_ctl(void *obj) {
+  if (wmtr_enabled()) {
+    return wmtr_unimplemented("madeira_ctl");
+  }
+  return _madeira_ctl(obj);
+}
+static NTSTATUS _rmg_MTLDevice_heapBufferSizeAndAlign(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtldevice_heapbuffersizealign *p = obj;
+    p->ret_size = 0;   /* never hand back uninitialised stack */
+    p->ret_align = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLDevice_heapBufferSizeAndAlign");
+  }
+  return _MTLDevice_heapBufferSizeAndAlign(obj);
+}
+static NTSTATUS _rmg_MTLHeap_newBufferAtOffset(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtlheap_newbufferatoffset *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLHeap_newBufferAtOffset");
+  }
+  return _MTLHeap_newBufferAtOffset(obj);
+}
+#ifndef DXMT_NATIVE
+static NTSTATUS _rmg_MTLCaptureManager_startCapture32(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtlcapturemanager_startcapture *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLCaptureManager_startCapture32");
+  }
+  return _MTLCaptureManager_startCapture32(obj);
+}
+static NTSTATUS _rmg_MTLDevice_newTemporalScaler32(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtldevice_newfxtemporalscaler *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLDevice_newTemporalScaler32");
+  }
+  return _MTLDevice_newTemporalScaler32(obj);
+}
+static NTSTATUS _rmg_MTLDevice_newSpatialScaler32(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_mtldevice_newfxspatialscaler *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLDevice_newSpatialScaler32");
+  }
+  return _MTLDevice_newSpatialScaler32(obj);
+}
+static NTSTATUS _rmg_MTLCommandBuffer_encodeTemporalScale32(void *obj) {
+  if (wmtr_enabled()) {
+    return wmtr_unimplemented("MTLCommandBuffer_encodeTemporalScale32");
+  }
+  return _MTLCommandBuffer_encodeTemporalScale32(obj);
+}
+static NTSTATUS _rmg_MTLLogContainer_enumerate32(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_enumerate *p = obj;
+    p->ret_read = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("MTLLogContainer_enumerate32");
+  }
+  return _MTLLogContainer_enumerate32(obj);
+}
+static NTSTATUS _rmg_WMTQueryDisplaySetting32(void *obj) {
+  if (wmtr_enabled()) {
+    struct unixcall_query_display_setting *p = obj;
+    p->ret = 0;   /* never hand back uninitialised stack */
+    return wmtr_unimplemented("WMTQueryDisplaySetting32");
+  }
+  return _WMTQueryDisplaySetting32(obj);
+}
+static NTSTATUS _rmg_WMTUpdateDisplaySetting32(void *obj) {
+  if (wmtr_enabled()) {
+    return wmtr_unimplemented("WMTUpdateDisplaySetting32");
+  }
+  return _WMTUpdateDisplaySetting32(obj);
+}
+#endif /* DXMT_NATIVE */

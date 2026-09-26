@@ -156,8 +156,19 @@ add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
 # On iOS all Metal storage modes that are Managed on macOS must become
 # Shared — iOS has unified memory and raises an assertion for storageMode 1
-# (Managed). Enable for aarch64-windows cross-build which is our iOS target.
-if host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'windows'
+# (Managed). Every PE module in this fork is loaded by Wine inside the iOS
+# app, so the switch is a property of "cross-building a Windows module", not
+# of the module's architecture.
+#
+# MADEIRA (WOW64_DESIGN.md section 7): this used to test cpu_family ==
+# 'aarch64' because aarch64-windows was the only cross target. The 32-bit
+# (WoW64) path adds an i386-windows target whose cpu_family is 'x86', so
+# that test left DXMT_IOS undefined for it — an i386 d3d11 would then ask
+# Metal for storageMode Managed and trip the same iOS assertion the remap
+# exists to avoid. Keyed on the Windows host system instead, which covers
+# i386, aarch64 and arm64ec alike and still excludes the native macOS build
+# (dxmt_native, host system 'darwin').
+if host_machine.system() == 'windows'
   add_project_arguments('-DDXMT_IOS=1', language: 'cpp')
   add_project_arguments('-DDXMT_IOS=1', language: 'c')
 endif

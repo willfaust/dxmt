@@ -160,6 +160,27 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, const char *site) {
   if (flags.test(BufferAllocationFlag::GpuManaged)) {
     options |= WMTResourceStorageModeManaged;
   }
+#if defined(__i386__)
+  /* MADEIRA (WOW64_DESIGN.md section 7.5): on a 32-bit guest a CPU-visible
+   * allocation MUST supply its own memory. The alternative -- letting the unix
+   * side call newBufferWithLength: and write [buffer contents] back into
+   * info.memory -- yields a HOST pointer from Metal's heap, which is not inside
+   * the guest window and therefore has no 32-bit address that names it;
+   * _MTLDevice_newBuffer32 refuses that path loudly rather than truncating.
+   * CpuPlaced makes BufferAllocation's constructor wsi::aligned_malloc the
+   * backing (and its destructor free it), and that allocation comes from this
+   * PE module's own heap inside the WoW pseudo-process, so it goes through the
+   * window chokepoint by construction. Texture::allocate already does exactly
+   * this for its buffer-backed allocations (dxmt_texture.cpp). A Private /
+   * CpuInvisible allocation is left alone: the handler leaves memory NULL for
+   * it and there is nothing for the guest to address.
+   *
+   * This is the whole d3d9 vertex/index-buffer path: allocateD3D9BufferStorage
+   * and every DynamicBuffer rename ask for CpuWriteCombined, never
+   * CpuInvisible. */
+  if (!flags.test(BufferAllocationFlag::CpuInvisible))
+    flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
   WMTBufferInfo info;
   info.memory.set(0);
   info.length = length_;

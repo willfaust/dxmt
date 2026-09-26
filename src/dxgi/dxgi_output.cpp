@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include "util_env.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
@@ -405,6 +407,12 @@ public:
 
       dstModeId += 1;
     }
+
+    static const bool reportModes = env::getEnvVar("DXMT_DISPLAY_MODE_STATS") != "0";
+    static std::atomic<unsigned> modeQueries{0};
+    if (reportModes && modeQueries.fetch_add(1, std::memory_order_relaxed) < 16)
+      Logger::warn(str::format("[dxgi-modes] ml1190 monitor=", monitor_, " format=", unsigned(EnumFormat),
+          " count=", dstModeId, " capacity=", pDesc ? *pNumModes : 0, " fill=", pDesc != nullptr));
 
     // Sort display modes by width, height and refresh rate,
     // in that order. Some games rely on correct ordering.

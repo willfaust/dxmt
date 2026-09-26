@@ -9,6 +9,8 @@
 #include <cfloat>
 #include "dxmt_mem_census.hpp"
 #include "config/config.hpp"   /* ml754 */
+#include "util_env.hpp"
+#include <atomic>
 
 namespace dxmt {
 
@@ -742,6 +744,34 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     visibility_readback = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_
     );
+  } else {
+    /* iOS-Madeira ml998: A QUERY THAT ENDS IN AN EMPTY SUBMISSION WAS LOST.
+     *
+     * VisibilityResultQuery only reports a value once seq_id_issued reaches
+     * seq_id_end, and the ONLY thing that advances seq_id_issued is
+     * ~VisibilityResultReadback calling issue() for every query it captured.
+     * When vro_state_.reset() returns 0 -- this submission counted no
+     * visibility samples at all, e.g. a flush with no render encoder, or one
+     * whose encoders ran with no occlusion query active -- no readback object
+     * is built, so nothing will ever issue() for seqId. The erase_if below
+     * then dropped every query whose END landed here out of pending_queries_,
+     * and since a query is only ever issued through a readback that captured
+     * it, it could never be settled by any later submission either.
+     *
+     * The single-submission case was already handled (end() completes a query
+     * whose begin and end share a seq id and a counter offset); what was not
+     * is a query that BEGINS in one submission and ENDS in an empty one. That
+     * one is stranded permanently: D3D9's GetData polls it forever and the
+     * caller never gets its result. It is visible in the captures as
+     * [d3d9-query] worst_ever, which is 178 s in q67.txt (and 10.3 s in
+     * qp4.txt) against an issue_to_complete_avg of 34 ms -- four orders of
+     * magnitude apart, which is not a slow GPU, it is a query that stopped.
+     *
+     * Empty means empty, so the accumulated total is already correct; all that
+     * is missing is the record that seqId has been accounted for. */
+    for (auto &query : pending_queries_)
+      if (query->queryEndAt() == seqId)
+        query->issueEmpty(seqId);
   }
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
 
@@ -1125,6 +1155,30 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     if (latter->type == EncoderType::Clear && former->type == EncoderType::Render) {
       auto render = reinterpret_cast<RenderEncoderData *>(former);
       auto clear = reinterpret_cast<ClearEncoderData *>(latter);
+
+      static const bool discardColor = [] {
+        const bool enabled = env::getEnvVar("DXMT_CLEAR_DISCARD_STORE") != "0";
+        Logger::warn(str::format("[clear-store] ml1190 enabled=", enabled));
+        return enabled;
+      }();
+      // A full clear makes the preceding color store dead. Keep dependency
+      // tracking intact, and only match the exact view and covered subresource.
+      // Resolve stores and partial clears must retain their original behavior.
+      if (discardColor && !clear->clear_dsv && clear->attachment &&
+          clear->array_length == render->render_target_array_length &&
+          clear->width == render->render_target_width && clear->height == render->render_target_height) {
+        for (unsigned i = 0; i < render->render_target_count; ++i) {
+          auto &color = render->colors[i];
+          if (color.attachment == clear->attachment && !color.level && !color.slice && !color.depth_plane &&
+              !color.resolve_attachment && color.store_action == WMTStoreActionStore) {
+            color.store_action = WMTStoreActionDontCare;
+            static std::atomic<uint64_t> saved{0};
+            const auto total = saved.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total <= 4 || !(total % 4096))
+              Logger::warn(str::format("[clear-store] ml1190 overwritten color stores skipped=", total));
+          }
+        }
+      }
 
       // DontCare can be used because it's going to be cleared anyway
       // just keep in mind DontCare != DontStore

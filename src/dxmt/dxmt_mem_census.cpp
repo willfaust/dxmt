@@ -1,5 +1,6 @@
 #include "dxmt_mem_census.hpp"
 #include "log/log.hpp"
+#include <chrono>
 
 namespace dxmt {
 
@@ -163,9 +164,60 @@ static bool g_census_device_valid = false;
 void
 mem_census_set_device(WMT::Device d) { g_census_device = d; g_census_device_valid = true; }
 
+/* ml998: THE CENSUS WAS COSTING MORE THAN WHAT IT MEASURES.
+ *
+ * ml684 moved the trigger from the memory high-water mark to sequence
+ * advancement (dxmt_dynamic.cpp: every 30 coherent seq ids), which on a real
+ * play session fires several times a second, on the ENCODE thread.  In the
+ * 934 s capture qp4.txt that was 22,449 reports of ~31 ERR lines each:
+ * 441,203 of the log's 454,514 lines and 54.2 MB of its 55.8 MB.  Every one of
+ * those lines is a write(2) on the thread that builds command buffers, and the
+ * report itself walks BSITE_SLOTS x 10 and DYN_CENSUS_SLOTS x 8 in nested
+ * top-N scans before it prints anything.
+ *
+ * The trigger stays where ml684 put it -- sampling on the fence is still the
+ * only way to observe a burst while it is happening -- but a report is now
+ * only EMITTED once per 10 s.  That is the cadence [prof] and [srv-stats]
+ * already use, so the three line up in the log, and a plateau near jetsam is
+ * still sampled every 10 s rather than "only on a rising HWM", which is the
+ * regression ml684 was written to remove.
+ *
+ * `why' starting with "warn" is never throttled: a real memory warning is the
+ * one sample that must not be dropped, and it cannot be reconstructed from the
+ * next periodic report because the trim that follows it has already run.  The
+ * first report of the process is always emitted too, so a run that dies inside
+ * the first 10 s still leaves one.
+ *
+ * Wall time, not the seq id: the seq id advances at the GPU's pace, so a
+ * per-N-seq gate throttles by frame rate and not by time -- which is exactly
+ * how ml684 came to emit 24 reports a second. */
+static bool
+mem_census_throttled(const char *why) {
+  using clock = std::chrono::steady_clock;
+  static std::atomic<uint64_t> last_ns{0};
+  constexpr uint64_t kPeriodNs = 10ull * 1000 * 1000 * 1000;
+
+  if (why && why[0] == 'w' && why[1] == 'a' && why[2] == 'r' && why[3] == 'n')
+    return false; /* memory warning: always reported */
+
+  uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     clock::now().time_since_epoch())
+                     .count();
+  uint64_t prev = last_ns.load(std::memory_order_relaxed);
+
+  if (prev && now - prev < kPeriodNs)
+    return true;
+  /* One winner per interval; a racing caller is dropped, not queued -- two
+   * reports 200 us apart would say the same thing twice. */
+  return !last_ns.compare_exchange_strong(prev, now, std::memory_order_relaxed);
+}
+
 void
 mem_census_report(const char *why) {
   uint64_t tl = 0, tp = 0, tr = 0;
+
+  if (mem_census_throttled(why)) return;
+
   for (int i = 0; i < MEMOWN_COUNT; i++) {
     tl += g_mem_census.live[i].load(std::memory_order_relaxed);
     tp += g_mem_census.peak[i].load(std::memory_order_relaxed);

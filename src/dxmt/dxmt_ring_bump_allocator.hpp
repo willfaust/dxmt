@@ -4,15 +4,33 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_math.hpp"
+#include "util_env.hpp"
 #include <mutex>
 #include <queue>
 #include "dxmt_mem_census.hpp"
 
 namespace dxmt {
 
+// Staging ring block size. An i386 (WoW64) module shares a 32-bit guest's few
+// GB of address space with the application, and every block is guest VA plus
+// host RAM plus a Metal buffer registration, so there the ring uses 8 MB
+// blocks; every 64-bit target keeps 32 MB.
+#if defined(__i386__)
+constexpr size_t kStagingBlockSize = 0x800000; // 8MB
+#else
 constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
+#endif
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
+
+inline bool ringOversizeReuseEnabled() {
+  static const bool enabled = [] {
+    const bool value = env::getEnvVar("DXMT_RING_OVERSIZE_REUSE") != "0";
+    WARN("[ring-reuse] ml1180 enabled=", value, " retained-extra-blocks=2 max-block=16777216");
+    return value;
+  }();
+  return enabled;
+}
 
 template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex = dxmt::mutex> class RingBumpState {
 
@@ -33,6 +51,7 @@ private:
     size_t total_size;
     uint64_t last_used_seq_id;
     uint64_t inc_time_to_live;
+    bool reusable_oversize = false;
     Allocator::Block block;
   };
 
@@ -46,6 +65,8 @@ private:
   };
 
   std::queue<Allocation> fifo;
+  unsigned reusable_oversize_blocks_ = 0;
+  uint64_t oversize_reuses_ = 0;
   mutex mutex_;
   Allocator allocator_;
 };
@@ -133,7 +154,30 @@ public:
   Block
   allocate(size_t block_size) {
     Block block{};
-    block.mapped_address = placed_buffer_ ? malloc(block_size) : nullptr;
+    bool placed = placed_buffer_;
+#if defined(__i386__)
+    /* MADEIRA (WOW64_DESIGN.md section 7.5): placed_buffer=false means "let
+     * Metal allocate and never look at the memory again".  That is fine for a
+     * 64-bit caller, but for a 32-bit guest the unix side would have to write
+     * [buffer contents] -- a pointer in Metal's own heap, outside the guest
+     * window -- back into info.memory, which has no 32-bit address, so
+     * _MTLDevice_newBuffer32 refuses the call and hands back a NULL buffer.
+     *
+     * The three placed_buffer=false rings are all on the D3D11 path and all
+     * CPU-visible (Managed, which DXMT_IOS remaps to Shared):
+     * CommandQueue::staging_allocator, MTLD3D11CommandList::staging_allocator
+     * and ResourceInitializer::gpu_command_heap_allocator.  Their contents are
+     * filled through MTLBuffer_updateContents, which memcpys into
+     * [buffer contents] -- so Private storage is not an alternative either.
+     * Supplying the backing from this PE module's own heap is: the allocation
+     * goes through the guest window chokepoint by construction, exactly as it
+     * does for Buffer::allocate's CpuPlaced (dxmt_buffer.cpp) and
+     * Texture::allocate (dxmt_texture.cpp).  Nothing reads mapped_address on
+     * these rings, so the only cost is the guest VA -- which is why
+     * kStagingBlockSize is already 8 MB rather than 32 MB on i386. */
+    placed = true;
+#endif
+    block.mapped_address = placed ? malloc(block_size) : nullptr;
     WMTBufferInfo info;
     info.options = buffer_info_;
     info.memory.set(block.mapped_address);
@@ -213,9 +257,10 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
       break;
     auto expired = (coherent_id - front.last_used_seq_id) > kStagingBlockLifetime ||
                    front.inc_time_to_live > kStagingBlockLifetime || coherent_id == -1ull;
-    auto adhoc = front.total_size != BlockSize;
+    auto adhoc = front.total_size != BlockSize && !front.reusable_oversize;
     if (expired || adhoc) {
       // can be deallocated
+      if (front.reusable_oversize) --reusable_oversize_blocks_;
       fifo.pop();
       continue;
     }
@@ -232,10 +277,19 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
   while (!fifo.empty()) {
     auto &front = fifo.front();
     if (front.last_used_seq_id < coherent_id) {
-      if (front.total_size != BlockSize) {
+      if (ringOversizeReuseEnabled() && front.total_size < block_size) {
+        // A completed small block must not strand usable blocks behind it.
+        // No pointer into it remains in flight at this coherent sequence.
+        if (front.reusable_oversize) --reusable_oversize_blocks_;
+        fifo.pop();
+        continue;
+      }
+      if (front.total_size != BlockSize && !front.reusable_oversize) {
         fifo.pop();
         continue;
       } else if (front.total_size >= block_size) {
+        if (front.reusable_oversize && ++oversize_reuses_ == 1)
+          WARN("[ring-reuse] ml1180 recycled oversized block bytes=", front.total_size);
         front.last_used_seq_id = seq_id;
         front.allocated_size = 0;
         front.inc_time_to_live = 0;
@@ -247,11 +301,18 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
     }
     break;
   }
+  // Repeated image uploads just above the normal block size otherwise create
+  // and destroy a Metal buffer every frame. Retain at most two modest oversize
+  // blocks per ring, with the same completion checks and expiry as normal ones.
+  const bool reusable_oversize = ringOversizeReuseEnabled() && block_size > BlockSize &&
+      block_size <= 16u * 1024u * 1024u && reusable_oversize_blocks_ < 2;
+  if (reusable_oversize) ++reusable_oversize_blocks_;
   fifo.push({
       .allocated_size = 0,
       .total_size = block_size,
       .last_used_seq_id = seq_id,
       .inc_time_to_live = 0,
+      .reusable_oversize = reusable_oversize,
       .block = allocator_.allocate(block_size),
   });
   return fifo.back();
