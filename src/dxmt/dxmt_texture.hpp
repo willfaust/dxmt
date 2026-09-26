@@ -29,7 +29,23 @@ struct TextureViewDescriptor {
   uint32_t miplevelCount   : 4 = 1;
   uint32_t firstArraySlice : 12 = 0;
   uint32_t arraySize       : 12 = 1;
+  // Per-channel sample swizzle. Identity for every d3d11 view (the frontend
+  // never sets it, and the defaults below are what TextureView already passed
+  // to newTextureView unconditionally); the Direct3D 9 frontend needs the
+  // non-identity cases for its X-channel, luminance and depth-replicate
+  // formats. Part of the view identity, so createView() compares it.
+  WMTTextureSwizzleChannels swizzle = {
+      WMTTextureSwizzleRed,
+      WMTTextureSwizzleGreen,
+      WMTTextureSwizzleBlue,
+      WMTTextureSwizzleAlpha,
+  };
 };
+
+inline bool
+SwizzleEqual(const WMTTextureSwizzleChannels &a, const WMTTextureSwizzleChannels &b) {
+  return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
 
 class Texture;
 class TextureAllocation;
@@ -92,6 +108,14 @@ public:
 
   WMT::Texture texture() const {
     return obj_;
+  }
+
+  // The Metal buffer a buffer-backed (linear) allocation wraps, or a null
+  // handle for a plain texture allocation. Buffer-backed is the only shape
+  // whose texels live in memory the CPU also addresses through mappedMemory,
+  // so having the buffer is the universal "buffer-backed" predicate.
+  WMT::Buffer buffer() const {
+    return buffer_;
   }
 
   Flags<TextureAllocationFlag>
@@ -226,6 +250,18 @@ public:
     return viewDescriptors_[view].arraySize;
   }
 
+  unsigned
+  miplevelCount() const {
+    return info_.mipmap_level_count;
+  }
+
+  // The whole-resource view: every mip, every slice, the resource's own format
+  // and type, identity swizzle. Both constructors push exactly that descriptor
+  // as view 0, and createView() only ever appends, so view 0 is always it.
+  // Named rather than spelled `0` at call sites because it is a fact about the
+  // constructors, not about the number.
+  static constexpr TextureViewKey fullView = 0;
+
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
 
@@ -234,6 +270,14 @@ public:
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);
+  // Derive a view that applies a per-channel sample swizzle (d3d9
+  // X-channel / luminance / depth-replicate formats). Returns `key`
+  // unchanged when the swizzle already matches. See checkViewUseFormat.
+  TextureViewKey checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle);
+  // Derive a view clamped to mips [firstMiplevel, firstMiplevel+count).
+  // d3d9 SetLOD(N) clamps sampling to mips N..(level_count-1). Returns
+  // `key` unchanged when the range already matches.
+  TextureViewKey checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount);
 
   Rc<TextureAllocation> rename(Rc<TextureAllocation> &&newAllocation);
 

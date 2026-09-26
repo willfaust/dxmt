@@ -84,6 +84,8 @@ void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
 
 bool isForeground(HWND hWindow) { return true; }
 
+HWND foregroundWindow() { return nullptr; }
+
 bool isMinimized(HWND hWindow) { return false; }
 
 } // namespace dxmt::wsi

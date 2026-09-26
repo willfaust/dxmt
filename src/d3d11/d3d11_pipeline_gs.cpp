@@ -3,6 +3,7 @@
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "log/log.hpp"
+#include "util_futex.hpp"
 #include "config/config.hpp"   /* ml754 */
 #include <atomic>
 
@@ -45,7 +46,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline) final {
-    ready_.wait(false, std::memory_order_acquire);
+    dxmt::atomic_wait(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_mesh_};
   }
 
@@ -159,7 +160,7 @@ public:
 
   void SetIsDone(bool state) {
     ready_.store(state);
-    ready_.notify_all();
+    dxmt::atomic_notify_all(ready_);
   }
 
 private:

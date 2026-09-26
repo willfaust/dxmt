@@ -28,7 +28,7 @@ DynamicBuffer::decRef() {
 };
 
 Rc<BufferAllocation>
-DynamicBuffer::allocate(uint64_t coherent_seq_id) {
+DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
   /* ml685 TRIM REGRET: did we release something and then immediately have to
    * allocate again? That -- not the raw churn count -- is what says the 64-entry
@@ -145,6 +145,8 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id) {
       while (lag > lm && !g_mem_census.dyn_seq_lag_max.compare_exchange_weak(lm, lag, std::memory_order_relaxed)) {}
     }
   }
+  if (out_minted_fresh)
+    *out_minted_fresh = !ret.ptr();
   if (!ret.ptr()) {
     g_mem_census.dyn_reuse_miss.fetch_add(1, std::memory_order_relaxed);
     if (was_trimmed) g_trim_regret.fetch_add(1, std::memory_order_relaxed);   /* ml685 */

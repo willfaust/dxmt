@@ -33,8 +33,7 @@ TextureView::TextureView(TextureAllocation *allocation, TextureViewKey key, Text
   auto parent = allocation->texture();
   texture = parent.newTextureView(
       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
-      descriptor.firstArraySlice, descriptor.arraySize,
-      {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpuResourceID
+      descriptor.firstArraySlice, descriptor.arraySize, descriptor.swizzle, gpuResourceID
   );
 }
 
@@ -103,6 +102,8 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     if (viewDescriptors_[i].firstArraySlice != descriptor.firstArraySlice)
       continue;
     if (viewDescriptors_[i].arraySize != descriptor.arraySize)
+      continue;
+    if (!SwizzleEqual(viewDescriptors_[i].swizzle, descriptor.swizzle))
       continue;
     return i;
   }
@@ -292,6 +293,33 @@ TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat fo
   if (unlikely(view.format != format)) {
     auto new_view_desc = view;
     new_view_desc.format = format;
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey
+Texture::checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key];
+  shared_lock = {};
+  if (unlikely(!SwizzleEqual(view.swizzle, swizzle))) {
+    auto new_view_desc = view;
+    new_view_desc.swizzle = swizzle;
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey
+Texture::checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key];
+  shared_lock = {};
+  if (unlikely(view.firstMiplevel != firstMiplevel || view.miplevelCount != miplevelCount)) {
+    auto new_view_desc = view;
+    new_view_desc.firstMiplevel = firstMiplevel;
+    new_view_desc.miplevelCount = miplevelCount;
     return createView(new_view_desc);
   }
   return key;

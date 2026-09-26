@@ -1,0 +1,35 @@
+; The i386 D3D9 shim's exports (WOW64_DESIGN.md 8.5).
+;
+; Same names AND same ordinals as research/dxmt/src/d3d9/d3d9.def: an
+; application that imports d3d9 by ordinal gets the wrong function otherwise.
+; d3d9_api.py's DLL_EXPORTS table carries the same pairs and the generator
+; checks them, so the two halves cannot drift apart silently.
+;
+; The library name is `d3d9shim.dll`, not `d3d9.dll`, even though the module
+; is INSTALLED as d3d9.dll: lld keeps its own output name in the PE export
+; directory whatever the LIBRARY line says (measured), and ntdll matches a
+; module to its unix-call table with a case-sensitive strstr() over exactly
+; that export name (build/ntdll-unix/virtual_ios.c, the load_builtin_unixlib
+; chain -- the dwrite branch there records what a case mismatch cost the last
+; time).  Spelling it the same way here keeps the two possible sources of the
+; name in agreement, and keeps the match unambiguous: the emulated frontend
+; shipping beside it as d3d9-emulated.dll exports the name "D3D9.DLL", which
+; a lower-case strstr(match, "d3d9shim") cannot hit.
+;
+; Copyright 2026 Will Faust
+; SPDX-License-Identifier: GPL-3.0-or-later
+
+LIBRARY d3d9shim.dll
+EXPORTS
+    Direct3DCreate9 @16
+    Direct3DCreate9Ex @20
+    D3DPERF_BeginEvent @23
+    D3DPERF_EndEvent @24
+    D3DPERF_GetStatus @25
+    D3DPERF_QueryRepeatFrame @26
+    D3DPERF_SetMarker @27
+    D3DPERF_SetOptions @28
+    D3DPERF_SetRegion @29
+    DebugSetLevel @30
+    DebugSetMute @31
+    Direct3DShaderValidatorCreate9 @32

@@ -1,6 +1,17 @@
 #pragma once
 
-#if defined(DXMT_NATIVE)
+/* MADEIRA (WOW64_DESIGN.md section 8.2(d)): in the native Madeira build every
+ * stub below is wrong -- each one warns and fails, which would turn a
+ * thread-priority request into a log line and the D3D9 recursive spinlock
+ * into a livelock (its owner id would always be 0).  Hand the whole surface
+ * to util_madeira_compat.h, which implements the calls that have a faithful
+ * POSIX meaning and uses explicit sentinels for the rest.  See
+ * research/dxmt/LICENSE-MADEIRA.md. */
+#if defined(DXMT_MADEIRA)
+
+#include "util_madeira_compat.h"
+
+#elif defined(DXMT_NATIVE)
 
 #include <windows.h>
 

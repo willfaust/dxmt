@@ -5,6 +5,7 @@
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <optional>
 #include <unordered_map>
 
 namespace dxmt {
@@ -279,6 +280,105 @@ private:
   ArgumentEncodingContext &ctx_;
   WMT::Device device_;
   WMT::Reference<WMT::ComputePipelineState> pso_downscale_dilated_mv_;
+};
+
+/* MADEIRA (WOW64_DESIGN.md section 7.11): the two shader-driven copy contexts
+ * the Direct3D 9 frontend needs. Imported from the upstream v0.4-d3d9 tag (see
+ * LICENSE-MADEIRA.md) and unreferenced by d3d11, which resolves only through
+ * Metal's own multisample-resolve store action and never scales a copy. */
+
+enum class ResolveTextureMode : uint32_t {
+  Average = 0,
+  // Point resolve of a multisampled depth surface (sample 0) to a single-sample
+  // depth target. Uses a depth-writing pipeline into a depth attachment rather
+  // than a colour one; see ResolveTextureContext::resolveDepth.
+  DepthPoint = 1,
+};
+
+class ResolveTextureContext {
+public:
+  ResolveTextureContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  void resolve(
+      Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+      ResolveTextureMode mode, std::optional<WMTScissorRect> src_rect,
+      WMTOrigin dst_origin, WMTSize resolve_size
+  );
+
+  // Point resolve of a multisampled depth surface (sample 0) into a single-sample
+  // depth destination; separate from resolve() because it drives a depth
+  // attachment and a depth-write pipeline instead of a colour one.
+  void resolveDepth(
+      Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+      std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+  );
+
+private:
+  WMT::RenderPipelineState getPSO(WMTPixelFormat format, ResolveTextureMode mode);
+
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::Function> vs_resolve_;
+  WMT::Reference<WMT::Function> fs_resolve_average_;
+  WMT::Reference<WMT::Function> fs_resolve_depth_;
+
+  struct PSOKey {
+    WMTPixelFormat format;
+    ResolveTextureMode mode;
+
+    bool operator==(const PSOKey &other) const {
+      return format == other.format && mode == other.mode;
+    }
+  };
+
+  struct PSOKeyHash {
+    size_t operator()(const PSOKey &key) const noexcept {
+      return (size_t(key.format) << 8) ^ size_t(key.mode);
+    }
+  };
+
+  std::unordered_map<PSOKey, WMT::Reference<WMT::RenderPipelineState>, PSOKeyHash> psos_;
+};
+
+// Render-pass sample/store blit for D3D9 StretchRect when the fast
+// blit-copy path doesn't fit; different src/dst extents, or pairs of
+// format aliases that share storage layout but use distinct Metal
+// pixel formats (X8R8G8B8 <-> A8R8G8B8 -> BGRX8Unorm vs BGRA8Unorm). The
+// PSO is keyed on dst format only; the sampler is keyed on filter
+// (POINT/LINEAR). Mirrors ResolveTextureContext's shape; minimum
+// viable additions are a sampler cache and a separate fragment shader
+// that calls `source.sample()` instead of `source.read()`.
+class StretchBlitContext {
+public:
+  StretchBlitContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  // Filter is POINT or LINEAR; anything else should be rejected at the
+  // d3d9 call site (D3DTEXF_ANISOTROPIC etc. are not legal for
+  // StretchRect per the IDL).
+  enum class Filter : uint8_t { Point = 0, Linear = 1 };
+
+  void blit(
+      Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+      Filter filter, WMTOrigin src_origin, WMTSize src_size,
+      WMTOrigin dst_origin, WMTSize dst_size
+  );
+
+private:
+  WMT::RenderPipelineState getPSO(WMTPixelFormat dst_format, uint32_t sample_count);
+  WMT::SamplerState getSampler(Filter filter);
+
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::Function> vs_blit_;
+  WMT::Reference<WMT::Function> fs_blit_;
+  // Keyed on {dst_format, sample_count}. raster_sample_count is baked into the
+  // PSO, so a single-sample blit and a single-sample -> multisample broadcast
+  // of the same format are distinct pipelines. Composite key = pixel format in
+  // the high bits, sample count in the low byte; a single-sample destination
+  // keys count = 1, unchanged from the format-only cache.
+  std::unordered_map<uint64_t, WMT::Reference<WMT::RenderPipelineState>> psos_;
+  WMT::Reference<WMT::SamplerState> sampler_point_;
+  WMT::Reference<WMT::SamplerState> sampler_linear_;
 };
 
 } // namespace dxmt

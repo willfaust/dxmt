@@ -103,6 +103,15 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
   }
 }
 
+void
+Presenter::setDisplaySyncEnabled(bool enabled) {
+  if (layer_props_.display_sync_enabled == enabled)
+    return;
+
+  layer_props_.display_sync_enabled = enabled;
+  layer_.setProps(layer_props_);
+}
+
 Presenter::PresentState
 Presenter::synchronizeLayerProperties() {
   uint64_t display_setting_version = 0;

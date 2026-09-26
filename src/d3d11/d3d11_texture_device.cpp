@@ -8,6 +8,11 @@
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 #include "config/config.hpp"   /* ml675: d3d11.mipClampBC */
+#include "d3d11_mip_clamp_policy.hpp"   /* ml2000: d3d11.mipClampAuto */
+#include "util_env.hpp"
+#include "winemetal.h"
+#include <atomic>
+#include <cstring>
 
 namespace dxmt {
 
@@ -424,6 +429,99 @@ static inline bool IsBCFormatForClamp(uint32_t f) {
          (f >= 94 && f <= 99);      /* BC6H, BC7 */
 }
 
+/* ---- ml2000: memory-pressure-aware automatic clamp (d3d11.mipClampAuto) ----
+ *
+ * A D3D11 scene load created ~500 SRV-only BC textures (mostly 2048/4096
+ * square, 1.23 GB logical) and ran the process from 4.35 GB to the 6.1 GB
+ * jetsam limit in ~30 s. mipClampBC would have saved it, but it is a blanket
+ * setting that costs resolution even with memory to spare. This applies the
+ * same, already-proven clamp -- bias 1, large textures only -- to textures
+ * created while the process is within d3d11.mipClampAutoMB (default 1536) of
+ * its limit, as reported by os_proc_available_memory() through MadeiraCtl op 7.
+ *
+ * Rollback: d3d11.mipClampAuto=0 (madeira.cfg dxmt=...) or env
+ * MADEIRA_MIP_CLAMP_AUTO=0. An explicit d3d11.mipClampBC=N>0 takes precedence.
+ * Where the query is unavailable (remote Metal, an older unix side) the
+ * reading is marked unavailable once and nothing is ever auto-clamped. */
+struct MipClampAutoConfig {
+  bool enabled;
+  uint32_t threshold_mb;
+};
+
+static const MipClampAutoConfig &
+GetMipClampAutoConfig() {
+  static const MipClampAutoConfig cfg = [] {
+    MipClampAutoConfig c;
+    const std::string opt = Config::getInstance().getOption<std::string>("d3d11.mipClampAuto", "");
+    const std::string env_v = env::getEnvVar("MADEIRA_MIP_CLAMP_AUTO");
+    c.enabled = !mip_clamp::IsOffValue(opt.c_str()) && !mip_clamp::IsOffValue(env_v.c_str());
+    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d11.mipClampAutoMB", 1536));
+    ERR("[mip-clamp] ml2000 auto ", c.enabled ? "on" : "off", " threshold=", c.threshold_mb,
+        " MB (d3d11.mipClampAuto=0 or MADEIRA_MIP_CLAMP_AUTO=0 disables; d3d11.mipClampAutoMB sets the threshold)");
+    return c;
+  }();
+  return cfg;
+}
+
+/* MadeiraCtl op 7: headroom and footprint in MB, or kHeadroomUnavailable. */
+static int64_t
+QueryHeadroomMB(int64_t *footprint_mb) {
+  struct madeira_ctl_args a;
+  memset(&a, 0, sizeof a);
+  a.op = 7;
+  MadeiraCtl(&a);
+  if (a.ret != 1)
+    return mip_clamp::kHeadroomUnavailable;
+  *footprint_mb = (int64_t)(a.ptr >> 20);
+  return (int64_t)(a.len >> 20);
+}
+
+static std::atomic<uint64_t> g_auto_candidates{0};
+static std::atomic<uint64_t> g_auto_clamped{0};
+static std::atomic<int64_t> g_auto_headroom_mb{mip_clamp::kHeadroomUnknown};
+static std::atomic<int64_t> g_auto_footprint_mb{0};
+static std::atomic<bool> g_auto_pressure_logged{false};
+
+/* Bias for an auto candidate already known to pass the mipClampBC filter. */
+static uint32_t
+MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+  const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
+  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
+    return 0;
+  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
+  if (!bias)
+    return 0;
+
+  const uint64_t n = g_auto_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
+  int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
+  if (mip_clamp::ShouldRequery(n, headroom, cfg.threshold_mb)) {
+    int64_t foot = 0;
+    const int64_t fresh = QueryHeadroomMB(&foot);
+    if (fresh == mip_clamp::kHeadroomUnavailable && headroom == mip_clamp::kHeadroomUnknown)
+      ERR("[mip-clamp] ml2000 auto: memory headroom unavailable here; auto clamp inactive");
+    headroom = fresh;
+    g_auto_headroom_mb.store(headroom, std::memory_order_relaxed);
+    g_auto_footprint_mb.store(foot, std::memory_order_relaxed);
+  }
+
+  const bool pressure = mip_clamp::UnderPressure(headroom, cfg.threshold_mb);
+  /* Log each entry into and exit from the pressure region once. */
+  bool was = g_auto_pressure_logged.load(std::memory_order_relaxed);
+  if (pressure != was && g_auto_pressure_logged.compare_exchange_strong(was, pressure))
+    ERR("[mip-clamp] ml2000 auto headroom=", headroom, " MB footprint=",
+        g_auto_footprint_mb.load(std::memory_order_relaxed), " MB -> ", pressure ? "clamping" : "not clamping",
+        " large BC textures (threshold ", cfg.threshold_mb, " MB) clamped=",
+        g_auto_clamped.load(std::memory_order_relaxed));
+  if (!pressure)
+    return 0;
+
+  const uint64_t clamped = g_auto_clamped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (mip_clamp::ShouldLogClamp(clamped))
+    ERR("[mip-clamp] ml2000 auto headroom=", headroom, " MB clamped=", clamped, " (", width, "x", height,
+        " mips ", mip_levels, " -> ", width >> bias, "x", height >> bias, " mips ", mip_levels - bias, ")");
+  return bias;
+}
+
 template <typename tag>
 HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
                                     const typename tag::DESC1 *pDesc,
@@ -459,27 +557,42 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
      * with initial data against 2,025 streamed updates. Those updates carry
      * LOGICAL mip indices, which UpdateTexture now translates through the bias,
      * dropping levels that no longer exist physically. */
-    if (cached_clamp && IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
+    const bool eligible =
+        IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
         (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
         finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
         finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
-        finalDesc.Width >= 8 && finalDesc.Height >= 8) {
-      mip_bias = std::min((uint32_t)cached_clamp, finalDesc.MipLevels - 1);
-      while (mip_bias && ((finalDesc.Width >> mip_bias) < 4 || (finalDesc.Height >> mip_bias) < 4))
-        mip_bias--;
+        finalDesc.Width >= 8 && finalDesc.Height >= 8;
+    /* ml2000: the automatic clamp additionally refuses any misc flag except
+     * TEXTURECUBE / RESOURCE_CLAMP. A shared texture is re-created at LOGICAL
+     * size by whoever opens it (ImportSharedTextureInternal) and would then
+     * address a smaller allocation; tiled and other exotic resources have no
+     * business losing levels behind the application's back. */
+    const bool auto_misc_ok =
+        !(finalDesc.MiscFlags & ~(UINT)(D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_RESOURCE_CLAMP));
+    if (eligible && cached_clamp) {
+      mip_bias = mip_clamp::ClampBias((uint32_t)cached_clamp, finalDesc.Width, finalDesc.Height,
+                                      finalDesc.MipLevels, false);
       if (mip_bias) {
-        physDesc.Width     = std::max(1u, finalDesc.Width  >> mip_bias);
-        physDesc.Height    = std::max(1u, finalDesc.Height >> mip_bias);
-        physDesc.MipLevels = finalDesc.MipLevels - mip_bias;
-        info.width              = physDesc.Width;
-        info.height             = physDesc.Height;
-        info.mipmap_level_count = physDesc.MipLevels;
         static uint32_t clamp_n;
         if (++clamp_n <= 8 || (clamp_n % 256) == 0)
           ERR("[mip-clamp] ml675 #", clamp_n, " logical ", finalDesc.Width, "x", finalDesc.Height,
-              " mips ", finalDesc.MipLevels, " -> physical ", physDesc.Width, "x", physDesc.Height,
-              " mips ", physDesc.MipLevels, " arr=", finalDesc.ArraySize);
+              " mips ", finalDesc.MipLevels, " -> physical ", finalDesc.Width >> mip_bias, "x",
+              finalDesc.Height >> mip_bias, " mips ", finalDesc.MipLevels - mip_bias, " arr=", finalDesc.ArraySize);
       }
+    } else if (eligible && auto_misc_ok) {
+      /* ml2000: MipLevels >= 2 is part of `eligible`, so a single-level texture
+       * is never clamped; arrays and cubes need nothing extra (see the
+       * per-slice initial-data remap below and TranslateSubresource). */
+      mip_bias = MipClampAutoBias(finalDesc.Width, finalDesc.Height, finalDesc.MipLevels);
+    }
+    if (mip_bias) {
+      physDesc.Width     = std::max(1u, finalDesc.Width  >> mip_bias);
+      physDesc.Height    = std::max(1u, finalDesc.Height >> mip_bias);
+      physDesc.MipLevels = finalDesc.MipLevels - mip_bias;
+      info.width              = physDesc.Width;
+      info.height             = physDesc.Height;
+      info.mipmap_level_count = physDesc.MipLevels;
     }
   }
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&

@@ -4,6 +4,7 @@
 #include "util_env.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
+#include <chrono>
 
 #define ASYNC_ENCODING 1
 
@@ -56,9 +57,9 @@ CommandQueue::~CommandQueue() {
   TRACE("Destructing command queue");
   stopped.store(true);
   ready_for_encode++;
-  ready_for_encode.notify_one();
+  dxmt::atomic_notify_one(ready_for_encode);
   ready_for_commit++;
-  ready_for_commit.notify_one();
+  dxmt::atomic_notify_one(ready_for_commit);
   SharedEventListener_destroy(shared_event_listener);
   encodeThread.join();
   finishThread.join();
@@ -82,10 +83,10 @@ CommandQueue::CommitCurrentChunk() {
   statistics.command_buffer_count++;
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
-  ready_for_encode.notify_one();
+  dxmt::atomic_notify_one(ready_for_encode);
 
   auto t0 = clock::now();
-  chunk_ongoing.wait(kCommandChunkCount - 1, std::memory_order_acquire);
+  dxmt::atomic_wait(chunk_ongoing, uint64_t(kCommandChunkCount - 1), std::memory_order_acquire);
   chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
   auto t1 = clock::now();
   statistics.commit_interval += (t1 - t0);
@@ -141,7 +142,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
-  ready_for_commit.notify_one();
+  dxmt::atomic_notify_one(ready_for_commit);
 }
 
 uint32_t
@@ -151,7 +152,7 @@ CommandQueue::EncodingThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_encode.wait(internal_seq, std::memory_order_acquire);
+    dxmt::atomic_wait(ready_for_encode, internal_seq, std::memory_order_acquire);
     if (stopped.load())
       break;
     // perform...
@@ -170,15 +171,17 @@ CommandQueue::WaitForFinishThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_commit.wait(internal_seq, std::memory_order_acquire);
+    dxmt::atomic_wait(ready_for_commit, internal_seq, std::memory_order_acquire);
     if (stopped.load())
       break;
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
-    if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
+    const bool device_error = chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError;
+    if (device_error) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+      MarkDeviceError();
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {
@@ -189,10 +192,13 @@ CommandQueue::WaitForFinishThread() {
     if (chunk.signal_frame_latency_fence_ != ~0ull)
       frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
 
+    for (const auto &target : chunk.completion_targets)
+      target->CompleteGpuWork(device_error ? GpuCompletionStatus::Failed : GpuCompletionStatus::Complete);
+
     chunk.reset();
     cpu_coherent.signal(internal_seq);
     chunk_ongoing.fetch_sub(1, std::memory_order_release);
-    chunk_ongoing.notify_one();
+    dxmt::atomic_notify_one(chunk_ongoing);
 
     staging_allocator.free_blocks(internal_seq);
     copy_temp_allocator.free_blocks(internal_seq);
@@ -213,5 +219,38 @@ void CommandQueue::Retain(uint64_t seq, Allocation* allocaiton) {
     tracker.addStorage(temp_buffer.ptr, block_size);
   }
 };
+
+// MADEIRA: see dxmt_command_queue.hpp for why a non-blocking poller needs
+// this instead of WaitCPUFence.
+bool
+CommandQueue::WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns) {
+  if (cpu_coherent.signaledValue() >= seq)
+    return true;
+  // Phase 1: a short load-spin. The watermark is published by the finish
+  // thread with a release store, so a re-check costs one acquire load; if the
+  // command buffer is about to retire this catches it without entering the
+  // scheduler at all.
+  constexpr unsigned kSpinIterations = 64;
+  for (unsigned i = 0; i < kSpinIterations; i++) {
+    if (cpu_coherent.signaledValue() >= seq)
+      return true;
+  }
+  // Phase 2: yield until the deadline. this_thread::yield is SwitchToThread on
+  // the PE build, so the encode / finish threads (both TIME_CRITICAL) get the
+  // core the poller would otherwise have burned. The clock is read once per
+  // yield, because reading it is the expensive part of this loop.
+  const auto deadline = clock::now() + std::chrono::nanoseconds(timeout_ns);
+  do {
+    this_thread::yield();
+    if (cpu_coherent.signaledValue() >= seq)
+      return true;
+  } while (clock::now() < deadline);
+  return cpu_coherent.signaledValue() >= seq;
+}
+
+void
+CommandQueue::MarkDeviceError() {
+  device_error_.store(true, std::memory_order_release);
+}
 
 } // namespace dxmt

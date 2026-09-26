@@ -18,6 +18,21 @@ enum airconv_unixcalls {
   unix_sm50_compile_tessellation_hull,
   unix_sm50_compile_tessellation_domain,
   unix_sm50_get_arguments_info = 88,
+  /* Keep in lock-step with the thunk_DXSO* / thunk32_DXSO* positions in BOTH
+   * dispatch tables in winemetal_unix.c; if entries are inserted above this
+   * block, move it forward by the same count.
+   *
+   * MADEIRA (WOW64_DESIGN.md section 7.4, rule 5): 145 is the number the
+   * reference tree (dacevedo12/dxmt v0.4-d3d9) gives unix_dxso_initialize,
+   * and slots 127-144 are left NULL here on purpose rather than packing DXSO
+   * into this tree's next free slot.  The slot number IS the ABI, so keeping
+   * the reference's numbering means a later cherry-pick from it lands on the
+   * same indices; 18 unused table entries cost nothing. */
+  unix_dxso_initialize = 145,
+  unix_dxso_destroy,
+  unix_dxso_compile,
+  unix_dxso_get_compiled_bitcode,
+  unix_dxso_destroy_bitcode,
 };
 
 struct sm50_initialize_params {
@@ -116,6 +131,34 @@ struct sm50_get_arguments_info_params {
   sm50_shader_t shader;
   struct MTL_SM50_SHADER_ARGUMENT *constant_buffers;
   struct MTL_SM50_SHADER_ARGUMENT *arguments;
+};
+
+struct dxso_initialize_params {
+  const void *bytecode;
+  size_t bytecode_size;
+  dxso_shader_t *shader;
+  int ret;
+};
+
+struct dxso_destroy_params {
+  dxso_shader_t shader;
+};
+
+struct dxso_compile_params {
+  dxso_shader_t shader;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *args;
+  const char *func_name;
+  dxso_bitcode_t *bitcode;
+  int ret;
+};
+
+struct dxso_get_compiled_bitcode_params {
+  dxso_bitcode_t bitcode;
+  struct SM50_COMPILED_BITCODE *data_out;
+};
+
+struct dxso_destroy_bitcode_params {
+  dxso_bitcode_t bitcode;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -229,6 +272,32 @@ struct sm50_get_arguments_info_params32 {
 };
 
 COMPATIBLE_STRUCT32(sm50_get_arguments_info_params, 16)
+
+struct dxso_initialize_params32 {
+  uint32_t bytecode;
+  unsigned int bytecode_size;
+  uint32_t shader;
+  int ret;
+};
+
+COMPATIBLE_STRUCT32(dxso_initialize_params, 16)
+
+struct dxso_compile_params32 {
+  dxso_shader_t shader;
+  uint32_t args;
+  uint32_t func_name;
+  uint32_t bitcode;
+  int ret;
+};
+
+COMPATIBLE_STRUCT32(dxso_compile_params, 24)
+
+struct dxso_get_compiled_bitcode_params32 {
+  dxso_bitcode_t bitcode;
+  uint32_t data_out;
+};
+
+COMPATIBLE_STRUCT32(dxso_get_compiled_bitcode_params, 16)
 
 #define UNIX_CALL(code, params) WINE_UNIX_CALL(unix_##code, params)
 

@@ -9,6 +9,16 @@ fs = import('fs')
 
 dxmt_native = get_option('dxmt_native')
 
+# MADEIRA (WOW64_DESIGN.md section 8): the native ARM64 D3D9 frontend behind a
+# 32-bit shim. A strict superset of dxmt_native -- same unixlib shape, same
+# nativemetal boundary -- plus the guest arena, util_madeira_compat.h and the
+# madeira wsi. Selecting it implies dxmt_native rather than being a third
+# mode, so every existing `if dxmt_native` arm keeps applying.
+dxmt_madeira = get_option('dxmt_madeira_native')
+if dxmt_madeira
+  dxmt_native = true
+endif
+
 cpp = meson.get_compiler('cpp')
 cc = meson.get_compiler('c')
 clang = meson.get_compiler('c', native: true)
@@ -152,12 +162,38 @@ add_project_arguments('-DDXMT_NATIVE=1', language: 'cpp')
 add_project_arguments('-DDXMT_NATIVE=1', language: 'c')
 endif
 
+# MADEIRA (WOW64_DESIGN.md section 8): every change to an imported DXMT file
+# is gated on this, so a diff against the v0.4-d3d9 tag stays readable and
+# every gate is listed in research/dxmt/LICENSE-MADEIRA.md (section 8.9 risk 2).
+if dxmt_madeira
+add_project_arguments('-DDXMT_MADEIRA=1', language: 'cpp')
+add_project_arguments('-DDXMT_MADEIRA=1', language: 'c')
+endif
+
 add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
 # On iOS all Metal storage modes that are Managed on macOS must become
 # Shared — iOS has unified memory and raises an assertion for storageMode 1
-# (Managed). Enable for aarch64-windows cross-build which is our iOS target.
-if host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'windows'
+# (Managed). Every PE module in this fork is loaded by Wine inside the iOS
+# app, so the switch is a property of "cross-building a Windows module", not
+# of the module's architecture.
+#
+# MADEIRA (WOW64_DESIGN.md section 7): this used to test cpu_family ==
+# 'aarch64' because aarch64-windows was the only cross target. The 32-bit
+# (WoW64) D3D9 path adds an i386-windows target whose cpu_family is 'x86', so
+# that test left DXMT_IOS undefined for it — an i386 d3d11/d3d9 would then ask
+# Metal for storageMode Managed and trip the same iOS assertion the remap
+# exists to avoid. Keyed on the Windows host system instead, which covers
+# i386, aarch64 and arm64ec alike and still excludes the native macOS build
+# (dxmt_native, host system 'darwin').
+#
+# MADEIRA (WOW64_DESIGN.md section 8): dxmt_madeira_native is the one target
+# that runs on iOS WITHOUT being a Windows module -- it is the native ARM64
+# half of the D3D9 path, host system 'darwin'. The storage-mode remap is a
+# property of the Metal device it talks to, not of the module's own format,
+# so it has to apply here too or the frontend asks Metal for storageMode
+# Managed and trips the same iOS assertion.
+if host_machine.system() == 'windows' or dxmt_madeira
   add_project_arguments('-DDXMT_IOS=1', language: 'cpp')
   add_project_arguments('-DDXMT_IOS=1', language: 'c')
 endif

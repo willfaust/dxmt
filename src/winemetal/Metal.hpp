@@ -427,6 +427,28 @@ public:
     MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
+  /* MADEIRA (WOW64_DESIGN.md section 7.11): the argument-table sampler bind and
+   * the depth-stencil state bind the Direct3D 9 internal passes need. */
+  void
+  setFragmentSamplerState(SamplerState sampler, uint8_t index) {
+    struct wmtcmd_render_setsamplerstate cmd;
+    cmd.type = WMTRenderCommandSetFragmentSamplerState;
+    cmd.next.set(nullptr);
+    cmd.sampler = sampler;
+    cmd.index = index;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  };
+
+  void
+  setDepthStencilState(DepthStencilState dsso, uint8_t stencil_ref = 0) {
+    struct wmtcmd_render_setdsso cmd;
+    cmd.type = WMTRenderCommandSetDSSO;
+    cmd.next.set(nullptr);
+    cmd.dsso = dsso;
+    cmd.stencil_ref = stencil_ref;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  };
+
   void
   setViewport(WMTViewport viewport) {
     struct wmtcmd_render_setviewports cmd;

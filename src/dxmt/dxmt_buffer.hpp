@@ -59,6 +59,15 @@ public:
     return obj_;
   }
 
+  // The allocation's own byte length. Buffer::length() is the logical resource
+  // length; a suballocated allocation backs several renames of it, so a caller
+  // that needs the range actually addressable through this allocation (an
+  // encoder access() range, say) has to ask the allocation, not the resource.
+  uint64_t
+  length() const noexcept {
+    return info_.length;
+  }
+
   Flags<BufferAllocationFlag>
   flags() const {
     return flags_;

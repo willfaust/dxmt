@@ -4,6 +4,7 @@
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
 #include "log/log.hpp"
+#include "util_futex.hpp"
 #include <atomic>
 
 namespace dxmt {
@@ -47,7 +48,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline) final {
-    ready_.wait(false, std::memory_order_acquire);
+    dxmt::atomic_wait(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_};
   }
 
@@ -112,7 +113,7 @@ public:
 
   void SetIsDone(bool state) {
     ready_.store(state);
-    ready_.notify_all();
+    dxmt::atomic_notify_all(ready_);
   }
 
 private:
@@ -151,7 +152,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_COMPUTE_PIPELINE *pPipeline) final {
-    ready_.wait(false, std::memory_order_acquire);
+    dxmt::atomic_wait(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_};
   }
 
@@ -188,7 +189,7 @@ public:
 
   void SetIsDone(bool state) {
     ready_.store(state);
-    ready_.notify_all();
+    dxmt::atomic_notify_all(ready_);
   }
 
 private:

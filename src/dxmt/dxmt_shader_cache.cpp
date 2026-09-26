@@ -6,6 +6,17 @@
 
 namespace dxmt {
 
+std::string
+GetDXMTShaderCacheDirectory() {
+  std::string path;
+  if (path = env::getEnvVar("DXMT_SHADER_CACHE_PATH"); !path.empty() && path.starts_with("/")) {
+    if (!path.ends_with('/'))
+      path += "/";
+    return path;
+  }
+  return str::format("dxmt/", env::getExeName(), "/");
+}
+
 ShaderCache &
 ShaderCache::getInstance(WMTMetalVersion version) {
   /* ml724: two fixed slots instead of a hash map.
@@ -48,13 +59,7 @@ ShaderCache::getInstance(WMTMetalVersion version) {
 ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
   if (env::getEnvVar("DXMT_SHADER_CACHE") == "0")
     return;
-  std::string path;
-  if (path = env::getEnvVar("DXMT_SHADER_CACHE_PATH"); !path.empty() && path.starts_with("/")) {
-    if (!path.ends_with('/'))
-      path += "/";
-  } else {
-    path = str::format("dxmt/", env::getExeName(), "/");
-  }
+  std::string path = GetDXMTShaderCacheDirectory();
   path += str::format("shaders_", (unsigned int)metal_version, ".db");
   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);

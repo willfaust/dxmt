@@ -867,6 +867,16 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandWaitForFence,
   WMTBlitCommandUpdateFence,
   WMTBlitCommandFillBuffer,
+  /* MADEIRA (WOW64_DESIGN.md section 7.11): appended for the Direct3D 9
+   * frontend's StretchRect scale path. The four Reserved slots keep the
+   * values aligned with the upstream v0.4-d3d9 tag (ResolveCounters,
+   * CopyFromBufferToTextureWithBlitOption, CopyFromTextureToBufferWithBlitOption
+   * and ResetCommandsInBuffer there); nothing emits or decodes them. */
+  WMTBlitCommandReserved9,
+  WMTBlitCommandReserved10,
+  WMTBlitCommandReserved11,
+  WMTBlitCommandReserved12,
+  WMTBlitCommandOptimizeContentsForGPUAccess,
 };
 
 struct wmtcmd_base {
@@ -961,6 +971,15 @@ struct wmtcmd_blit_fillbuffer {
   uint64_t offset;
   uint64_t length;
   uint8_t value;
+};
+
+struct wmtcmd_blit_optimize_contents {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t texture;
+  uint32_t slice;
+  uint32_t level;
 };
 
 WINEMETAL_API void MTLBlitCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
@@ -1108,6 +1127,25 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDXMTTessellationMeshDrawIndexed,
   WMTRenderCommandDXMTTessellationMeshDrawIndirect,
   WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
+  /* MADEIRA (WOW64_DESIGN.md section 7.11): appended for the Direct3D 9
+   * frontend, which binds textures and samplers through Metal's argument
+   * TABLE rather than an argument buffer -- something d3d11 never needed.
+   * Appended, never inserted: the value is the wire format between this
+   * module's PE and unix halves.
+   *
+   * The three Reserved slots keep the values aligned with the upstream
+   * v0.4-d3d9 tag (DispatchThreadsPerTile, ExecuteCommandsInBuffer and
+   * SetStencilRef there), so a later cherry-pick of those families lands on
+   * the same numbers, the same reasoning as the NULL unix-call slots in
+   * section 7.4 rule 5. Nothing emits or decodes them; an encoder that meets
+   * one falls through to the loud unknown-command path. */
+  WMTRenderCommandReserved41,
+  WMTRenderCommandReserved42,
+  WMTRenderCommandSetBlendFactor,
+  WMTRenderCommandReserved44,
+  WMTRenderCommandSetFragmentSamplerState,
+  WMTRenderCommandSetVertexTexture,
+  WMTRenderCommandSetVertexSamplerState,
 };
 
 struct wmtcmd_render_nop {
@@ -1156,6 +1194,14 @@ struct wmtcmd_render_settexture {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   obj_handle_t texture;
+  uint8_t index;
+};
+
+struct wmtcmd_render_setsamplerstate {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t sampler;
   uint8_t index;
 };
 
@@ -1857,6 +1903,26 @@ WINEMETAL_API uint64_t MTLDevice_registryID(obj_handle_t device);
 
 WINEMETAL_API bool MTLSharedEvent_waitUntilSignaledValue(obj_handle_t event, uint64_t value, uint64_t timeout);
 
+/* MADEIRA (WOW64_DESIGN.md section 8.4, measurement 2): the empty unix call.
+ *
+ * Section 8 has to decide whether a synchronous 32-bit shim over a native
+ * ARM64 D3D9 frontend can work, and that decision is (D3D9 calls per frame,
+ * from [d3d9-census]) x (cost of ONE unix call). Section 8.4 estimates that
+ * cost at 150-400 ns and then says, in terms: do not build on the estimate.
+ * This is the thing that measures it. The handler returns immediately, so
+ * what a timing loop sees is exactly the crossing -- bridge page, JIT exit,
+ * SpillStaticRegs, HandleSyscall, UnlockJITContext, the table dispatch, and
+ * the whole sequence again in reverse -- and nothing else.
+ *
+ * The argument block is 16 bytes and is neither read nor written, so the
+ * 64-bit and 32-bit tables share the one handler (there is no embedded
+ * pointer to convert -- section 7.4 rule 1 has nothing to do here) and a
+ * 32-bit caller measures the same path a real `_Foo32` thunk would take up to
+ * the point where the thunk starts converting.
+ *
+ * See build/x86-tests/unixcall-bench-x86.c. */
+WINEMETAL_API void WMTNop(uint64_t a, uint64_t b);
+
 
 /* madeira-d3d12: convert application DXIL to a metallib on this machine.
  * `args` is a struct madeira_ir_convert_args; see madeira_ir_abi.h. Runs
@@ -1916,6 +1982,8 @@ WINEMETAL_API obj_handle_t MTLHeap_newBufferAtOffset(obj_handle_t heap, struct W
  *   0  capture poll: ret = frames requested from the UI since the last poll (cleared)
  *   1  write file: Documents/capture/<name> from ptr/len; ret = 1 on success
  *   2  config get: madeira.cfg value of key <name> copied into ptr/len (NUL-terminated); ret = 1 when set
+ *   7  ml2000 memory: len = os_proc_available_memory() bytes, ptr = phys_footprint bytes; ret = 1 when known
+ *      (the only op the wow64 entry forwards; 0 in remote mode)
  * Local in both backends: it never touches a Metal object. */
 struct madeira_ctl_args {
   uint32_t op;

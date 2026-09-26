@@ -134,4 +134,84 @@ static inline void bcn_bc5_block(const uint8_t *blk, uint8_t out[32], bool is_si
 
 void bcn_bc7_block(const uint8_t *blk, uint8_t out[64]);
 
+/* ---- whole-subresource decode ------------------------------------------- */
+/* ml1012: the per-image loop used to live in dxmt_resource_initializer.cpp,
+ * where only the D3D11 initial-data path could reach it. The D3D9 frontend
+ * needs the same loop from its upload funnel, and a second copy of BC block
+ * addressing is exactly the kind of duplication that drifts, so it moves here
+ * beside the block decoders and the initializer keeps a forwarder.
+ *
+ * `kind` is the shared tag: 1=BC1 2=BC2 3=BC3 4=BC4u 5=BC5u 7=BC7 14=BC4s
+ * 15=BC5s, 0 = not decodable. BC6H has no tag: its destination is RGBA16F
+ * and this path only produces 8-bit channels. */
+
+/* Physical bytes per texel each kind produces. */
+static inline uint32_t bcn_texel_size(int kind) {
+  switch (kind) {
+  case 4: case 14: return 1;   /* BC4 -> R8  */
+  case 5: case 15: return 2;   /* BC5 -> RG8 */
+  default:         return 4;   /* BC1/2/3/7 -> RGBA8 */
+  }
+}
+
+/* Bytes per 4x4 block on the wire. BC1 and BC4 are 8, everything else 16. */
+static inline uint32_t bcn_block_bytes(int kind) {
+  return (kind == 1 || kind == 4 || kind == 14) ? 8u : 16u;
+}
+
+/* Bytes one decoded subresource occupies at the tight pitch this decoder
+ * writes. Callers size their staging span with this so the two cannot drift. */
+static inline uint64_t bcn_decoded_bytes(int kind, uint32_t width, uint32_t height) {
+  return (uint64_t)width * bcn_texel_size(kind) * height;
+}
+
+/* Decode one subresource. `src_pitch` is the BC row pitch (bytes per ROW OF
+ * BLOCKS, which is what D3D9's LockRect pitch and D3D11's RowPitch both are);
+ * `dst_pitch` is the destination row pitch in bytes, 0 meaning tightly packed.
+ *
+ * Edge blocks are decoded in full and CLIPPED, which is what the BC spec
+ * requires for non-multiple-of-4 extents: a 2x2 or 1x1 level is still one whole
+ * block on the wire, and its texels are the top-left corner of that block. No
+ * allocation and no per-block call overhead beyond the 64-byte stack scratch,
+ * so a caller may run this on the uploading thread. */
+static inline void
+bcn_decode_image(
+    const uint8_t *src, size_t src_pitch, uint8_t *dst, size_t dst_pitch, uint32_t width, uint32_t height, int kind
+) {
+  const uint32_t bx_n = (width + 3u) / 4u, by_n = (height + 3u) / 4u;
+  const uint32_t blk_bytes = bcn_block_bytes(kind);
+  const uint32_t tsz = bcn_texel_size(kind);
+  if (dst_pitch == 0)
+    dst_pitch = (size_t)width * tsz;
+  uint8_t texels[64];
+  for (uint32_t by = 0; by < by_n; by++) {
+    const uint8_t *row = src + (size_t)by * src_pitch;
+    /* Rows this block contributes, clipped at the level edge. */
+    const uint32_t y0 = by * 4u;
+    const uint32_t ty_n = (height - y0) < 4u ? (height - y0) : 4u;
+    for (uint32_t bx = 0; bx < bx_n; bx++) {
+      const uint8_t *b = row + (size_t)bx * blk_bytes;
+      switch (kind) {
+      case 1:  bcn_bc1_block(b, texels, /*punchthrough=*/true); break;
+      case 2:  bcn_bc2_block(b, texels); break;
+      case 3:  bcn_bc3_block(b, texels); break;
+      case 4:  bcn_bc4_block(b, texels, false); break;
+      case 14: bcn_bc4_block(b, texels, true);  break;
+      case 5:  bcn_bc5_block(b, texels, false); break;
+      case 15: bcn_bc5_block(b, texels, true);  break;
+      case 7:  bcn_bc7_block(b, texels); break;
+      default: memset(texels, 0, sizeof(texels)); break;
+      }
+      const uint32_t x0 = bx * 4u;
+      const uint32_t tx_n = (width - x0) < 4u ? (width - x0) : 4u;
+      /* One memcpy per block row rather than per texel: a full interior block
+       * is four 4-, 8- or 16-byte copies at a known stride, which is what the
+       * streaming case is made of. */
+      for (uint32_t ty = 0; ty < ty_n; ty++)
+        memcpy(dst + (size_t)(y0 + ty) * dst_pitch + (size_t)x0 * tsz, texels + (size_t)(ty * 4u) * tsz,
+               (size_t)tx_n * tsz);
+    }
+  }
+}
+
 } // namespace dxmt

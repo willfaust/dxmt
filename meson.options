@@ -2,6 +2,13 @@ option('native_llvm_path', type : 'string', value: '/usr/local/opt/llvm@15')
 option('build_airconv_for_windows', type : 'boolean', value : false)
 option('dxmt_debug', type : 'boolean', value : false)
 option('dxmt_native', type : 'boolean', value : false)
+# MADEIRA (WOW64_DESIGN.md section 8): dxmt_native plus the Madeira-specific
+# substrate -- the guest arena, util_madeira_compat.h and the madeira wsi.
+# Implies dxmt_native. The iOS-arm64 objects are actually produced by
+# build/dxmt-ios/build.sh, a hand-rolled clang script; this option exists so
+# the meson shape still describes the configuration and so the upstream
+# dxmt_native CI target keeps its meaning.
+option('dxmt_madeira_native', type : 'boolean', value : false)
 option('wine_build_path', type : 'string')
 option('wine_install_path', type : 'string')
 option('wine_builtin_dll', type : 'boolean', value : false)

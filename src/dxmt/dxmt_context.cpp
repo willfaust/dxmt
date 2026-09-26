@@ -9,6 +9,8 @@
 #include <cfloat>
 #include "dxmt_mem_census.hpp"
 #include "config/config.hpp"   /* ml754 */
+#include "util_env.hpp"
+#include <atomic>
 
 namespace dxmt {
 
@@ -18,6 +20,8 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     blit_depth_stencil_cmd(device, lib, *this),
     clear_res_cmd(device, lib, *this),
     mv_scale_cmd(device, lib, *this),
+    resolve_texture_cmd(device, lib, *this),
+    stretch_blit_cmd(device, lib, *this),
     device_(device),
     queue_(queue) {
   dummy_sampler_info_.support_argument_buffers = true;
@@ -442,7 +446,9 @@ ArgumentEncodingContext::clearDepthStencil(
 
 void
 ArgumentEncodingContext::resolveTexture(
-    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin,
+    WMTSize resolve_size
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<ResolveEncoderData>();
@@ -451,9 +457,109 @@ ArgumentEncodingContext::resolveTexture(
 
   encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ);
   encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
 
   endPass();
 };
+
+/* MADEIRA (WOW64_DESIGN.md section 7.11): the three encoder entry points the
+ * Direct3D 9 frontend needs, imported from the upstream v0.4-d3d9 tag (see
+ * LICENSE-MADEIRA.md). d3d11 calls none of them. */
+
+void
+ArgumentEncodingContext::resolveDepthTexture(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<ResolveEncoderData>();
+  encoder_info->type = EncoderType::Resolve;
+  encoder_info->id = nextEncoderId();
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ);
+  encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
+  encoder_info->is_depth = true;
+
+  endPass();
+};
+
+void
+ArgumentEncodingContext::stretchBlit(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, WMT::SamplerState sampler, WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  assert(!encoder_current);
+  // The src texture-view's level dimensions normalize the sample sub-rect into
+  // uv-space. Texture::width/height(view) returns max(info_.width >>
+  // firstMiplevel, 1), so a divide-by-zero is impossible.
+  uint32_t src_view_w = src.ptr() ? src->width(src_view) : 1;
+  uint32_t src_view_h = src.ptr() ? src->height(src_view) : 1;
+
+  auto encoder_info = allocate<StretchBlitEncoderData>();
+  encoder_info->type = EncoderType::StretchBlit;
+  encoder_info->id = nextEncoderId();
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ);
+  encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->pso = pso;
+  encoder_info->sampler = sampler;
+  encoder_info->src_uv_origin[0] = float(src_origin.x) / float(src_view_w);
+  encoder_info->src_uv_origin[1] = float(src_origin.y) / float(src_view_h);
+  encoder_info->src_uv_size[0] = float(src_size.width) / float(src_view_w);
+  encoder_info->src_uv_size[1] = float(src_size.height) / float(src_view_h);
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->dst_size = dst_size;
+
+  endPass();
+}
+
+void
+ArgumentEncodingContext::copyTexture(
+    const Rc<Texture> &src, unsigned src_level, unsigned src_slice, WMTOrigin src_origin, const Rc<Texture> &dst,
+    unsigned dst_level, unsigned dst_slice, WMTOrigin dst_origin, WMTSize size
+) {
+  assert(!encoder_current);
+  startBlitPass();
+  auto src_tex = access(src, src_level, src_slice, DXMT_ENCODER_RESOURCE_ACESS_READ);
+  auto dst_tex = access(dst, dst_level, dst_slice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  auto &cmd = encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
+  cmd.type = WMTBlitCommandCopyFromTextureToTexture;
+  cmd.src = src_tex.handle;
+  cmd.src_slice = src_slice;
+  cmd.src_level = src_level;
+  cmd.src_origin = src_origin;
+  cmd.src_size = size;
+  cmd.dst = dst_tex.handle;
+  cmd.dst_slice = dst_slice;
+  cmd.dst_level = dst_level;
+  cmd.dst_origin = dst_origin;
+  endPass();
+}
+
+void
+ArgumentEncodingContext::optimizeTextureForGPUAccess(const Rc<Texture> &texture, unsigned level, unsigned slice) {
+  assert(!encoder_current);
+  // Write access: the re-tile mutates the texture's layout, so it must register
+  // as the subresource's last writer for the following sample to wait on it.
+  startBlitPass();
+  auto tex = access(texture, level, slice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  auto &cmd = encodeBlitCommand<wmtcmd_blit_optimize_contents>();
+  cmd.type = WMTBlitCommandOptimizeContentsForGPUAccess;
+  cmd.texture = tex.handle;
+  cmd.slice = slice;
+  cmd.level = level;
+  endPass();
+}
 
 void
 ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata) {
@@ -540,6 +646,22 @@ ArgumentEncodingContext::signalEvent(WMT::Reference<WMT::Event> &&event, uint64_
   encoder_info->type = EncoderType::SignalEvent;
   encoder_info->id = nextEncoderId();
   encoder_info->event = std::move(event);
+  encoder_info->value = value;
+
+  encoder_current = encoder_info;
+  endPass();
+}
+
+void
+ArgumentEncodingContext::signalEventByHandle(obj_handle_t event_handle, uint64_t value) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<SignalEventData>();
+  encoder_info->type = EncoderType::SignalEvent;
+  encoder_info->id = nextEncoderId();
+  // Reference operator=(Class non_retained); retains, paired with the
+  // SignalEventData destructor's release. The retain runs on the encode
+  // thread so the calling-thread emit site dodges a wine_unix_call.
+  encoder_info->event = WMT::Event{event_handle};
   encoder_info->value = value;
 
   encoder_current = encoder_info;
@@ -742,6 +864,34 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     visibility_readback = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_
     );
+  } else {
+    /* iOS-Madeira ml998: A QUERY THAT ENDS IN AN EMPTY SUBMISSION WAS LOST.
+     *
+     * VisibilityResultQuery only reports a value once seq_id_issued reaches
+     * seq_id_end, and the ONLY thing that advances seq_id_issued is
+     * ~VisibilityResultReadback calling issue() for every query it captured.
+     * When vro_state_.reset() returns 0 -- this submission counted no
+     * visibility samples at all, e.g. a flush with no render encoder, or one
+     * whose encoders ran with no occlusion query active -- no readback object
+     * is built, so nothing will ever issue() for seqId. The erase_if below
+     * then dropped every query whose END landed here out of pending_queries_,
+     * and since a query is only ever issued through a readback that captured
+     * it, it could never be settled by any later submission either.
+     *
+     * The single-submission case was already handled (end() completes a query
+     * whose begin and end share a seq id and a counter offset); what was not
+     * is a query that BEGINS in one submission and ENDS in an empty one. That
+     * one is stranded permanently: D3D9's GetData polls it forever and the
+     * caller never gets its result. It is visible in the captures as
+     * [d3d9-query] worst_ever, which is 178 s in q67.txt (and 10.3 s in
+     * qp4.txt) against an issue_to_complete_avg of 34 ms -- four orders of
+     * magnitude apart, which is not a slow GPU, it is a query that stopped.
+     *
+     * Empty means empty, so the accumulated total is already correct; all that
+     * is missing is the record that seqId has been accounted for. */
+    for (auto &query : pending_queries_)
+      if (query->queryEndAt() == seqId)
+        query->issueEmpty(seqId);
   }
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
 
@@ -996,6 +1146,119 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Resolve: {
       auto data = static_cast<ResolveEncoderData *>(current);
+      /* MADEIRA (WOW64_DESIGN.md section 7.11): the Direct3D 9 depth resolve.
+       * Point resolve of a multisampled depth surface: a depth-only render pass
+       * whose fragment shader reads sample 0 of the source (bound as a fragment
+       * depth texture) and writes the destination depth attachment. Only the
+       * depth aspect is resolved; a depth-stencil source's stencil is not
+       * carried, matching wined3d and DXVK. */
+      if (data->is_depth) {
+        auto src_texture = data->src.texture();
+        auto dst_texture = data->dst.texture();
+        if (!src_texture || !dst_texture) {
+          WARN("skipped a depth resolve with a missing attachment, encoder=", data->id);
+          data->~ResolveEncoderData();
+          break;
+        }
+        auto *dst_allocation = data->dst.ptr() ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.depth.texture = dst_texture;
+        info.depth.load_action = WMTLoadActionDontCare;
+        info.depth.store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+        }
+        info.render_target_array_length = 1;
+        info.default_raster_sample_count = 1;
+
+        if (!depth_resolve_dss_) {
+          WMTDepthStencilInfo ds_info = {};
+          ds_info.depth_compare_function = WMTCompareFunctionAlways;
+          ds_info.depth_write_enabled = true;
+          depth_resolve_dss_ = device_.newDepthStencilState(ds_info);
+        }
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("DepthResolvePass", WMTUTF8StringEncoding));
+        struct ResolveMetadata {
+          uint32_t src_origin[2];
+          uint32_t dst_origin[2];
+          uint32_t size[2];
+        } metadata = {};
+        metadata.src_origin[0] = data->src_rect ? data->src_rect->x : 0;
+        metadata.src_origin[1] = data->src_rect ? data->src_rect->y : 0;
+        metadata.dst_origin[0] = data->dst_origin.x;
+        metadata.dst_origin[1] = data->dst_origin.y;
+        metadata.size[0] = data->resolve_size.width ? data->resolve_size.width : info.render_target_width;
+        metadata.size[1] = data->resolve_size.height ? data->resolve_size.height : info.render_target_height;
+        encoder.setRenderPipelineState(data->pso);
+        encoder.setDepthStencilState(depth_resolve_dss_);
+        encoder.setFragmentTexture(src_texture, 0);
+        encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+        encoder.setViewport(
+            {double(metadata.dst_origin[0]), double(metadata.dst_origin[1]), double(metadata.size[0]),
+             double(metadata.size[1]), 0.0, 1.0}
+        );
+        encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        encoder.endEncoding();
+        data->~ResolveEncoderData();
+        break;
+      }
+      /* MADEIRA: the shader colour resolve, for a sub-rect, an offset
+       * destination or a format-converting resolve, none of which Metal's own
+       * multisample-resolve store action can express. */
+      if (data->pso) {
+        auto src_texture = data->src.texture();
+        auto dst_texture = data->dst.texture();
+        if (!src_texture || !dst_texture) {
+          WARN("skipped a shader resolve with a missing attachment, encoder=", data->id);
+          data->~ResolveEncoderData();
+          break;
+        }
+        auto *dst_allocation = data->dst.ptr() ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.colors[0].texture = dst_texture;
+        info.colors[0].load_action = WMTLoadActionLoad;
+        info.colors[0].store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+        }
+        info.render_target_array_length = 1;
+        info.default_raster_sample_count = 1;
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("ShaderResolvePass", WMTUTF8StringEncoding));
+        struct ResolveMetadata {
+          uint32_t src_origin[2];
+          uint32_t dst_origin[2];
+          uint32_t size[2];
+        } metadata = {};
+        metadata.src_origin[0] = data->src_rect ? data->src_rect->x : 0;
+        metadata.src_origin[1] = data->src_rect ? data->src_rect->y : 0;
+        metadata.dst_origin[0] = data->dst_origin.x;
+        metadata.dst_origin[1] = data->dst_origin.y;
+        metadata.size[0] = data->resolve_size.width ? data->resolve_size.width : info.render_target_width;
+        metadata.size[1] = data->resolve_size.height ? data->resolve_size.height : info.render_target_height;
+        encoder.setRenderPipelineState(data->pso);
+        encoder.setFragmentTexture(src_texture, 0);
+        encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+        encoder.setViewport(
+            {double(metadata.dst_origin[0]), double(metadata.dst_origin[1]), double(metadata.size[0]),
+             double(metadata.size[1]), 0.0, 1.0}
+        );
+        encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        encoder.endEncoding();
+        data->~ResolveEncoderData();
+        break;
+      }
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
@@ -1009,6 +1272,58 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
+      break;
+    }
+    /* MADEIRA (WOW64_DESIGN.md section 7.11): the Direct3D 9 StretchRect
+     * render-pass scale. Samples the source through a cached PSO + sampler and
+     * stores into a viewport-restricted region of the destination. */
+    case EncoderType::StretchBlit: {
+      auto data = static_cast<StretchBlitEncoderData *>(current);
+      {
+        auto *dst_allocation = data->dst.ptr() ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.colors[0].texture = data->dst.texture();
+        info.colors[0].load_action = WMTLoadActionLoad;
+        info.colors[0].store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+          info.render_target_array_length = 1;
+          // A single-sample -> multisample StretchRect broadcasts the sampled
+          // source into every sample, so the pass raster count follows the
+          // destination (1 for the common single-sample dst, unchanged).
+          info.default_raster_sample_count = dst_descriptor->sampleCount();
+        } else {
+          info.default_raster_sample_count = 1;
+        }
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("StretchBlitPass", WMTUTF8StringEncoding));
+        if (data->pso && data->sampler) {
+          struct {
+            float src_uv_origin[2];
+            float src_uv_size[2];
+          } metadata{};
+          metadata.src_uv_origin[0] = data->src_uv_origin[0];
+          metadata.src_uv_origin[1] = data->src_uv_origin[1];
+          metadata.src_uv_size[0] = data->src_uv_size[0];
+          metadata.src_uv_size[1] = data->src_uv_size[1];
+          encoder.setRenderPipelineState(data->pso);
+          encoder.setFragmentTexture(data->src.texture(), 0);
+          encoder.setFragmentSamplerState(data->sampler, 0);
+          encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+          encoder.setViewport(
+              {double(data->dst_origin.x), double(data->dst_origin.y), double(data->dst_size.width),
+               double(data->dst_size.height), 0.0, 1.0}
+          );
+          encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        }
+        encoder.endEncoding();
+      }
+      data->~StretchBlitEncoderData();
       break;
     }
     case EncoderType::SpatialUpscale: {
@@ -1125,6 +1440,30 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     if (latter->type == EncoderType::Clear && former->type == EncoderType::Render) {
       auto render = reinterpret_cast<RenderEncoderData *>(former);
       auto clear = reinterpret_cast<ClearEncoderData *>(latter);
+
+      static const bool discardColor = [] {
+        const bool enabled = env::getEnvVar("DXMT_CLEAR_DISCARD_STORE") != "0";
+        Logger::warn(str::format("[clear-store] ml1190 enabled=", enabled));
+        return enabled;
+      }();
+      // A full clear makes the preceding color store dead. Keep dependency
+      // tracking intact, and only match the exact view and covered subresource.
+      // Resolve stores and partial clears must retain their original behavior.
+      if (discardColor && !clear->clear_dsv && clear->attachment &&
+          clear->array_length == render->render_target_array_length &&
+          clear->width == render->render_target_width && clear->height == render->render_target_height) {
+        for (unsigned i = 0; i < render->render_target_count; ++i) {
+          auto &color = render->colors[i];
+          if (color.attachment == clear->attachment && !color.level && !color.slice && !color.depth_plane &&
+              !color.resolve_attachment && color.store_action == WMTStoreActionStore) {
+            color.store_action = WMTStoreActionDontCare;
+            static std::atomic<uint64_t> saved{0};
+            const auto total = saved.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total <= 4 || !(total % 4096))
+              Logger::warn(str::format("[clear-store] ml1190 overwritten color stores skipped=", total));
+          }
+        }
+      }
 
       // DontCare can be used because it's going to be cleared anyway
       // just keep in mind DontCare != DontStore

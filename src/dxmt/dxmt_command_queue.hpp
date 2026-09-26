@@ -13,13 +13,33 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_cpu_fence.hpp"
+#include "util_futex.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace dxmt {
+
+enum class GpuCompletionStatus : uint8_t {
+  Pending,
+  Complete,
+  Failed,
+};
+
+// Notified once the command buffer a chunk was encoded into has finished, so
+// an object can retire whatever it was keeping alive for that GPU work.
+class GpuCompletionTarget {
+public:
+  GpuCompletionTarget() = default;
+  GpuCompletionTarget(const GpuCompletionTarget &) = delete;
+  GpuCompletionTarget &operator=(const GpuCompletionTarget &) = delete;
+  virtual ~GpuCompletionTarget() noexcept = default;
+  virtual void CompleteGpuWork(GpuCompletionStatus status) noexcept = 0;
+};
 
 template <typename T> class moveonly_list {
 public:
@@ -102,12 +122,22 @@ public:
     statistics.encode_flush_interval += (t2 - t1);
   };
 
+  void
+  addCompletionTarget(std::shared_ptr<GpuCompletionTarget> target) {
+    if (!target)
+      return;
+    std::lock_guard<dxmt::mutex> lock(completion_targets_mutex_);
+    completion_targets.push_back(std::move(target));
+  }
+
   uint64_t chunk_id;
   uint64_t chunk_event_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
   std::unique_ptr<VisibilityResultReadback> visibility_readback;
   uint64_t resource_initializer_event_id;
+  std::vector<std::shared_ptr<GpuCompletionTarget>> completion_targets;
+  dxmt::mutex completion_targets_mutex_;
 
 private:
   CommandQueue *queue;
@@ -125,6 +155,7 @@ public:
   reset() noexcept {
     signal_frame_latency_fence_ = ~0ull;
     visibility_readback = {};
+    completion_targets.clear();
     list_enc.reset();
     ref_tracker.clear();
     attached_cmdbuf = nullptr;
@@ -134,6 +165,7 @@ public:
 class CommandQueue {
 
 private:
+  std::atomic<bool> device_error_ = false;
   void CommitChunkInternal(CommandChunk &chunk, uint64_t seq);
 
   uint32_t EncodingThread();
@@ -182,6 +214,15 @@ public:
   ResourceInitializer initializer;
 
   CommandQueue(WMT::Device device);
+
+  // Sticky: set once a command buffer retires in the Error status, so a
+  // frontend can report a lost/removed device instead of continuing to submit
+  // work the driver has already given up on.
+  bool HasDeviceError() const {
+    return device_error_.load(std::memory_order_acquire);
+  }
+
+  void MarkDeviceError();
 
   ~CommandQueue();
 
@@ -255,10 +296,46 @@ public:
 
   void SetMaxLatency(uint32_t value) { max_latency_ = value; };
 
+  // Highest frame seq whose present chunk has retired, signaled on the frame
+  // latency fence. d3d9's D3DPRESENT_DONOTWAIT probe peeks this to decide
+  // whether the end-of-Present frame-latency throttle would block, and returns
+  // D3DERR_WASSTILLDRAWING instead of entering the wait.
+  uint64_t FrameLatencySignaled() { return frame_latency_fence_.signaledValue(); }
+
+  // Block until the present chunk from max_latency frames back has retired,
+  // capping how far the calling thread runs ahead of the GPU. Present pacing is
+  // applied per frontend rather than in PresentBoundary; the other back ends
+  // pace through their own swapchain fence or present semaphore, so d3d9 rides
+  // the frame-latency fence it stamps on each present chunk.
+  void WaitFrameLatency(uint64_t frame_seq) {
+    if (frame_seq > max_latency_)
+      frame_latency_fence_.wait(frame_seq - max_latency_);
+  }
+
   void
   WaitCPUFence(uint64_t seq) {
     cpu_coherent.wait(seq);
   };
+
+  // MADEIRA: bounded, cooperative counterpart of WaitCPUFence, for a caller
+  // that is NOT allowed to block. D3D9's IDirect3DQuery9::GetData is the
+  // motivating one: its contract is "report, never stall", so it has to come
+  // back with S_FALSE while the GPU is still running -- but an application
+  // that builds a GPU fence out of
+  // `while (GetData(..., D3DGETDATA_FLUSH) == S_FALSE) {}` then spins its
+  // render thread at full speed for a whole frame. Parking that thread here
+  // for a capped slice turns tens of thousands of no-op polls per frame into
+  // a few hundred and observes the completion within microseconds of it
+  // happening, instead of whenever the caller next happens to ask.
+  //
+  // Never waits longer than timeout_ns, so it cannot turn a non-blocking API
+  // into a blocking one. Two phases, the same shape D9RecursiveSpinlock uses:
+  // a short load-spin catches a completion that is already microseconds away
+  // without paying for a context switch, then the core is handed to whoever
+  // else is runnable -- which is exactly the encode and finish threads, the
+  // only threads that can move this watermark at all. Returns true iff the
+  // watermark reached seq before the deadline.
+  bool WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns);
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {
