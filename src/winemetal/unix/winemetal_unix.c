@@ -478,6 +478,50 @@ _MTLCommandQueue_commandBuffer(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* ml1174: GPU busy time for the performance overlay. While the overlay shows
+ * GPU load, every committed command buffer gets a completion handler that adds
+ * the part of its GPUStartTime..GPUEndTime not already covered by an earlier
+ * buffer (the union, as DXMT's [gpu-perf] counts it). Off, nothing is attached.
+ * Command buffers committed through the remote path (wmtr) are not counted. */
+static _Atomic int g_madeira_gpu_meter;
+static os_unfair_lock g_gpu_meter_lock = OS_UNFAIR_LOCK_INIT;
+static double g_gpu_meter_busy_s, g_gpu_meter_last_end;
+static _Atomic uint64_t g_gpu_meter_cmdbufs;
+
+void madeira_gpu_meter_enable(int on) {
+  atomic_store_explicit(&g_madeira_gpu_meter, on ? 1 : 0, memory_order_relaxed);
+}
+
+/* Busy seconds so far and command buffers counted; both only grow. */
+double madeira_gpu_meter_busy_seconds(void) {
+  double v;
+  os_unfair_lock_lock(&g_gpu_meter_lock);
+  v = g_gpu_meter_busy_s;
+  os_unfair_lock_unlock(&g_gpu_meter_lock);
+  return v;
+}
+
+uint64_t madeira_gpu_meter_cmdbufs(void) {
+  return atomic_load_explicit(&g_gpu_meter_cmdbufs, memory_order_relaxed);
+}
+
+static void madeira_gpu_meter_attach(id<MTLCommandBuffer> cmdbuf) {
+  [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+    double start = buffer.GPUStartTime, end = buffer.GPUEndTime;
+    if (start <= 0.0 || end <= start)
+      return;
+    os_unfair_lock_lock(&g_gpu_meter_lock);
+    if (start < g_gpu_meter_last_end)
+      start = g_gpu_meter_last_end;
+    if (end > start)
+      g_gpu_meter_busy_s += end - start;
+    if (end > g_gpu_meter_last_end)
+      g_gpu_meter_last_end = end;
+    os_unfair_lock_unlock(&g_gpu_meter_lock);
+    atomic_fetch_add_explicit(&g_gpu_meter_cmdbufs, 1, memory_order_relaxed);
+  }];
+}
+
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
@@ -501,6 +545,8 @@ _MTLCommandBuffer_commit(void *obj) {
       ios_frame_gpu(buffer.GPUStartTime > 0.0 && span > 0.0 ? (unsigned long long)(span * 1e9) : 0, depth);
     }];
   }
+  if (atomic_load_explicit(&g_madeira_gpu_meter, memory_order_relaxed))
+    madeira_gpu_meter_attach((id<MTLCommandBuffer>)params->handle);
   [(id<MTLCommandBuffer>)params->handle commit];
   return STATUS_SUCCESS;
 }
