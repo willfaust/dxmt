@@ -5031,11 +5031,18 @@ _MTLDevice_newSharedTexture(void *obj) {
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
     fill_texture_descriptor(desc, info);
     id<MTLTexture> ret = [device newSharedTextureWithDescriptor:desc];
-    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
     params->ret = (obj_handle_t)ret;
     info->gpu_resource_id = [ret gpuResourceID]._impl;
+#if TARGET_OS_IOS
+    /* An iOS app cannot bootstrap-register the port, so the caller could only
+     * fail the creation (Crysis Remastered then crashed on the views it never
+     * got). Without a port DXMT keeps the texture unshared (ml866). */
+    info->mach_port = 0;
+#else
+    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
     info->mach_port = [handle createMachPort]; // implicitly add ref to underlying IOSurface
     [handle release];
+#endif
     [desc release];
   }
 
