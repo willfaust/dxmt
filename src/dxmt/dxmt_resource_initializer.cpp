@@ -49,7 +49,7 @@ namespace dxmt {
 ResourceInitializer::ResourceInitializer(WMT::Device device) :
     device_(device),
     gpu_command_heap_allocator(StagingBufferBlockAllocator(
-        device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false
+        device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false, MEMOWN_INIT_UPLOAD
     )) {
   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
   upload_queue_event_ = device.newSharedEvent();
@@ -62,6 +62,8 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
 ResourceInitializer::~ResourceInitializer() {
   free(cpu_command_heap);
 }
+
+static inline uint32_t bc_fill_texel_size(enum WMTPixelFormat f);   /* ml1251: defined below */
 
 uint64_t
 ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uint64_t length) {
@@ -185,6 +187,19 @@ ResourceInitializer::initWithZero(
 
   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
   size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
+  /* ml1251: on a GPU without BC the Metal texture is PHYSICALLY uncompressed
+   * (remap_unsupported_bc), so the zero fill must be laid out in that format,
+   * exactly as initWithData does for real data. With the BC layout a BC3
+   * texture got a w*h-byte zero buffer for a 4*w*h-byte copy -- Metal read the
+   * other three quarters from whatever followed it (validation: "totalBytesUsed
+   * must be <= [sourceBuffer length]") -- and a BC1 one got half the row pitch,
+   * which texture_upload_pitch_ok() then dropped, leaving it uninitialised.
+   * Every mip the game never streams (or that a clamped copy loses) showed that. */
+  if (block_size == 4u && !device_.supportsBCTextureCompression()) {
+    const int kind = bc_decode_kind(texture->pixelFormat());
+    texel_size = kind ? bc_decode_texel_size(kind) : bc_fill_texel_size(texture->pixelFormat());
+    block_size = 1u;
+  }
   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
   size_t bytes_per_image_needed = bytes_per_row_needed * align(height_sub, block_size) / block_size;
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
@@ -338,6 +353,42 @@ void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_
   }
 }
 
+void bc_decode_image_half(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+                          uint32_t height, int kind) {
+  const uint32_t bx_n = width / 4, by_n = height / 4;
+  const size_t blk_bytes = (kind == 1 || kind == 4 || kind == 14) ? 8 : 16;
+  const uint32_t tsz = bc_decode_texel_size(kind);
+  const bool is_signed = kind == 14 || kind == 15;
+  const size_t dst_pitch = (size_t)(width / 2) * tsz;
+  uint8_t texels[64];
+  for (uint32_t by = 0; by < by_n; by++) {
+    const uint8_t *row = src + (size_t)by * src_pitch;
+    for (uint32_t bx = 0; bx < bx_n; bx++) {
+      const uint8_t *b = row + bx * blk_bytes;
+      switch (kind) {
+      case 1:  bcn_bc1_block(b, texels, /*punchthrough=*/true); break;
+      case 2:  bcn_bc2_block(b, texels); break;
+      case 3:  bcn_bc3_block(b, texels); break;
+      case 4:  bcn_bc4_block(b, texels, false); break;
+      case 14: bcn_bc4_block(b, texels, true);  break;
+      case 5:  bcn_bc5_block(b, texels, false); break;
+      case 15: bcn_bc5_block(b, texels, true);  break;
+      case 7:  bcn_bc7_block(b, texels); break;
+      default: memset(texels, 0, sizeof(texels)); break;
+      }
+      for (uint32_t qy = 0; qy < 2; qy++)
+        for (uint32_t qx = 0; qx < 2; qx++) {
+          const uint8_t *t00 = texels + (size_t)((qy * 2) * 4 + qx * 2) * tsz;
+          const uint8_t *t10 = t00 + tsz, *t01 = t00 + 4 * tsz, *t11 = t01 + tsz;
+          uint8_t *o = dst + (size_t)(by * 2 + qy) * dst_pitch + (size_t)(bx * 2 + qx) * tsz;
+          for (uint32_t c = 0; c < tsz; c++)
+            o[c] = is_signed ? (uint8_t)(int8_t)(((int)(int8_t)t00[c] + (int8_t)t10[c] + (int8_t)t01[c] +
+                                                  (int8_t)t11[c]) / 4)
+                             : (uint8_t)(((unsigned)t00[c] + t10[c] + t01[c] + t11[c] + 2) / 4);
+        }
+    }
+  }
+}
 
 /* ml676: which REMAPPED formats came from a BC source we cannot decode yet, and
  * what does one physical texel cost. Mirrors remap_unsupported_bc() in
@@ -546,6 +597,11 @@ ResourceInitializer::initWithData(
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
+  /* ml1243: flush BEFORE the block, not through ALLOC_GPU's failure path --
+   * `continue` in a do/while(0) leaves the loop, so that path drops the upload. */
+  if (upload_bytes_since_flush_ &&
+      upload_bytes_since_flush_ + total_bytes_needed > kResourceInitializerFlushThreshold)
+    flushInternal();
   do {
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
@@ -618,6 +674,7 @@ ResourceInitializer::flushToWait() {
 void
 ResourceInitializer::reset() {
   cpu_command_heap_offset = 0;
+  upload_bytes_since_flush_ = 0;
 
   clear_render_pass_head.next = nullptr;
   clear_render_pass_tail = &clear_render_pass_head;
@@ -651,6 +708,7 @@ ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset) {
   auto [block, offset_] = gpu_command_heap_allocator.allocate(
       current_seq_id_, cached_coherent_seq_id, size, kResourceInitializerGpuUploadHeapAlignment
   );
+  upload_bytes_since_flush_ += size;
   offset = offset_;
   return block.buffer;
 }
@@ -716,7 +774,11 @@ ResourceInitializer::allocateZeroBuffer(size_t size) {
 
     fill->type = WMTBlitCommandFillBuffer;
     fill->buffer = zero_buffer_;
-    fill->length = size;
+    /* ml1168: fill everything that zero_buffer_size_ now promises. With the
+     * ml1490 pow2 growth, `length` exceeds `size`, and a later request up to
+     * `length` reuses the tail without a new fill; it read zero only because
+     * Metal happens to zero a fresh private buffer. */
+    fill->length = length;
     fill->offset = 0;
     fill->value = 0;
   }

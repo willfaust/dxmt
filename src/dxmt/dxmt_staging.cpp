@@ -3,6 +3,19 @@
 
 namespace dxmt {
 
+std::atomic<uint64_t> StagingResource::spare_bytes = {0u};
+
+StagingResource::~StagingResource() {
+  if (buffer_pool.size() > 1)
+    spare_bytes.fetch_sub((buffer_pool.size() - 1) * length, std::memory_order_relaxed);
+}
+
+bool
+StagingResource::canRenameWithoutGrowth(uint64_t coherent_seq_id) {
+  std::lock_guard<dxmt::mutex> lock(mutex_);
+  return !fifo.empty() && fifo.front().will_free_at <= coherent_seq_id;
+}
+
 StagingResource::StagingResource(
   WMT::Device device, uint64_t length, uint32_t bytes_per_row, uint32_t bytes_per_image
 ) :
@@ -80,6 +93,8 @@ StagingResource::allocate(uint64_t coherent_seq_id) {
 #ifdef __i386__
     flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
+    if (!buffer_pool.empty())
+      spare_bytes.fetch_add(length, std::memory_order_relaxed);
     buffer_pool.push_back(buffer_->allocate(flags, "StagingResource::pool"));
     ret = buffer_pool.size() - 1;
   }

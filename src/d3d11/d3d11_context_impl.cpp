@@ -8,6 +8,7 @@ since it is for internal use only
 */
 #include "Metal.hpp"
 #include "config/config.hpp"   /* ml869 */
+#include <deque>   /* ml1256 */
 #include "d3d11_annotation.hpp"
 #include "d3d11_context.hpp"
 #include "d3d11_device_child.hpp"
@@ -616,6 +617,8 @@ inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
  * into a physically-RGBA8 texture (the ml743 defect, in the copy path). */
 inline std::atomic<uint32_t> g_cp_xlated{0};      /* index shifted, executed   */
 inline std::atomic<uint32_t> g_cp_dropped{0};     /* logical mip below a bias  */
+inline std::atomic<uint32_t> g_cp_lost{0};        /* ml1247: src clamped away, dst level left empty */
+inline std::atomic<uint32_t> g_cp_refilled{0};    /* ml1252: lost levels rebuilt from the level above */
 inline std::atomic<uint32_t> g_cp_tex_tex{0};
 inline std::atomic<uint32_t> g_cp_stg_tex{0};
 inline std::atomic<uint32_t> g_cp_tex_stg{0};
@@ -639,13 +642,150 @@ inline void BCStreamReport() {
       " | ALLOC-FAIL=", g_bc_stream_fail.load(),
       " | ml745 clamp xlated=", g_bc_clamp_xlated.load(),
       " dropped=", g_bc_clamp_dropped.load(),
-      " | ml746 copy xlated=", g_cp_xlated.load(), " dropped=", g_cp_dropped.load(),
+      " | ml746 copy xlated=", g_cp_xlated.load(), " dropped=", g_cp_dropped.load(), " (lost=", g_cp_lost.load(), " refilled=", g_cp_refilled.load(), ")",
       " paths tex<-tex=", g_cp_tex_tex.load(), " tex<-stg=", g_cp_stg_tex.load(),
       " stg<-tex=", g_cp_tex_stg.load(), " stg<-stg=", g_cp_stg_stg.load(),
       " BCstg-unsup=", g_cp_bc_stg_unsupported.load(),
       " | ml747 BCstg decoded=", g_cp_bc_stg_decoded.load(),
       " fail=", g_cp_bc_stg_fail.load());
 }
+
+/* ml1252: 2x2 box filter of a decoded (physical-format) image */
+inline void
+RefillBoxHalf(const uint8_t *cur, uint32_t cw, uint32_t ch, uint8_t *next, uint32_t nw, uint32_t nh, uint32_t tsz,
+              bool is_signed) {
+  for (uint32_t y = 0; y < nh; y++) {
+    const uint32_t y0 = std::min(ch - 1, y * 2), y1 = std::min(ch - 1, y * 2 + 1);
+    for (uint32_t x = 0; x < nw; x++) {
+      const uint32_t x0 = std::min(cw - 1, x * 2), x1 = std::min(cw - 1, x * 2 + 1);
+      for (uint32_t c = 0; c < tsz; c++) {
+        const uint8_t a = cur[((size_t)y0 * cw + x0) * tsz + c], b = cur[((size_t)y0 * cw + x1) * tsz + c],
+                      d = cur[((size_t)y1 * cw + x0) * tsz + c], e = cur[((size_t)y1 * cw + x1) * tsz + c];
+        next[((size_t)y * nw + x) * tsz + c] =
+            is_signed ? (uint8_t)(int8_t)(((int)(int8_t)a + (int8_t)b + (int8_t)d + (int8_t)e) / 4)
+                      : (uint8_t)(((unsigned)a + b + d + e + 2) / 4);
+      }
+    }
+  }
+}
+
+/* ml1256: LOST-LEVEL REFILL OFF THE GAME THREAD.
+ *
+ * ml1253 decoded the dropped top level and box-filtered it into the lost
+ * physical top inside UpdateSubresource. On the iPad that cost the game thread
+ * 5-21 ms per frame while streaming, and the FPS dips followed it window by
+ * window with the GPU only 30-50% busy (log 20). Now the immediate context
+ * copies the BC blocks and queues them; two low-priority workers decode
+ * straight to half resolution (bc_decode_image_half) and cascade into any
+ * further lost levels; the game thread uploads the result at the next
+ * UpdateSubresource or Present. Until then the level stays lost and sampling
+ * steps past it -- one mip blurrier for a frame or two, never black. A level
+ * the game wrote in the meantime (levelGen moved) or that is no longer lost is
+ * left alone. d3d11.asyncRefill=0 restores the synchronous path. */
+struct RefillJob {
+  Rc<Texture> tex;
+  uint32_t slice = 0, width = 0, height = 0; /* the dropped level */
+  int kind = 0;
+  std::vector<uint8_t> blocks;               /* its BC block rows, tightly packed */
+  uint32_t lost = 0;                         /* lost run of physical levels from 0 */
+  uint32_t gen[16] = {};
+  size_t bytes = 0;                          /* budget charge */
+  std::vector<std::vector<uint8_t>> levels;  /* result: physical 0, 1, ... */
+};
+
+inline std::atomic<uint32_t> g_refill_done{0}; /* finished jobs waiting for DrainRefills */
+
+class RefillWorker {
+public:
+  static RefillWorker &
+  get() {
+    static RefillWorker *w = new RefillWorker(); /* never destroyed: its threads live as long as the process */
+    return *w;
+  }
+
+  bool
+  submit(RefillJob &&job) {
+    std::lock_guard<dxmt::mutex> lock(m_);
+    if (pending_bytes_ + job.bytes > kBudget)
+      return false;
+    pending_bytes_ += job.bytes;
+    todo_.push_back(std::move(job));
+    cv_.notify_one();
+    return true;
+  }
+
+  void
+  drain(std::vector<RefillJob> &out) {
+    std::lock_guard<dxmt::mutex> lock(m_);
+    while (!done_.empty()) {
+      pending_bytes_ -= done_.front().bytes;
+      out.push_back(std::move(done_.front()));
+      done_.pop_front();
+    }
+    g_refill_done.store(0, std::memory_order_relaxed);
+  }
+
+private:
+  static constexpr size_t kBudget = size_t(192) << 20;
+
+  RefillWorker() {
+    for (unsigned i = 0; i < 2; i++) {
+      dxmt::thread t([this]() { run(); });
+      t.set_priority(ThreadPriority::Lowest);
+      t.detach();
+    }
+  }
+
+  void
+  run() {
+    for (;;) {
+      RefillJob job;
+      {
+        std::unique_lock<dxmt::mutex> lock(m_);
+        cv_.wait(lock, [this] { return !todo_.empty(); });
+        job = std::move(todo_.front());
+        todo_.pop_front();
+      }
+      {
+        PerfTimer _t{g_perf.refill_worker_ns};
+        compute(job);
+      }
+      std::lock_guard<dxmt::mutex> lock(m_);
+      done_.push_back(std::move(job)); /* the Texture reference is released on the game thread */
+      g_refill_done.store(1, std::memory_order_relaxed);
+    }
+  }
+
+  static void
+  compute(RefillJob &j) {
+    const uint32_t tsz = bc_decode_texel_size(j.kind);
+    const bool is_signed = j.kind == 14 || j.kind == 15;
+    const size_t pitch = (size_t)((j.width + 3) / 4) * ((j.kind == 1 || j.kind == 4 || j.kind == 14) ? 8 : 16);
+    uint32_t w = std::max(1u, j.width >> 1), h = std::max(1u, j.height >> 1);
+    std::vector<uint8_t> top((size_t)w * h * tsz);
+    if ((j.width & 3) == 0 && (j.height & 3) == 0) {
+      bc_decode_image_half(j.blocks.data(), pitch, top.data(), j.width, j.height, j.kind);
+    } else {
+      std::vector<uint8_t> full((size_t)j.width * j.height * tsz);
+      bc_decode_image(j.blocks.data(), pitch, full.data(), j.width, j.height, j.kind);
+      RefillBoxHalf(full.data(), j.width, j.height, top.data(), w, h, tsz, is_signed);
+    }
+    j.levels.push_back(std::move(top));
+    for (uint32_t l = 1; l < 16 && ((j.lost >> l) & 1u); l++) {
+      const uint32_t nw = std::max(1u, w >> 1), nh = std::max(1u, h >> 1);
+      std::vector<uint8_t> next((size_t)nw * nh * tsz);
+      RefillBoxHalf(j.levels.back().data(), w, h, next.data(), nw, nh, tsz, is_signed);
+      j.levels.push_back(std::move(next));
+      w = nw;
+      h = nh;
+    }
+  }
+
+  dxmt::mutex m_;
+  dxmt::condition_variable cv_;
+  std::deque<RefillJob> todo_, done_;
+  size_t pending_bytes_ = 0;
+};
 
 struct DXMT_DRAW_ARGUMENTS {
   uint32_t VertexCount;
@@ -3645,11 +3785,32 @@ public:
       if (src_bias || dst_bias) {
         if (cmd.Src.MipLevel < src_bias || cmd.Dst.MipLevel < dst_bias) {
           g_cp_dropped.fetch_add(1, std::memory_order_relaxed);
+          /* ml1247: the destination level EXISTS but the source level was clamped
+           * away -- that destination mip is never filled and stays zero.
+           * ml1252: remember it, so sampling steps past it and the next upload
+           * of the level above refills it (see UpdateTexture). */
+          if (cmd.Dst.MipLevel >= dst_bias) {
+            g_cp_lost.fetch_add(1, std::memory_order_relaxed);
+            if (auto t = GetTexture(cmd.pDst)) {
+              t->markLevelLost(cmd.Dst.MipLevel - dst_bias);
+              t->noteLevelWritten(cmd.Dst.MipLevel - dst_bias);   /* ml1256 */
+            }
+          }
           return;
         }
         cmd.Src.MipLevel -= src_bias;
         cmd.Dst.MipLevel -= dst_bias;
         g_cp_xlated.fetch_add(1, std::memory_order_relaxed);
+        /* ml1252/ml1253: an empty level copied is still empty -- carry the mark
+         * across, or pool moves launder a lost level into a "filled" one. */
+        if (auto t = GetTexture(cmd.pDst)) {
+          auto s_ = GetTexture(cmd.pSrc);
+          t->noteLevelWritten(cmd.Dst.MipLevel);   /* ml1256 */
+          if (s_ && ((s_->lostLevels() >> cmd.Src.MipLevel) & 1u))
+            t->markLevelLost(cmd.Dst.MipLevel);
+          else
+            t->markLevelFilled(cmd.Dst.MipLevel);
+        }
       }
     }
 
@@ -4027,6 +4188,95 @@ public:
     }
   }
 
+  /* ml1252/ml1253: REFILL LEVELS A CLAMPED COPY LOST.
+   *
+   * Metro 2033 Redux keeps a fixed pool of textures (1727 created, none ever
+   * freed) and changes a texture's resolution by copying its mip chain into a
+   * bigger pool slot one level down, then streaming the new top level from disk.
+   * Under mipClampBC the old slot's top level was clamped away, so the new slot's
+   * matching level -- usually its PHYSICAL TOP, the one everything close to the
+   * camera samples -- receives nothing: black ground under the player, a black
+   * opaque scope lens when aiming.
+   *
+   * `img` is a decoded (physical-format) w x h image of the level directly ABOVE
+   * `level`. While `level` is marked lost, box-filter 2x2 into it and upload;
+   * cascade down through consecutive lost levels. */
+  void
+  RefillLostLevels(const Rc<Texture> &tex, const uint8_t *img, uint32_t w, uint32_t h, int bc_kind, uint32_t level,
+                   uint32_t slice) {
+    if (!((tex->lostLevels() >> level) & 1u))
+      return;
+    const uint32_t tsz = bc_decode_texel_size(bc_kind);
+    const bool is_signed = bc_kind == 14 || bc_kind == 15;
+    std::unique_ptr<uint8_t[]> cur_owner;
+    const uint8_t *cur = img;
+    uint32_t cw = w, ch = h;
+    while (level < tex->mipLevelCount() && ((tex->lostLevels() >> level) & 1u)) {
+      const uint32_t nw = std::max(1u, cw >> 1), nh = std::max(1u, ch >> 1);
+      std::unique_ptr<uint8_t[]> next(new (std::nothrow) uint8_t[(size_t)nw * nh * tsz]);
+      if (!next)
+        break;
+      RefillBoxHalf(cur, cw, ch, next.get(), nw, nh, tsz, is_signed);
+      UploadRefillLevel(tex, next.get(), nw, nh, tsz, level, slice);
+      cur_owner = std::move(next);
+      cur = cur_owner.get();
+      cw = nw;
+      ch = nh;
+      level++;
+    }
+  }
+
+  /* ml1252: upload one refilled physical level and mark it filled */
+  void
+  UploadRefillLevel(const Rc<Texture> &tex, const uint8_t *data, uint32_t w, uint32_t h, uint32_t tsz, uint32_t level,
+                    uint32_t slice) {
+    const size_t nbytes = (size_t)w * h * tsz;
+    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+    auto [rf_buffer, rf_offset] = AllocateStagingBuffer(nbytes, 16);
+    rf_buffer.updateContents(rf_offset, data, nbytes);
+    EmitOP([rf_buffer, rf_offset, tex, level, slice, w, h, tsz, nbytes](ArgumentEncodingContext &enc) {
+      auto texture = enc.access(tex, level, slice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+      auto &c = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+      c.type = WMTBlitCommandCopyFromBufferToTexture;
+      c.src = rf_buffer;
+      c.src_offset = rf_offset;
+      c.bytes_per_row = w * tsz;
+      c.bytes_per_image = (uint32_t)nbytes;
+      c.size = {w, h, 1};
+      c.dst = texture;
+      c.slice = slice;
+      c.level = level;
+      c.origin = {0, 0, 0};
+    });
+    tex->markLevelFilled(level);
+    g_cp_refilled.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /* ml1256: upload the refills RefillWorker finished. Immediate context only,
+   * called at UpdateSubresource and Present. */
+  void
+  DrainRefills() {
+    if (!g_refill_done.load(std::memory_order_relaxed))
+      return;
+    std::vector<RefillJob> done;
+    RefillWorker::get().drain(done);
+    for (auto &j : done) {
+      const uint32_t tsz = bc_decode_texel_size(j.kind);
+      uint32_t w = std::max(1u, j.width >> 1), h = std::max(1u, j.height >> 1);
+      bool applied = false;
+      for (uint32_t l = 0; l < j.levels.size(); l++) {
+        /* the game wrote this level since the job was queued, or it is filled */
+        if (!((j.tex->lostLevels() >> l) & 1u) || j.tex->levelGen(l) != j.gen[l])
+          break;
+        UploadRefillLevel(j.tex, j.levels[l].data(), w, h, tsz, l, j.slice);
+        applied = true;
+        w = std::max(1u, w >> 1);
+        h = std::max(1u, h >> 1);
+      }
+      (applied ? g_perf.refill_applied : g_perf.refill_stale).fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void
   UpdateTexture(
       TextureUpdateCommand &&cmd, const void *pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
@@ -4035,6 +4285,9 @@ public:
       return;
 
     std::lock_guard<mutex_t> lock(mutex);
+
+    if constexpr (!requires(ContextInternalState &s) { s.current_cmdlist; })
+      DrainRefills();   /* ml1256 */
 
     if (auto dst = GetTexture(cmd.pDst)) {
       /* ml745: TRANSLATE THE MIP INDEX THROUGH THE CLAMP.
@@ -4053,6 +4306,51 @@ public:
       if (mip_bias) {
         if (cmd.Dst.MipLevel < mip_bias) {
           g_bc_clamp_dropped.fetch_add(1, std::memory_order_relaxed);
+          /* ml1253: the level directly above the physical top has just arrived
+           * in full while the physical top is empty (a clamped copy lost it).
+           * Its 2x2 box filter IS the physical top: decode and refill. */
+          const int drop_kind = (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)
+                                    ? bc_decode_kind(cmd.DstFormat.PixelFormat) : 0;
+          const uint32_t lw = std::max(1u, (dst->width() << mip_bias) >> cmd.Dst.MipLevel);
+          const uint32_t lh = std::max(1u, (dst->height() << mip_bias) >> cmd.Dst.MipLevel);
+          if (cmd.Dst.MipLevel + 1 == mip_bias && (dst->lostLevels() & 1u) && drop_kind &&
+              cmd.DstSize.depth == 1 && cmd.DstOrigin.x == 0 && cmd.DstOrigin.y == 0 &&
+              cmd.DstSize.width == lw && cmd.DstSize.height == lh &&
+              !device->GetMTLDevice().supportsBCTextureCompression()) {
+            if constexpr (!requires(ContextInternalState &s) { s.current_cmdlist; }) {
+              static const bool async_refill = Config::getInstance().getOption<int>("d3d11.asyncRefill", 1) != 0;
+              if (async_refill) {   /* ml1256 */
+                PerfTimer _t{g_perf.refill_ns};
+                RefillJob job;
+                job.tex = dst;
+                job.slice = cmd.Dst.ArraySlice;
+                job.width = lw;
+                job.height = lh;
+                job.kind = drop_kind;
+                const size_t row = (size_t)((lw + 3) / 4) * ((drop_kind == 1 || drop_kind == 4 || drop_kind == 14) ? 8 : 16);
+                const uint32_t rows = (lh + 3) / 4;
+                job.blocks.resize(row * rows);
+                for (uint32_t r = 0; r < rows; r++)
+                  std::memcpy(job.blocks.data() + r * row, (const uint8_t *)pSrcData + (size_t)r * SrcRowPitch, row);
+                const uint32_t lost = dst->lostLevels();
+                for (uint32_t l = 0; l < 16 && ((lost >> l) & 1u); l++) {
+                  job.lost |= 1u << l;
+                  job.gen[l] = dst->levelGen(l);
+                }
+                job.bytes = job.blocks.size() + (size_t)(lw / 2) * (lh / 2) * bc_decode_texel_size(drop_kind) * 4 / 3;
+                (RefillWorker::get().submit(std::move(job)) ? g_perf.refill_queued : g_perf.refill_overbudget)
+                    .fetch_add(1, std::memory_order_relaxed);
+                return;
+              }
+            }
+            std::unique_ptr<uint8_t[]> top(
+                new (std::nothrow) uint8_t[(size_t)lw * lh * bc_decode_texel_size(drop_kind)]);
+            if (top) {
+              PerfTimer _t{g_perf.refill_ns};   /* ml1254 */
+              bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, top.get(), lw, lh, drop_kind);
+              RefillLostLevels(dst, top.get(), lw, lh, drop_kind, 0, cmd.Dst.ArraySlice);
+            }
+          }
           return;
         }
         cmd.Dst.MipLevel -= mip_bias;
@@ -4103,8 +4401,11 @@ public:
           g_bc_stream_fail.fetch_add(1, std::memory_order_relaxed);
           return;
         }
-        bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, bc_decoded.get(),
-                        cmd.DstSize.width, cmd.DstSize.height, bc_kind);
+        {
+          PerfTimer _t{g_perf.decode_ns};   /* ml1254 */
+          bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, bc_decoded.get(),
+                          cmd.DstSize.width, cmd.DstSize.height, bc_kind);
+        }
         pSrcData = bc_decoded.get();
         SrcRowPitch = (UINT)dec_pitch;
         SrcDepthPitch = (UINT)dec_slice;
@@ -4129,6 +4430,18 @@ public:
           }
         }
       }
+      /* ml1252: what the lost-level refill below needs, taken before the
+       * upload lambda moves dst and cmd away. */
+      Rc<Texture> refill_dst = dst;
+      const uint32_t refill_level = cmd.Dst.MipLevel, refill_slice = cmd.Dst.ArraySlice;
+      const bool refill_full_level =
+          cmd.DstOrigin.x == 0 && cmd.DstOrigin.y == 0 && cmd.DstOrigin.z == 0 && cmd.DstSize.depth == 1 &&
+          cmd.DstSize.width == std::max(1u, dst->width() >> refill_level) &&
+          cmd.DstSize.height == std::max(1u, dst->height() >> refill_level);
+      if (mip_bias) {
+        dst->markLevelFilled(refill_level);
+        dst->noteLevelWritten(refill_level);   /* ml1256 */
+      }
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       EmitOP([staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
             bytes_per_depth_slice](ArgumentEncodingContext &enc) {
@@ -4145,6 +4458,14 @@ public:
         cmd_cptex.level = cmd.Dst.MipLevel;
         cmd_cptex.origin = cmd.DstOrigin;
       });
+
+      /* ml1252: REFILL LEVELS A CLAMPED COPY LOST -- see RefillLostLevels. The
+       * level just uploaded is decoded in bc_decoded; the one below it may be lost. */
+      if (mip_bias && bc_decoded && refill_full_level && ((refill_dst->lostLevels() >> (refill_level + 1)) & 1u)) {
+        PerfTimer _t{g_perf.refill_ns};   /* ml1254 */
+        RefillLostLevels(refill_dst, bc_decoded.get(), std::max(1u, refill_dst->width() >> refill_level),
+                         std::max(1u, refill_dst->height() >> refill_level), bc_kind, refill_level + 1, refill_slice);
+      }
     } else if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
       // staging: ...
       UNIMPLEMENTED("update staging texture");
@@ -4785,6 +5106,12 @@ public:
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
     }
+    /* ml1254: draw census */
+    g_perf.draws.fetch_add(1, std::memory_order_relaxed);
+    if (status == DrawCallStatus::Tessellation)
+      g_perf.draws_tess.fetch_add(1, std::memory_order_relaxed);
+    else if (status == DrawCallStatus::Geometry)
+      g_perf.draws_gs.fetch_add(1, std::memory_order_relaxed);
     UpdateVertexBuffer();
     UpdateSOTargets();
     if (dirty_state.any(DirtyState::DepthStencilState)) {

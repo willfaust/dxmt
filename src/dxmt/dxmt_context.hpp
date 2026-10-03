@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>   /* ml1251: std::memset in encodeBlitCommand */
 #include "Metal.hpp"
 #include "dxmt_buffer.hpp"
 #include "dxmt_command.hpp"
@@ -606,6 +607,13 @@ public:
     assert(encoder_current->type == EncoderType::Blit);
     auto encoder = static_cast<BlitEncoderData *>(encoder_current);
     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
+    /* ml1251: the CPU heap is not zeroed. 4c86e09 (ml1098) added `options` to
+     * the texture->buffer copy and passed it to Metal, but none of the four
+     * d3d11 readback sites set it -- every GPU->CPU readback since then carried
+     * leftover heap bytes as MTLBlitOptions (validation: DepthFromDepthStencil
+     * on R32Float, RowLinearPVRTC, ... ~1000 per session). Zero every blit
+     * command so a field nobody sets is 0, never garbage. */
+    std::memset((void *)storage, 0, sizeof(cmd_struct));
     encoder->cmd_tail->next.set(storage);
     encoder->cmd_tail = (wmtcmd_base *)storage;
     storage->next.set(nullptr);

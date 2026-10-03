@@ -28,6 +28,27 @@ public:
   uint64_t allocate(uint64_t coherent_seq_id);
   void updateImmediateName(uint64_t current_seq_id, uint64_t allocation);
 
+  /* ml1246: rename budget. A rename that cannot reuse a retired buffer adds a
+   * whole `length` of shared memory that is never given back while the
+   * resource lives. Metro 2033 Redux maps one ~54MB upload staging texture
+   * over and over inside a single unflushed seq while loading, and every map
+   * allocated (and memcpy'd) a fresh copy: 32 of them, 1.6GB, then jetsam.
+   * The caller checks these and waits for the GPU instead, as a native driver
+   * does for Map(WRITE) on a staging resource that is still being read. */
+  bool canRenameWithoutGrowth(uint64_t coherent_seq_id);
+  uint64_t
+  gpuBusyDistance(uint64_t coherent_seq_id) const {
+    return gpu_occupied_until_finished_seq_id > coherent_seq_id
+               ? gpu_occupied_until_finished_seq_id - coherent_seq_id
+               : 1;
+  }
+  /* ml1254: the seq whose completion makes a GPU write visible to a read map */
+  uint64_t readableAfterSeq() const { return cpu_coherent_after_finished_seq_id; }
+  /* bytes held by buffers beyond each live resource's first one */
+  static std::atomic<uint64_t> spare_bytes;
+
+  ~StagingResource();
+
   void *
   mappedImmediateMemory() {
     return buffer_pool[immediate_name_]->mappedMemory(0);
