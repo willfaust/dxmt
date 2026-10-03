@@ -263,6 +263,11 @@ public:
         if (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) {
           return DXGI_ERROR_WAS_STILL_DRAWING;
         }
+        /* ml1254: is the work this read waits for still unsubmitted (recorded
+         * in the chunk being built), or already on the GPU? */
+        const bool read_wait = (MapType & D3D11_MAP_READ) != 0;
+        const uint64_t ready_seq = staging->readableAfterSeq();
+        const bool unsubmitted = read_wait && ready_seq >= current_seq_id;
         // even it's in a while loop
         // only the first flush will have effect
         // and the following calls are essentially no-op
@@ -274,6 +279,20 @@ public:
         auto t1 = clock::now();
         statistics.sync_count++;
         statistics.sync_interval += (t1 - t0);
+        {
+          const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+          g_perf.map_waits.fetch_add(1, std::memory_order_relaxed);
+          g_perf.map_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+          if (unsubmitted)
+            g_perf.map_waits_unsubmitted.fetch_add(1, std::memory_order_relaxed);
+          static uint32_t detail_n;
+          if (++detail_n <= 6)
+            ERR("[readback] ml1254 blocking ", read_wait ? "READ" : "WRITE", " map #", detail_n, ": ",
+                staging->length, " B staging (row ", staging->bytesPerRow, " B), ready after seq ", ready_seq,
+                ", recording seq ", current_seq_id, ", GPU done through ", coherent_seq_id,
+                unsubmitted ? " -- work NOT yet submitted" : "", ", waited ",
+                std::chrono::duration<double, std::milli>(t1 - t0).count(), " ms");
+        }
         current_seq_id = cmd_queue.CurrentSeqId();
         coherent_seq_id = cmd_queue.CoherentSeqId();
       };
@@ -456,6 +475,12 @@ public:
       ERR("Unknown query type ", desc.Query);
       return E_FAIL;
     }
+    if (hr == S_FALSE)   /* ml1254 */
+      (desc.Query == D3D11_QUERY_EVENT || desc.Query == D3D11_QUERY_TIMESTAMP ||
+               desc.Query == D3D11_QUERY_TIMESTAMP_DISJOINT
+           ? g_perf.polls_event
+           : g_perf.polls_other)
+          .fetch_add(1, std::memory_order_relaxed);
     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
       cmd_queue.CurrentFrameStatistics().event_stall++;
       Flush();

@@ -28,6 +28,9 @@ public:
   uint64_t allocate(uint64_t coherent_seq_id);
   void updateImmediateName(uint64_t current_seq_id, uint64_t allocation);
 
+  /* ml1254: the seq whose completion makes a GPU write visible to a read map */
+  uint64_t readableAfterSeq() const { return cpu_coherent_after_finished_seq_id; }
+
   void *
   mappedImmediateMemory() {
     return buffer_pool[immediate_name_]->mappedMemory(0);

@@ -3,8 +3,10 @@
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_win32_compat.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 
 #define ASYNC_ENCODING 1
 
@@ -189,6 +191,8 @@ CommandQueue::WaitForFinishThread() {
       }
     }
 
+    AccountGpuTime(chunk.attached_cmdbuf.handle, chunk.frame_);   /* ml1254 */
+
     if (chunk.signal_frame_latency_fence_ != ~0ull)
       frame_latency_fence_.signal(chunk.signal_frame_latency_fence_);
 
@@ -208,6 +212,54 @@ CommandQueue::WaitForFinishThread() {
   }
   TRACE("finishing thread gracefully terminates");
   return 0;
+}
+
+/* ml1254: see PerfCounters. Command buffers of one queue run in order, so the
+ * busy time is the union of their [GPUStartTime, GPUEndTime] intervals. */
+void
+CommandQueue::AccountGpuTime(obj_handle_t cmdbuf, uint64_t frame) {
+  struct { uint64_t cb; double start, end; } t = {(uint64_t)cmdbuf, 0.0, 0.0};
+  struct madeira_ctl_args a = {};
+  a.op = 3;
+  a.ptr = (uint64_t)(uintptr_t)&t;
+  MadeiraCtl(&a);
+  if (!a.ret || t.end <= 0.0)
+    return;
+  if (perf_.window_frame == ~0ull) {
+    perf_.window_frame = frame;
+    perf_.window_start = t.start;
+  }
+  const double from = std::max(t.start, perf_.last_end);
+  if (t.end > from)
+    perf_.busy += t.end - from;
+  perf_.last_end = std::max(perf_.last_end, t.end);
+  perf_.cmdbufs++;
+  if (frame < perf_.window_frame + 64)
+    return;
+  const double frames = double(frame - perf_.window_frame);
+  const double wall_ms = (perf_.last_end - perf_.window_start) * 1000.0;
+  const double busy_ms = perf_.busy * 1000.0;
+  auto take = [](std::atomic<uint64_t> &c) { return double(c.exchange(0, std::memory_order_relaxed)); };
+  const double waits = take(g_perf.map_waits), wait_ms = take(g_perf.map_wait_ns) / 1e6,
+               unsubmitted = take(g_perf.map_waits_unsubmitted);
+  const double pe = take(g_perf.polls_event), po = take(g_perf.polls_other);
+  const double draws = take(g_perf.draws), tess = take(g_perf.draws_tess), gs = take(g_perf.draws_gs);
+  const double dec_ms = take(g_perf.decode_ns) / 1e6;
+  char line[800];
+  snprintf(line, sizeof(line),
+           "[gpu-perf] ml1254 %.0f frames in %.0f ms (%.1f fps): GPU busy %.0f ms = %.0f%% (%.1f ms/frame), "
+           "%.1f cmdbufs/frame | readback Map waits %.2f/frame, %.1f ms/frame (%.2f/frame on unsubmitted work) | "
+           "not-ready polls/frame: event %.1f, other %.1f | draws/frame %.0f, tess %.0f, GS %.0f | "
+           "game-thread BC decode %.2f ms/frame (%.0f ms per 64 frames)",
+           frames, wall_ms, wall_ms > 0 ? frames * 1000.0 / wall_ms : 0.0, busy_ms,
+           wall_ms > 0 ? busy_ms * 100.0 / wall_ms : 0.0, busy_ms / frames, perf_.cmdbufs / frames, waits / frames,
+           wait_ms / frames, unsubmitted / frames, pe / frames, po / frames, draws / frames, tess / frames, gs / frames,
+           dec_ms / frames, dec_ms);
+  ERR(line);
+  perf_.window_frame = frame;
+  perf_.window_start = perf_.last_end;
+  perf_.busy = 0.0;
+  perf_.cmdbufs = 0;
 }
 
 void CommandQueue::Retain(uint64_t seq, Allocation* allocaiton) {

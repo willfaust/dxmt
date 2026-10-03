@@ -15,6 +15,7 @@
 #include "util_cpu_fence.hpp"
 #include "util_futex.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -89,6 +90,27 @@ private:
 };
 
 constexpr uint32_t kCommandChunkCount = 32;
+
+/* ml1254: FRAME-TIME ATTRIBUTION. Metro 2033 Redux on the iPad waits in one
+ * blocking readback Map per frame (12-56ms) while no CPU thread is saturated:
+ * either the GPU is busy the whole frame, or CPU and GPU take turns. The game
+ * side bumps these on the immediate context; the finish thread adds the GPU
+ * time of every command buffer and prints one [gpu-perf] line per 64 frames. */
+struct PerfCounters {
+  std::atomic<uint64_t> map_wait_ns{0}, map_waits{0}, map_waits_unsubmitted{0};
+  std::atomic<uint64_t> polls_event{0}, polls_other{0};
+  std::atomic<uint64_t> draws{0}, draws_tess{0}, draws_gs{0};
+  std::atomic<uint64_t> decode_ns{0};   /* BC decode on the game thread */
+};
+struct PerfTimer {   /* ml1254: adds its lifetime to a counter */
+  std::atomic<uint64_t> &sink;
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  ~PerfTimer() {
+    sink.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                   std::memory_order_relaxed);
+  }
+};
+inline PerfCounters g_perf;
 
 class CommandQueue;
 
@@ -171,6 +193,12 @@ private:
   uint32_t EncodingThread();
 
   uint32_t WaitForFinishThread();
+  void AccountGpuTime(obj_handle_t cmdbuf, uint64_t frame);   /* ml1254 */
+  struct {
+    uint64_t window_frame = ~0ull;
+    double window_start = 0.0, last_end = 0.0, busy = 0.0;
+    uint64_t cmdbufs = 0;
+  } perf_;   /* ml1254: finish thread only */
 
   std::atomic_uint64_t ready_for_encode = 1; // we start from 1, so 0 is always coherent
   std::atomic_uint64_t ready_for_commit = 1;

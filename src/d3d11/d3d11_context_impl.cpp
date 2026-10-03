@@ -4103,8 +4103,11 @@ public:
           g_bc_stream_fail.fetch_add(1, std::memory_order_relaxed);
           return;
         }
-        bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, bc_decoded.get(),
-                        cmd.DstSize.width, cmd.DstSize.height, bc_kind);
+        {
+          PerfTimer _t{g_perf.decode_ns};   /* ml1254 */
+          bc_decode_image((const uint8_t *)pSrcData, SrcRowPitch, bc_decoded.get(),
+                          cmd.DstSize.width, cmd.DstSize.height, bc_kind);
+        }
         pSrcData = bc_decoded.get();
         SrcRowPitch = (UINT)dec_pitch;
         SrcDepthPitch = (UINT)dec_slice;
@@ -4785,6 +4788,12 @@ public:
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
     }
+    /* ml1254: draw census */
+    g_perf.draws.fetch_add(1, std::memory_order_relaxed);
+    if (status == DrawCallStatus::Tessellation)
+      g_perf.draws_tess.fetch_add(1, std::memory_order_relaxed);
+    else if (status == DrawCallStatus::Geometry)
+      g_perf.draws_gs.fetch_add(1, std::memory_order_relaxed);
     UpdateVertexBuffer();
     UpdateSOTargets();
     if (dirty_state.any(DirtyState::DepthStencilState)) {

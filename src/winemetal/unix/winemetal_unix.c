@@ -835,21 +835,30 @@ static bool query_bc_support(void) {
     return g_bc_supported_cached != 0;
   }
   bool supported = false;
+  int float32_filter = -1;
+  char dev_class[64] = "?";
   @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (dev) {
+      snprintf(dev_class, sizeof(dev_class), "%s", object_getClassName(dev));   /* ml1249: MTLDebugDevice = validation on */
       if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
         supported = [dev supportsBCTextureCompression];
+      if ([dev respondsToSelector:@selector(supports32BitFloatFiltering)])
+        float32_filter = [dev supports32BitFloatFiltering] ? 1 : 0;
       [dev release];
     }
   }
   g_bc_supported_cached = supported ? 1 : 0;
   /* iOS-Madeira 2026-05-18: one-shot log so we can see if A15+ supports BC
    * natively (would skip all the BC decoder work). Fires exactly once
-   * per process — first call to to_metal_pixel_format. */
+   * per process — first call to to_metal_pixel_format.
+   * ml1248: plus 32-bit float filtering, which Apple7/8 iPads have or lack per
+   * GPU -- a linear sampler on R32F/RG32F/RGBA32F without it is undefined. */
   dprintf(STDERR_FILENO,
-          "[iOS DXMT] supportsBCTextureCompression = %s\n",
-          supported ? "YES" : "NO");
+          "[iOS DXMT] supportsBCTextureCompression = %s supports32BitFloatFiltering = %s MTL_DEBUG_LAYER=%s device class %s\n",
+          supported ? "YES" : "NO",
+          float32_filter < 0 ? "?" : (float32_filter ? "YES" : "NO"),
+          getenv("MTL_DEBUG_LAYER") ? getenv("MTL_DEBUG_LAYER") : "unset", dev_class);
   return supported;
 }
 
