@@ -958,6 +958,19 @@ static bool texture_upload_pitch_ok(id<MTLTexture> tex, size_t width, size_t byt
   return bytes_per_row >= width * bpp;
 }
 
+/* madeira_d3d12 copies ONE plane of a combined depth-stencil texture from a
+ * buffer and names it in reserved[0] (1 = depth, 2 = stencil, the
+ * MTLBlitOption values); Metal leaves a buffer->texture copy into such a
+ * texture without the option undefined. Other producers may leave reserved[0]
+ * uninitialised, so it counts only for a combined depth-stencil destination. */
+static MTLBlitOption b2t_plane_option(id<MTLTexture> dst, uint16_t value) {
+  if (value != MTLBlitOptionDepthFromDepthStencil && value != MTLBlitOptionStencilFromDepthStencil)
+    return MTLBlitOptionNone;
+  if ([dst pixelFormat] != MTLPixelFormatDepth32Float_Stencil8)
+    return MTLBlitOptionNone;
+  return (MTLBlitOption)value;
+}
+
 void
 fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info) {
   desc.textureType = (MTLTextureType)info->type;
@@ -1970,8 +1983,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
       id<MTLTexture> dst = (id<MTLTexture>)body->dst;
-      /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. */
-      if (!texture_upload_pitch_ok(dst, body->size.width, body->bytes_per_row))
+      MTLBlitOption plane = b2t_plane_option(dst, body->reserved[0]);
+      /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. Not for
+       * a plane copy: one plane is 4 or 1 bytes per pixel, not the combined
+       * format's (as the texture->buffer case below, ml1102). */
+      if (!plane && !texture_upload_pitch_ok(dst, body->size.width, body->bytes_per_row))
         break;
       wmt_stale_check(body->src, "blit copy src"); wmt_stale_check(body->dst, "blit copy dst");
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
@@ -1982,7 +1998,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
                     toTexture:dst
              destinationSlice:body->slice
              destinationLevel:body->level
-            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                      options:plane];
       break;
     }
     case WMTBlitCommandCopyFromTextureToBuffer: {
