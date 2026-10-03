@@ -2837,8 +2837,15 @@ uint64_t madeira_get_present_count(void) {
  *   3 = LOCKED30 (2026-09-15, device feedback): same mechanism as mode 1,
  *       afterMinimumDuration(1/30) — exact 30. A real cap on THIS present
  *       path, not merely a CADisplayLink hint: the drawable is genuinely
- *       held until the next 1/30s boundary, same as mode 1 is at 1/60s. */
+ *       held until the next 1/30s boundary, same as mode 1 is at 1/60s.
+ *   4 = LOCKED40: the same at 1/40. 25 ms is three refreshes of a 120Hz
+ *       panel but rounds to 33 ms at 60Hz, so the app offers it only on a
+ *       120Hz panel and holds the panel at its maximum while it runs. */
 static volatile int g_madeira_vsync_mode = 1;
+
+/* The app offers the 40 FPS cap only when this is linked (IOSDisplayShim.m
+ * has a weak fallback returning 0 for a DXMT without mode 4). */
+int madeira_dxmt_has_40_cap(void) { return 1; }
 
 /* ml1050: what the PANEL can do, published from Swift (only UIKit knows it).
  * Nothing branches on these -- they are printed by the [frame] line, because
@@ -2858,7 +2865,7 @@ void madeira_set_display_max_fps(int panel_hz, int intent_hz) {
 void madeira_set_vsync_locked(int mode) {
   g_madeira_vsync_mode = mode;
   ios_frame_note_display(g_madeira_panel_hz, g_madeira_intent_hz, mode);
-  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_mode=%d (1=locked60 0=max 2=raw 3=locked30)\n", mode);
+  dprintf(STDERR_FILENO, "[iOS DXMT] vsync_mode=%d (1=locked60 0=max 2=raw 3=locked30 4=locked40)\n", mode);
 }
 int madeira_get_vsync_locked(void) { return g_madeira_vsync_mode; }
 
@@ -2937,12 +2944,12 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
   /* ml1050: this call IS the frame boundary on the encode thread. */
   if (madeira_frame_hooks_on())
     ios_frame_encode_present(0);
-  if ((mode == 1 || mode == 3) && madeira_present_limiter_enabled()) {
+  if ((mode == 1 || mode == 3 || mode == 4) && madeira_present_limiter_enabled()) {
     /* Opt-in precise pacing: hold the producer to the deadline and then ask
      * for the next vblank with no minimum duration, so the cap is the
      * limiter's and the only quantisation left is the panel's own. */
-    ios_frame_limiter(madeira_present_limit_to(mode == 3 ? (1.0 / 30.0) : (1.0 / 60.0)));
-    madeira_log_present_cadence(mode == 3 ? "presentLimited30" : "presentLimited60", 0.0);
+    ios_frame_limiter(madeira_present_limit_to(mode == 3 ? (1.0 / 30.0) : mode == 4 ? (1.0 / 40.0) : (1.0 / 60.0)));
+    madeira_log_present_cadence(mode == 3 ? "presentLimited30" : mode == 4 ? "presentLimited40" : "presentLimited60", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   } else if (mode == 1) {
     madeira_log_present_cadence("presentDrawable60", 0.0);
@@ -2956,6 +2963,12 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     madeira_log_present_cadence("presentDrawable30", 0.0);
     [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
                                      afterMinimumDuration:(1.0 / 30.0)];
+  } else if (mode == 4) {
+    /* The same at 40: the drawable pool gives back-pressure, so the game
+     * itself runs at the cap. */
+    madeira_log_present_cadence("presentDrawable40", 0.0);
+    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
+                                     afterMinimumDuration:(1.0 / 40.0)];
   } else if (mode == 2) {
     /* Frame-skip gating lives in _MetalLayer_nextDrawable (nil return);
      * only real, ≥18ms-spaced frames reach here. */
