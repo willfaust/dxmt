@@ -301,7 +301,19 @@ ArgumentEncodingContext::encodeShaderResources(
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           encoded_buffer[arg.StructurePtrOffset] =
               access<PreRasterStage>(srv.texture, viewIdChecked, DXMT_ENCODER_RESOURCE_ACESS_READ).gpuResourceID;
-          encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
+          /* ml1252: never let the top sampled level be one a clamped copy left
+           * empty -- step past it to the next populated level (one mip blurrier,
+           * instead of black). The shader clamps in VIEW space, whose LOD 0 is
+           * physical mip firstMiplevel. */
+          float min_lod = 0.0f;
+          if (uint32_t lost = srv.texture->lostLevels()) {   /* else it is always 0 */
+            const uint32_t view_base = srv.texture->firstMiplevel(viewIdChecked);   /* physical */
+            uint32_t lvl = view_base;
+            while (lvl < 31 && ((lost >> lvl) & 1u) && (lvl + 1) < srv.texture->mipLevelCount())
+              lvl++;
+            min_lod = float(lvl - view_base);
+          }
+          encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), min_lod);
           makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
         } else {
           encoded_buffer[arg.StructurePtrOffset] = 0;

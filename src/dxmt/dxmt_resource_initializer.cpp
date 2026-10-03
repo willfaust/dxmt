@@ -353,6 +353,42 @@ void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_
   }
 }
 
+void bc_decode_image_half(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+                          uint32_t height, int kind) {
+  const uint32_t bx_n = width / 4, by_n = height / 4;
+  const size_t blk_bytes = (kind == 1 || kind == 4 || kind == 14) ? 8 : 16;
+  const uint32_t tsz = bc_decode_texel_size(kind);
+  const bool is_signed = kind == 14 || kind == 15;
+  const size_t dst_pitch = (size_t)(width / 2) * tsz;
+  uint8_t texels[64];
+  for (uint32_t by = 0; by < by_n; by++) {
+    const uint8_t *row = src + (size_t)by * src_pitch;
+    for (uint32_t bx = 0; bx < bx_n; bx++) {
+      const uint8_t *b = row + bx * blk_bytes;
+      switch (kind) {
+      case 1:  bcn_bc1_block(b, texels, /*punchthrough=*/true); break;
+      case 2:  bcn_bc2_block(b, texels); break;
+      case 3:  bcn_bc3_block(b, texels); break;
+      case 4:  bcn_bc4_block(b, texels, false); break;
+      case 14: bcn_bc4_block(b, texels, true);  break;
+      case 5:  bcn_bc5_block(b, texels, false); break;
+      case 15: bcn_bc5_block(b, texels, true);  break;
+      case 7:  bcn_bc7_block(b, texels); break;
+      default: memset(texels, 0, sizeof(texels)); break;
+      }
+      for (uint32_t qy = 0; qy < 2; qy++)
+        for (uint32_t qx = 0; qx < 2; qx++) {
+          const uint8_t *t00 = texels + (size_t)((qy * 2) * 4 + qx * 2) * tsz;
+          const uint8_t *t10 = t00 + tsz, *t01 = t00 + 4 * tsz, *t11 = t01 + tsz;
+          uint8_t *o = dst + (size_t)(by * 2 + qy) * dst_pitch + (size_t)(bx * 2 + qx) * tsz;
+          for (uint32_t c = 0; c < tsz; c++)
+            o[c] = is_signed ? (uint8_t)(int8_t)(((int)(int8_t)t00[c] + (int8_t)t10[c] + (int8_t)t01[c] +
+                                                  (int8_t)t11[c]) / 4)
+                             : (uint8_t)(((unsigned)t00[c] + t10[c] + t01[c] + t11[c] + 2) / 4);
+        }
+    }
+  }
+}
 
 /* ml676: which REMAPPED formats came from a BC source we cannot decode yet, and
  * what does one physical texel cost. Mirrors remap_unsupported_bc() in

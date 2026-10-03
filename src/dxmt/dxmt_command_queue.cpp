@@ -244,17 +244,20 @@ CommandQueue::AccountGpuTime(obj_handle_t cmdbuf, uint64_t frame) {
                unsubmitted = take(g_perf.map_waits_unsubmitted);
   const double pe = take(g_perf.polls_event), po = take(g_perf.polls_other);
   const double draws = take(g_perf.draws), tess = take(g_perf.draws_tess), gs = take(g_perf.draws_gs);
-  const double dec_ms = take(g_perf.decode_ns) / 1e6;
+  const double dec_ms = take(g_perf.decode_ns) / 1e6, refill_ms = take(g_perf.refill_ns) / 1e6;
+  const double rw_ms = take(g_perf.refill_worker_ns) / 1e6, rq = take(g_perf.refill_queued),
+               ra = take(g_perf.refill_applied), rs = take(g_perf.refill_stale), ro = take(g_perf.refill_overbudget);
   char line[800];
   snprintf(line, sizeof(line),
            "[gpu-perf] ml1254 %.0f frames in %.0f ms (%.1f fps): GPU busy %.0f ms = %.0f%% (%.1f ms/frame), "
            "%.1f cmdbufs/frame | readback Map waits %.2f/frame, %.1f ms/frame (%.2f/frame on unsubmitted work) | "
            "not-ready polls/frame: event %.1f, other %.1f | draws/frame %.0f, tess %.0f, GS %.0f | "
-           "game-thread BC decode %.2f ms/frame (%.0f ms per 64 frames)",
+           "game-thread BC decode %.2f ms/frame (%.0f ms per 64 frames), lost-level refill %.2f ms/frame | "
+           "async refill: worker %.2f ms/frame, queued %.0f applied %.0f stale %.0f over-budget %.0f",
            frames, wall_ms, wall_ms > 0 ? frames * 1000.0 / wall_ms : 0.0, busy_ms,
            wall_ms > 0 ? busy_ms * 100.0 / wall_ms : 0.0, busy_ms / frames, perf_.cmdbufs / frames, waits / frames,
            wait_ms / frames, unsubmitted / frames, pe / frames, po / frames, draws / frames, tess / frames, gs / frames,
-           dec_ms / frames, dec_ms);
+           dec_ms / frames, dec_ms, refill_ms / frames, rw_ms / frames, rq, ra, rs, ro);
   ERR(line);
   perf_.window_frame = frame;
   perf_.window_start = perf_.last_end;

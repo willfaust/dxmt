@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include "Metal.hpp"
 #include "dxmt_deptrack.hpp"
 #include "dxmt_residency.hpp"
@@ -186,6 +187,24 @@ public:
    * correct. */
   uint32_t mipBias() const { return mip_bias_; }
   void setMipBias(uint32_t bias) { mip_bias_ = bias; }
+  /* ml1252: PHYSICAL levels a mipClampBC copy could not fill (its source level
+   * was clamped away). Bit n = level n, any slice. Sampling skips a lost level
+   * at the top (see TextureMetadata's caller) and UpdateTexture refills it from
+   * the level above by a CPU box filter when that one is streamed in. */
+  uint32_t mipLevelCount() const { return info_.mipmap_level_count; }   /* ml1252: physical */
+  uint32_t lostLevels() const { return lost_levels_.load(std::memory_order_relaxed); }
+  void markLevelLost(uint32_t level) { if (level < 32) lost_levels_.fetch_or(1u << level, std::memory_order_relaxed); }
+  void markLevelFilled(uint32_t level) { if (level < 32) lost_levels_.fetch_and(~(1u << level), std::memory_order_relaxed); }
+  /* ml1256: bumped whenever the GAME changes a physical level (copy or upload
+   * into it), so a refill computed off-thread from older data is discarded. */
+  uint32_t levelGen(uint32_t level) const { return level < 16 ? level_gen_[level].load(std::memory_order_relaxed) : 0; }
+  void noteLevelWritten(uint32_t level) { if (level < 16) level_gen_[level].fetch_add(1, std::memory_order_relaxed); }
+  /* first PHYSICAL mip a view starts at */
+  uint32_t
+  firstMiplevel(TextureViewKey view) {
+    std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+    return viewDescriptors_[view].firstMiplevel;
+  }
 
   WMTTextureType
   textureType(TextureViewKey view) {
@@ -290,6 +309,8 @@ private:
 
   WMTTextureInfo info_;
   uint32_t mip_bias_ = 0;          /* ml745, see mipBias() */
+  std::atomic<uint32_t> lost_levels_{0}; /* ml1252, see lostLevels() */
+  std::atomic<uint32_t> level_gen_[16] = {}; /* ml1256, see levelGen() */
   unsigned bytes_per_image_ = 0;
   unsigned bytes_per_row_ = 0;
 

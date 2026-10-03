@@ -156,5 +156,11 @@ int bc_decode_kind(enum WMTPixelFormat f);
 uint32_t bc_decode_texel_size(int kind);
 void bc_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
                      uint32_t height, int kind);
+/* ml1256: decode AND 2x2 box-filter in one pass -- each 4x4 block becomes 2x2
+ * texels of a tightly packed (width/2) x (height/2) image. width and height
+ * must be multiples of 4. Rounding matches the lost-level refill filter:
+ * unsigned (a+b+c+d+2)/4, signed kinds (14/15) truncated toward zero. */
+void bc_decode_image_half(const uint8_t *src, size_t src_pitch, uint8_t *dst, uint32_t width,
+                          uint32_t height, int kind);
 
 } // namespace dxmt

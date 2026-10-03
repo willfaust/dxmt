@@ -501,6 +501,7 @@ public:
   }
 
   void PrepareFlush() override {
+    DrainRefills();   /* ml1256: finished off-thread refills go out with this frame */
     InvalidateCurrentPass(true);
   }
 
