@@ -1322,6 +1322,9 @@ struct wmtcmd_render_draw_indexed_indirect {
   uint64_t indirect_args_offset;
 };
 
+/* reserved[1] == 0x7e55 marks a draw that sets the object threadgroup memory
+ * length at index 0 to reserved[0] first (the converter's tessellation draw
+ * helpers set 15360 bytes). Every producer memsets its commands, so it was 0. */
 struct wmtcmd_render_draw_meshthreadgroups {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
@@ -2013,7 +2016,20 @@ struct WMTGeometryEmulationInfo {
   char fragment_function[64];
   uint32_t gs_vertex_size_bytes;
   uint32_t gs_max_input_primitives;
-  uint32_t reserved[6];
+  /* DXIL tessellation (was reserved[6]; same size and offsets): with
+   * `tessellation` set, the pipeline is built the way the converter runtime's
+   * IRRuntimeNewGeometryTessellationEmulationPipeline builds it. The object
+   * stage is the vertex shader's object function with tessellationEnabled, the
+   * hull library's irconverter_hull_shader and irconverter_tessellator linked
+   * into it; the mesh function is `geometry_function` (the converter's
+   * passthrough geometry shader for the tessellator output) from the domain
+   * library, with its irconverter_dxil_domain_shader linked in;
+   * gs_max_input_primitives is the domain shader's primitives per mesh
+   * threadgroup. */
+  obj_handle_t hull_library;
+  obj_handle_t domain_library;
+  float max_tessellation_factor;
+  uint32_t tessellation;
 };
 WINEMETAL_API obj_handle_t
 MTLDevice_newGeometryEmulationPipelineState(obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info,

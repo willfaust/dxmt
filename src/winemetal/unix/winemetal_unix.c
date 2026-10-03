@@ -2472,6 +2472,10 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawMeshThreadgroups: {
       struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+      /* DXIL tessellation draws carry the object threadgroup memory the
+       * converter's draw helpers set (see struct wmtcmd_render_draw_meshthreadgroups). */
+      if (body->reserved[1] == 0x7e55 && body->reserved[0])
+        [encoder setObjectThreadgroupMemoryLength:body->reserved[0] atIndex:0];
       [encoder drawMeshThreadgroups:MTLSizeMake(
                                         body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
                                         body->threadgroup_per_grid.depth
@@ -6265,6 +6269,72 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
     d.alphaToCoverageEnabled = i->alpha_to_coverage_enabled;
     d.rasterizationEnabled = i->rasterization_enabled;
     d.rasterSampleCount = i->raster_sample_count ? i->raster_sample_count : 1;
+
+    if (g->tessellation) {
+      /* DXIL tessellation, built exactly as the converter runtime's
+       * IRRuntimeNewGeometryTessellationEmulationPipeline builds it. */
+      id<MTLLibrary> Lh = (id<MTLLibrary>)g->hull_library, Ld = (id<MTLLibrary>)g->domain_library;
+      id<MTLFunction> th = nil, tt = nil, td = nil, tm = nil;
+      MTLFunctionConstantValues *vc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+      MTLFunctionConstantValues *hc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+      BOOL on = YES;
+      float mtf = g->max_tessellation_factor;
+      if (!Lh || !Ld) {
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: missing library (hull %d domain %d)\n", !!Lh, !!Ld);
+        return STATUS_SUCCESS;
+      }
+      fsi = [[Ls newFunctionWithName:Ls.functionNames.firstObject] autorelease];
+      [vc setConstantValue:&on type:MTLDataTypeBool withName:@"tessellationEnabled"];
+      e = nil;
+      fo = [[Lv newFunctionWithName:[NSString stringWithFormat:@"%s.dxil_irconverter_object_shader", g->vertex_function]
+                     constantValues:vc error:&e] autorelease];
+      if (!fo)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: object function '%s.dxil_irconverter_object_shader': %s\n",
+                g->vertex_function, e ? [[e localizedDescription] UTF8String] : "?");
+      [hc setConstantValue:&vsz type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+      [hc setConstantValue:&mtf type:MTLDataTypeFloat withName:@"max_tessellation_factor_fc"];
+      e = nil;
+      th = [[Lh newFunctionWithName:@"irconverter_hull_shader" constantValues:hc error:&e] autorelease];
+      if (!th)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: hull function: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      e = nil;
+      tt = [[Lh newFunctionWithName:@"irconverter_tessellator" constantValues:hc error:&e] autorelease];
+      if (!tt)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: tessellator function: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      td = [[Ld newFunctionWithName:@"irconverter_dxil_domain_shader"] autorelease];
+      tm = [[Ld newFunctionWithName:[NSString stringWithUTF8String:g->geometry_function]] autorelease];
+      if (g->fragment_function[0])
+        ff = [[Lf newFunctionWithName:[NSString stringWithUTF8String:g->fragment_function]] autorelease];
+      if (!fsi || !fo || !th || !tt || !td || !tm || (g->fragment_function[0] && !ff)) {
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline REFUSED: stage-in %d object %d hull %d tessellator %d domain %d "
+                        "mesh '%s' %d fragment %d\n", !!fsi, !!fo, !!th, !!tt, !!td, g->geometry_function, !!tm, !!ff);
+        return STATUS_SUCCESS;
+      }
+      d.objectFunction = fo;
+      d.meshFunction = tm;
+      d.fragmentFunction = ff;
+      {
+        MTLLinkedFunctions *ol = [MTLLinkedFunctions linkedFunctions], *ml = [MTLLinkedFunctions linkedFunctions];
+        ol.functions = @[ fsi, th ];
+        ml.functions = @[ tt, td ];
+        d.objectLinkedFunctions = ol;
+        d.meshLinkedFunctions = ml;
+      }
+      e = nil;
+      params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:d
+                                                                                                      options:MTLPipelineOptionNone
+                                                                                                   reflection:nil
+                                                                                                        error:&e];
+      if (!params->ret_pso)
+        fprintf(stderr, "[winemetal] DXIL tessellation pipeline: %s\n", e ? [[e localizedDescription] UTF8String] : "?");
+      else {
+        static unsigned said;
+        if (said++ < 4)
+          fprintf(stderr, "[winemetal] DXIL tessellation pipeline OK: vs '%s' mesh '%s' ps '%s', vertex %u B, max factor %.1f\n",
+                  g->vertex_function, g->geometry_function, g->fragment_function, g->gs_vertex_size_bytes, (double)mtf);
+      }
+      return STATUS_SUCCESS;
+    }
 
     cv = [[[MTLFunctionConstantValues alloc] init] autorelease];
     fsi = [[Ls newFunctionWithName:Ls.functionNames.firstObject] autorelease];
