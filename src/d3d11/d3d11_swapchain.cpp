@@ -167,6 +167,10 @@ public:
 
     preferred_max_frame_rate =
         Config::getInstance().getOption<int>("d3d11.preferredMaxFrameRate", 0);
+    commit_before_present_ =
+        Config::getInstance().getOption<int>("d3d11.commitBeforePresent", 1) != 0;
+    WARN("[present] ml1175 commitBeforePresent=", commit_before_present_ ? 1 : 0,
+         " (d3d11.commitBeforePresent=0 records the present into the frame's last chunk)");
     wsi::WsiMode current_mode;
     if (wsi::getCurrentDisplayMode(monitor_, &current_mode) &&
         current_mode.refreshRate.denominator != 0 &&
@@ -803,6 +807,22 @@ public:
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
     auto &cmd_queue = device_->GetDXMTDevice().queue();
+    /* ml1175: SUBMIT THE FRAME BEFORE ITS PRESENT.
+     *
+     * The encode thread turns one chunk into one Metal command buffer and
+     * commits it only after encoding all of it, and encoding the present
+     * blocks in nextDrawable until the display hands a drawable back. With
+     * the present recorded into the frame's last chunk, the draws since the
+     * previous commit (the frame's tail) therefore start on the GPU only once
+     * a drawable is free, and the frame is ready several ms after that --
+     * too late for the next refresh. Metro 2033 at the 60 FPS cap: the encode
+     * thread waited 15-23 ms a frame in nextDrawable with the GPU 30-45% busy
+     * and many frames stayed on glass for two refreshes: 41-50 FPS, while
+     * uncapped the same scenes ran at 62-100 FPS. Committing the tail here
+     * lets the GPU draw it during the drawable wait; the present then only
+     * adds the blit. */
+    if (commit_before_present_ && cmd_queue.CurrentChunk()->hasCommands())
+      device_context_->Commit();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
     if (target_) {
@@ -1123,6 +1143,7 @@ private:
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   double init_refresh_rate_ = DBL_MAX;
   int preferred_max_frame_rate = 0;
+  bool commit_before_present_ = true;   /* ml1175 */
   HUDState hud;
   Rc<Presenter> presenter;
   ModeSetGuard modeset_guard_;

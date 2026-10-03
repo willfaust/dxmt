@@ -88,6 +88,12 @@ public:
     return *this;
   }
 
+  /* MADEIRA (ml1175): nothing emitted since the last reset. */
+  bool
+  isEmpty() const {
+    return empty.next == nullptr;
+  }
+
   template <CommandWithContext<Context> Fn>
   constexpr unsigned
   calculateCommandSize() {

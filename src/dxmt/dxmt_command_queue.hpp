@@ -151,6 +151,12 @@ private:
 public:
   CommandChunk() {}
 
+  /* MADEIRA (ml1175): no command recorded into this chunk yet. */
+  bool
+  hasCommands() const {
+    return !list_enc.isEmpty();
+  }
+
   void
   reset() noexcept {
     signal_frame_latency_fence_ = ~0ull;
