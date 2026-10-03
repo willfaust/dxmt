@@ -63,6 +63,8 @@ ResourceInitializer::~ResourceInitializer() {
   free(cpu_command_heap);
 }
 
+static inline uint32_t bc_fill_texel_size(enum WMTPixelFormat f);   /* ml1251: defined below */
+
 uint64_t
 ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uint64_t length) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
@@ -185,6 +187,19 @@ ResourceInitializer::initWithZero(
 
   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
   size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
+  /* ml1251: on a GPU without BC the Metal texture is PHYSICALLY uncompressed
+   * (remap_unsupported_bc), so the zero fill must be laid out in that format,
+   * exactly as initWithData does for real data. With the BC layout a BC3
+   * texture got a w*h-byte zero buffer for a 4*w*h-byte copy -- Metal read the
+   * other three quarters from whatever followed it (validation: "totalBytesUsed
+   * must be <= [sourceBuffer length]") -- and a BC1 one got half the row pitch,
+   * which texture_upload_pitch_ok() then dropped, leaving it uninitialised.
+   * Every mip the game never streams (or that a clamped copy loses) showed that. */
+  if (block_size == 4u && !device_.supportsBCTextureCompression()) {
+    const int kind = bc_decode_kind(texture->pixelFormat());
+    texel_size = kind ? bc_decode_texel_size(kind) : bc_fill_texel_size(texture->pixelFormat());
+    block_size = 1u;
+  }
   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
   size_t bytes_per_image_needed = bytes_per_row_needed * align(height_sub, block_size) / block_size;
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
