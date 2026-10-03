@@ -570,6 +570,28 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* ml1178: no write-combined CPU mappings. DXMT asks for
+ * MTLCPUCacheModeWriteCombined on what the CPU only writes (dynamic buffers
+ * and textures, upload staging). Under FEX's TSO emulation every x86 integer
+ * store is an STLR, and a store-release to a write-combined page waits for the
+ * previous store to reach memory: Metro 2033 Redux's intro converts YUV to RGBA with one
+ * 32-bit mov per pixel into a mapped dynamic texture and ran at 3 FPS (the
+ * JIT loop was LDAPRB x3 + STLR per pixel). Shared memory on Apple GPUs is
+ * coherent, so the default cache mode only costs cache footprint.
+ * env.MADEIRA_WRITE_COMBINED = 1 keeps DXMT's flag. Applied wherever resource
+ * options reach Metal, so a buffer and a texture view over it still agree. */
+static MTLResourceOptions
+madeira_cpu_cache_mode(MTLResourceOptions options) {
+  static int keep = -1;
+  if (keep < 0) {
+    const char *e = getenv("MADEIRA_WRITE_COMBINED");
+    keep = (e && e[0] == '1') ? 1 : 0;
+    dprintf(STDERR_FILENO, "[iOS DXMT] ml1178 write-combined CPU mappings %s (env.MADEIRA_WRITE_COMBINED)\n",
+            keep ? "kept" : "off");
+  }
+  return keep ? options : (options & ~(MTLResourceOptions)MTLResourceCPUCacheModeMask);
+}
+
 static NTSTATUS
 _MTLDevice_newBuffer(void *obj) {
   struct unixcall_mtldevice_newbuffer *params = obj;
@@ -684,10 +706,10 @@ _MTLDevice_newBuffer(void *obj) {
   if (info->memory.ptr) {
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
-                                      options:(enum MTLResourceOptions)info->options
+                                      options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)
                                   deallocator:NULL];
   } else {
-    buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
+    buffer = [device newBufferWithLength:info->length options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)];
     info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
   }
   params->ret = (obj_handle_t)buffer;
@@ -969,7 +991,7 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
   desc.mipmapLevelCount = info->mipmap_level_count;
   desc.sampleCount = info->sample_count;
   desc.usage = (MTLTextureUsage)info->usage;
-  desc.resourceOptions = (MTLResourceOptions)info->options;
+  desc.resourceOptions = madeira_cpu_cache_mode((MTLResourceOptions)info->options);
 };
 
 void
@@ -6146,7 +6168,7 @@ _MTLDevice_heapBufferSizeAndAlign(void *obj) {
   if (wmtr_enabled()) return STATUS_SUCCESS;
   {
     MTLSizeAndAlign sa = [(id<MTLDevice>)params->device heapBufferSizeAndAlignWithLength:params->length
-                                                                                  options:(MTLResourceOptions)params->options];
+                                                                                  options:madeira_cpu_cache_mode((MTLResourceOptions)params->options)];
     params->ret_size = sa.size; params->ret_align = sa.align;
   }
   return STATUS_SUCCESS;
@@ -6159,7 +6181,7 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   if (wmtr_enabled()) return STATUS_SUCCESS;
   {
     id<MTLBuffer> b = [(id<MTLHeap>)params->heap newBufferWithLength:info->length
-                                                             options:(MTLResourceOptions)info->options
+                                                             options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)
                                                               offset:params->offset];
     params->ret = (obj_handle_t)b;
     if (wmt_stale_probe_on()) wmt_freed_set((uintptr_t)b, 0);   /* ml1156 */
