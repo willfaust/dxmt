@@ -426,7 +426,7 @@ pop_mesh_output_vertex_data(
 
 IREffect pull_vertex_input(
   air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask
+  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask, bool check_bounds
 ) {
   auto vbuf_table = func_signature.DefineInput(air::ArgumentBindingBuffer{
     .buffer_size = {},
@@ -484,6 +484,15 @@ IREffect pull_vertex_input(
       builder.CreateMul(stride, index),
       builder.getInt32(element_info.aligned_byte_offset)
     );
+    if (check_bounds) {
+      // D3D reads zero past the end of the vertex buffer binding; Metal would
+      // read on. Take the unbound-slot path (zeros) for such a fetch.
+      auto length = builder.CreateExtractValue(vertex_buffer_entry, {2});
+      base_addr = builder.CreateSelect(
+        builder.CreateICmpULT(byte_offset, length), base_addr,
+        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(base_addr->getType()))
+      );
+    }
     auto vec4 = co_yield air::pull_vec4_from_addr(
       (air::MTLAttributeFormat)element_info.format, base_addr, byte_offset
     );
