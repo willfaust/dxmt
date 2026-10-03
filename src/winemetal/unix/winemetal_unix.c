@@ -320,6 +320,50 @@ _MTLCopyAllDevices(void *obj) {
  * Documents/madeira-vram-mb.txt overrides the result outright. */
 #include <os/proc.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
+/* The process limit above can be larger than the device's RAM: an iPad with
+ * 7644 MB of RAM measured 8192 MB, so nothing here ever saw a shortage and God
+ * of War sat at an 8175 MB footprint with 4.4 GB compressed, drawing black
+ * frames. Budgets therefore plan with min(limit, hw.memsize - what iOS keeps
+ * for itself). madeira.cfg ram-reserve-mb = that reserve (default 2048; 0 =
+ * plan with the limit alone). On a 12 GB phone the cap is above the limit and
+ * nothing changes. */
+static uint64_t madeira_ram_cap(void) {
+  static uint64_t cap = 1;   /* 1 = not computed yet */
+  if (cap == 1) {
+    uint64_t mem = 0; size_t len = sizeof mem;
+    long long reserve = madeira_cfg_int("ram-reserve-mb", 2048); /* RAM left to iOS, MB; 0 = limit only */
+    cap = 0;
+    if (reserve > 0 && !sysctlbyname("hw.memsize", &mem, &len, NULL, 0) && mem > ((uint64_t)reserve << 20))
+      cap = mem - ((uint64_t)reserve << 20);
+    fprintf(stderr, "[wmt] RAM %llu MB, iOS reserve %lld MB -> memory cap %llu MB (madeira.cfg ram-reserve-mb; 0 = off)\n",
+            (unsigned long long)(mem >> 20), reserve, (unsigned long long)(cap >> 20));
+  }
+  return cap;
+}
+/* os_proc_available_memory(), lowered so that footprint + the result stays
+ * within the cap. 0 when the limit is unknown. */
+static uint64_t madeira_avail_memory(uint64_t foot) {
+  uint64_t avail = (uint64_t)os_proc_available_memory(), cap = madeira_ram_cap();
+  if (avail && cap && foot + avail > cap) {
+    static int said;
+    if (!said++)
+      fprintf(stderr, "[wmt] process limit %llu MB is above the memory cap %llu MB: "
+                      "the video budget, its trim and the mip clamp use the cap\n",
+              (unsigned long long)((foot + avail) >> 20), (unsigned long long)(cap >> 20));
+    avail = cap > foot ? cap - foot : (1ull << 20);
+  }
+  return avail;
+}
+/* The process limit a budget plans with: min(limit, cap). */
+static uint64_t madeira_mem_limit(uint64_t foot) {
+  uint64_t limit = (uint64_t)os_proc_available_memory() + foot, cap = madeira_ram_cap();
+  if (cap && limit > cap) {
+    madeira_avail_memory(foot);   /* logs the first lowering */
+    limit = cap;
+  }
+  return limit;
+}
 static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended);
 /* ml1075: DYNAMIC BUDGET. The number above is a one-off: the game read it once
  * and then grew its heap through a cutscene until jetsam (ph-rdr42: guest heap
@@ -341,7 +385,7 @@ static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     uint64_t foot = 0, limit, high, budget = base;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
-    limit = (uint64_t)os_proc_available_memory() + foot;
+    limit = madeira_mem_limit(foot);
     /* ml1103: madeira.cfg vram-trim-mb = distance below the kill line where the
      * trim starts (default 1536, the ml1075 value); 0 = never trim. ph-rdr56:
      * raising vram-mb to 3072 doubled the snow-scene frame rate, but in the city
@@ -374,7 +418,7 @@ static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended) {
   if (!budget) {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
-    limit = (uint64_t)os_proc_available_memory() + foot;
+    limit = madeira_mem_limit(foot);
     const uint64_t guest_ram = 4096ull << 20;      /* what ml992 lets the guest see */
     const uint64_t overhead  = 2560ull << 20;      /* JIT pool + FEX + Wine + host, measured */
     budget = limit > guest_ram + overhead ? limit - guest_ram - overhead : 0;
@@ -5979,20 +6023,22 @@ static NTSTATUS _madeira_ctl(void *args) {
     break;
   }
   case 7: {   /* ml2000: memory headroom for DXMT's automatic mip clamp.
-               * len = os_proc_available_memory() bytes, ptr = phys_footprint
+               * len = os_proc_available_memory() bytes (lowered to the memory
+               * cap, see madeira_ram_cap), ptr = phys_footprint
                * bytes (0 when task_info fails), ret = 1. ret stays 0 when the
                * limit is unknown (0 from os_proc_available_memory) and in
                * remote mode, where textures live on the other machine. No
                * pointer is read or written, which is why the wow64 entry may
                * forward this op unchanged. */
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    uint64_t avail;
+    uint64_t avail, foot;
     if (wmtr_enabled()) break;
-    avail = (uint64_t)os_proc_available_memory();
+    foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS
+               ? (uint64_t)vmi.phys_footprint : 0;
+    avail = madeira_avail_memory(foot);
     if (!avail) break;
     a->len = avail;
-    a->ptr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS
-                 ? (uint64_t)vmi.phys_footprint : 0;
+    a->ptr = foot;
     a->ret = 1;
     break;
   }
