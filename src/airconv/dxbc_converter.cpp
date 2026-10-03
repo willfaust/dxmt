@@ -1043,7 +1043,7 @@ bool CheckGSSignatureIsPassThrough(
   return true;
 };
 
-AIRCONV_API int SM50Initialize(
+static int parse_shader(
   const void *pBytecode, size_t BytecodeSize, sm50_shader_t *ppShader,
   MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
 ) {
@@ -1379,6 +1379,47 @@ AIRCONV_API int SM50Initialize(
   return 0;
 };
 
+AIRCONV_API int SM50Initialize(
+  const void *pBytecode, size_t BytecodeSize, sm50_shader_t *ppShader,
+  MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
+) {
+  int ret = parse_shader(pBytecode, BytecodeSize, ppShader, pRefl, ppError);
+  if (ret)
+    return ret;
+  /* A shader lives as long as the pipeline cache keeps it, i.e. as long as the
+   * device, but its parsed program (decoded instructions, signature handlers)
+   * is only needed while a variant is compiled and is several times the size of
+   * the bytecode. Keep the bytecode and parse it again per compilation. */
+  auto sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)*ppShader;
+  sm50_shader->bytecode.assign(
+    (const uint8_t *)pBytecode, (const uint8_t *)pBytecode + BytecodeSize
+  );
+  decltype(sm50_shader->bbs)().swap(sm50_shader->bbs);
+  decltype(sm50_shader->signature_handlers)().swap(sm50_shader->signature_handlers);
+  return 0;
+}
+
+namespace dxmt::dxbc {
+
+SM50ShaderInternal *
+with_parsed_program(SM50ShaderInternal *shader, std::unique_ptr<SM50ShaderInternal> &hold) {
+  if (!shader || shader->bytecode.empty())
+    return shader;
+  sm50_shader_t parsed = nullptr;
+  sm50_error_t err = nullptr;
+  // with a reflection, as all callers of SM50Initialize pass one: it adjusts
+  // the hull shader limits the compilation reads
+  MTL_SHADER_REFLECTION refl = {};
+  if (parse_shader(shader->bytecode.data(), shader->bytecode.size(), &parsed, &refl, &err)) {
+    SM50FreeError(err);
+    return nullptr;
+  }
+  hold.reset((SM50ShaderInternal *)parsed);
+  return hold.get();
+}
+
+} // namespace dxmt::dxbc
+
 AIRCONV_API void SM50GetArgumentsInfo(
   sm50_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
   struct MTL_SM50_SHADER_ARGUMENT *pArguments
@@ -1479,6 +1520,14 @@ AIRCONV_API int SM50Compile(
     return 1;
   }
 
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pShader;
+  pShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pShader, hold_pShader);
+  if (!pShader) {
+    errorOut << "Invalid DXBC bytecode\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
   // pArgs is ignored for now
   LLVMContext context;
 
@@ -1536,6 +1585,16 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pHullShader;
+  pVertexShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pVertexShader, hold_pVertexShader);
+  pHullShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pHullShader, hold_pHullShader);
+  if (!pVertexShader || !pHullShader) {
+    errorOut << "Invalid DXBC bytecode\0";
     *ppError = (sm50_error_t)errorObj;
     return 1;
   }
@@ -1600,6 +1659,16 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pHullShader;
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pDomainShader;
+  pHullShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pHullShader, hold_pHullShader);
+  pDomainShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pDomainShader, hold_pDomainShader);
+  if (!pHullShader || !pDomainShader) {
+    errorOut << "Invalid DXBC bytecode\0";
     *ppError = (sm50_error_t)errorObj;
     return 1;
   }
@@ -1669,6 +1738,16 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     return 1;
   }
 
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pGeometryShader;
+  pVertexShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pVertexShader, hold_pVertexShader);
+  pGeometryShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pGeometryShader, hold_pGeometryShader);
+  if (!pVertexShader || !pGeometryShader) {
+    errorOut << "Invalid DXBC bytecode\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
   // pArgs is ignored for now
   LLVMContext context;
 
@@ -1728,6 +1807,16 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
+
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
+  std::unique_ptr<dxbc::SM50ShaderInternal> hold_pGeometryShader;
+  pVertexShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pVertexShader, hold_pVertexShader);
+  pGeometryShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pGeometryShader, hold_pGeometryShader);
+  if (!pVertexShader || !pGeometryShader) {
+    errorOut << "Invalid DXBC bytecode\0";
     *ppError = (sm50_error_t)errorObj;
     return 1;
   }

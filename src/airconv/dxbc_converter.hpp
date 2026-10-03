@@ -423,6 +423,9 @@ public:
   std::vector<Signature> output_signature;
   std::vector<std::unique_ptr<BasicBlock>> bbs;
   std::vector<std::function<void(SignatureContext &)>> signature_handlers;
+  /* SM50Initialize drops bbs and signature_handlers and keeps the bytecode;
+   * see with_parsed_program */
+  std::vector<uint8_t> bytecode;
   microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
   /* for domain shader, it refers to patch constant input count */
   uint32_t max_input_register = 0;
@@ -515,6 +518,12 @@ llvm::Error convert_dxbc_tesselator_domain_shader(
     SM50ShaderInternal *pShaderInternal, const char *name, SM50ShaderInternal *pHullStage, llvm::LLVMContext &context,
     llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
 );
+
+/* The convert_* functions need the parsed program, which SM50Initialize does
+ * not keep. Returns `shader` if it still has it, otherwise parses its bytecode
+ * again into `hold` and returns that (nullptr if parsing fails). */
+SM50ShaderInternal *
+with_parsed_program(SM50ShaderInternal *shader, std::unique_ptr<SM50ShaderInternal> &hold);
 
 template <SM50_SHADER_COMPILATION_ARGUMENT_TYPE data_e, typename data_t>
 bool
