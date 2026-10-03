@@ -767,7 +767,11 @@ ResourceInitializer::allocateZeroBuffer(size_t size) {
 
     fill->type = WMTBlitCommandFillBuffer;
     fill->buffer = zero_buffer_;
-    fill->length = size;
+    /* ml1168: fill everything that zero_buffer_size_ now promises. With the
+     * ml1490 pow2 growth, `length` exceeds `size`, and a later request up to
+     * `length` reuses the tail without a new fill; it read zero only because
+     * Metal happens to zero a fresh private buffer. */
+    fill->length = length;
     fill->offset = 0;
     fill->value = 0;
   }
