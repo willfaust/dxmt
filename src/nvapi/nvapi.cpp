@@ -18,6 +18,23 @@ Logger Logger::s_instance("nvapi.log");
 
 static std::atomic_uint32_t s_initialization_count = 0;
 
+/*
+ * The caller's NvAPI_ShortString is not zeroed, so the copy has to end in a NUL
+ */
+static void
+CopyShortString(NvAPI_ShortString dst, const std::string &src) {
+  size_t size = std::min<size_t>(src.size(), NVAPI_SHORT_STRING_MAX - 1);
+  memcpy(dst, src.c_str(), size);
+  dst[size] = '\0';
+}
+
+/*
+ * Driver 581.57 (branch r580_00), the same driver the display adapter's registry
+ * entry names; titles that check for a minimum driver accept it
+ */
+static constexpr NvU32 kDriverVersion = 58157;
+static constexpr const char *kDriverBranch = "r580_00";
+
 NVAPI_INTERFACE
 NvAPI_Initialize() {
   if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
@@ -38,20 +55,20 @@ NvAPI_Unload() {
 NVAPI_INTERFACE
 NvAPI_SYS_GetDriverAndBranchVersion(NvU32 *pDriverVersion,
                                     NvAPI_ShortString szBuildBranchString) {
-  std::string build_str = std::format("r{}_000", NVAPI_SDK_VERSION);
+  std::string build_str = kDriverBranch;
 
   if (!pDriverVersion || !szBuildBranchString)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szBuildBranchString, build_str.c_str(), build_str.size());
-  *pDriverVersion = 99999;
+  CopyShortString(szBuildBranchString, build_str);
+  *pDriverVersion = kDriverVersion;
 
   return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
 NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERSION *pVersion) {
-  std::string build_str = std::format("r{}_000", NVAPI_SDK_VERSION);
+  std::string build_str = kDriverBranch;
   std::string adapter_str = "NVIDIA GeForce RTX";
 
   if (!pVersion)
@@ -60,10 +77,10 @@ NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERS
   if (pVersion->version != NV_DISPLAY_DRIVER_VERSION_VER)
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
 
-  pVersion->drvVersion = 99999;
+  pVersion->drvVersion = kDriverVersion;
   pVersion->bldChangeListNum = 0;
-  memcpy(pVersion->szBuildBranchString, build_str.c_str(), build_str.size());
-  memcpy(pVersion->szAdapterString, adapter_str.c_str(), adapter_str.size());
+  CopyShortString(pVersion->szBuildBranchString, build_str);
+  CopyShortString(pVersion->szAdapterString, adapter_str);
 
   return NVAPI_OK;
 }
@@ -75,7 +92,7 @@ NvAPI_GetInterfaceVersionString(NvAPI_ShortString szDesc) {
   if (!szDesc)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szDesc, version_str.c_str(), version_str.size());
+  CopyShortString(szDesc, version_str);
 
   return NVAPI_OK;
 }
@@ -201,6 +218,19 @@ NVAPI_INTERFACE NvAPI_D3D11_SetNvShaderExtnSlot(__in IUnknown *pDev,
   return NVAPI_OK;
 }
 
+static bool
+IsPrimaryAdapterName(const char *name) {
+  DISPLAY_DEVICEA device = {};
+  device.cb = sizeof(device);
+  for (DWORD i = 0; name && EnumDisplayDevicesA(nullptr, i, &device, 0); i++) {
+    if ((device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) && !_stricmp(device.DeviceName, name))
+      return true;
+    device = {};
+    device.cb = sizeof(device);
+  }
+  return false;
+}
+
 NVAPI_INTERFACE
 NvAPI_DISP_GetDisplayIdByDisplayName(const char *displayName, NvU32 *displayId) {
   struct MonitorEnumInfo {
@@ -232,6 +262,16 @@ NvAPI_DISP_GetDisplayIdByDisplayName(const char *displayName, NvU32 *displayId) 
       },
       reinterpret_cast<LPARAM>(&info)
   );
+
+  /*
+   * The GDI name of the primary adapter (what DXGI_OUTPUT_DESC and
+   * EnumDisplayDevices report) is the primary display, even when user32
+   * names its monitor differently
+   */
+  if (!info.handle && IsPrimaryAdapterName(displayName)) {
+    *displayId = WMTGetPrimaryDisplayId();
+    return NVAPI_OK;
+  }
 
   if (!info.handle)
     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
@@ -517,7 +557,27 @@ NvAPI_GPU_GetAllClockFrequencies(__in NvPhysicalGpuHandle hPhysicalGPU,
   if (!pClkFreqs)
     return NVAPI_INVALID_ARGUMENT;
 
-  return NVAPI_NOT_SUPPORTED;
+  NvU32 version = pClkFreqs->version;
+  switch (version) {
+  case NV_GPU_CLOCK_FREQUENCIES_VER_1:
+  case NV_GPU_CLOCK_FREQUENCIES_VER_2:
+  case NV_GPU_CLOCK_FREQUENCIES_VER_3:
+    break;
+  default:
+    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  }
+
+  // NVIDIA GeForce RTX 4090: base 2235 MHz, boost 2520 MHz, memory 10501 MHz (in kHz)
+  // V1 has no clock type and reports the current clocks
+  bool boost = version != NV_GPU_CLOCK_FREQUENCIES_VER_1 &&
+               pClkFreqs->ClockType == NV_GPU_CLOCK_FREQUENCIES_BOOST_CLOCK;
+  memset(pClkFreqs->domain, 0, sizeof(pClkFreqs->domain));
+  pClkFreqs->domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent = 1;
+  pClkFreqs->domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency = boost ? 2520000 : 2235000;
+  pClkFreqs->domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent = 1;
+  pClkFreqs->domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency = 10501000;
+
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -551,7 +611,9 @@ NvAPI_GPU_GetGpuCoreCount(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pCount) {
   if (!hPhysicalGpu || !pCount)
     return NVAPI_INVALID_ARGUMENT;
 
-  return NVAPI_NOT_SUPPORTED;
+  // NVIDIA GeForce RTX 4090
+  *pCount = 16384;
+  return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -593,7 +655,7 @@ NvAPI_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName
   if (!szName)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szName, adapter_str.c_str(), adapter_str.size());
+  CopyShortString(szName, adapter_str);
 
   return NVAPI_OK;
 }
@@ -795,6 +857,160 @@ NvAPI_GPU_GetLogicalGpuInfo(NvLogicalGpuHandle hLogicalGpu, NV_LOGICAL_GPU_DATA 
   return NVAPI_OK;
 }
 
+/*
+ * Physical and logical GPU handles are both the Metal device's registry ID
+ */
+static WMT::Device
+FindDevice(uint64_t registry_id) {
+  auto devices = WMT::CopyAllDevices();
+  for (unsigned i = 0; i < devices.count(); i++) {
+    if (registry_id == devices.object(i).registryID())
+      return devices.object(i);
+  }
+  return {};
+}
+
+NVAPI_INTERFACE
+NvAPI_GetLogicalGPUFromPhysicalGPU(NvPhysicalGpuHandle hPhysicalGPU, NvLogicalGpuHandle *pLogicalGPU) {
+  if (!pLogicalGPU)
+    return NVAPI_INVALID_ARGUMENT;
+  if (!FindDevice(uint64_t(hPhysicalGPU)))
+    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+
+  *pLogicalGPU = (NvLogicalGpuHandle)hPhysicalGPU;
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GetPhysicalGPUsFromLogicalGPU(
+    NvLogicalGpuHandle hLogicalGPU, NvPhysicalGpuHandle hPhysicalGPU[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount
+) {
+  if (!hPhysicalGPU || !pGpuCount)
+    return NVAPI_INVALID_ARGUMENT;
+  if (!FindDevice(uint64_t(hLogicalGPU)))
+    return NVAPI_EXPECTED_LOGICAL_GPU_HANDLE;
+
+  hPhysicalGPU[0] = (NvPhysicalGpuHandle)hLogicalGPU;
+  *pGpuCount = 1;
+  return NVAPI_OK;
+}
+
+/*
+ * Display handles are HMONITORs, as NvAPI_EnumNvidiaDisplayHandle returns them
+ */
+NVAPI_INTERFACE
+NvAPI_GetAssociatedNvidiaDisplayHandle(const char *szDisplayName, NvDisplayHandle *pNvDispHandle) {
+  if (!szDisplayName || !pNvDispHandle)
+    return NVAPI_INVALID_ARGUMENT;
+
+  for (unsigned i = 0;; i++) {
+    HMONITOR monitor = wsi::enumMonitors(i);
+    if (!monitor)
+      break;
+    MONITORINFOEXA info = {};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoA(monitor, &info) && !_stricmp(info.szDevice, szDisplayName)) {
+      *pNvDispHandle = (NvDisplayHandle)monitor;
+      return NVAPI_OK;
+    }
+  }
+
+  /*
+   * A name the monitor list does not know (e.g. the adapter's GDI name from
+   * DXGI) is the primary display
+   */
+  HMONITOR primary = wsi::enumMonitors(0);
+  if (!primary)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+  *pNvDispHandle = (NvDisplayHandle)primary;
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GetAssociatedDisplayOutputId(NvDisplayHandle hNvDisplay, NvU32 *pOutputId) {
+  if (!hNvDisplay || !pOutputId)
+    return NVAPI_INVALID_ARGUMENT;
+
+  for (unsigned i = 0; i < 32; i++) {
+    HMONITOR monitor = wsi::enumMonitors(i);
+    if (!monitor)
+      break;
+    if ((NvDisplayHandle)monitor == hNvDisplay) {
+      *pOutputId = 1u << i;
+      return NVAPI_OK;
+    }
+  }
+  return NVAPI_EXPECTED_DISPLAY_HANDLE;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetPCIIdentifiers(
+    NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pDeviceId, NvU32 *pSubSystemId, NvU32 *pRevisionId, NvU32 *pExtDeviceId
+) {
+  if (!pDeviceId || !pSubSystemId || !pRevisionId || !pExtDeviceId)
+    return NVAPI_INVALID_ARGUMENT;
+  if (!FindDevice(uint64_t(hPhysicalGpu)))
+    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+
+  // vendor 0x10DE in the low word, device id 0
+  *pDeviceId = 0x10DE;
+  *pSubSystemId = 0;
+  *pRevisionId = 0;
+  *pExtDeviceId = 0;
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetThermalSettings(
+    NvPhysicalGpuHandle hPhysicalGpu, NvU32 sensorIndex, NV_GPU_THERMAL_SETTINGS *pThermalSettings
+) {
+  if (!pThermalSettings)
+    return NVAPI_INVALID_ARGUMENT;
+  if (!FindDevice(uint64_t(hPhysicalGpu)))
+    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+  if (pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_1 &&
+      pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_2)
+    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  if (sensorIndex != NVAPI_THERMAL_TARGET_ALL && sensorIndex != 0)
+    return NVAPI_INVALID_ARGUMENT;
+
+  /*
+   * Metal reports no temperature; one GPU sensor at a steady reading
+   */
+  NvU32 version = pThermalSettings->version;
+  memset(pThermalSettings, 0, sizeof(*pThermalSettings));
+  pThermalSettings->version = version;
+  pThermalSettings->count = 1;
+  pThermalSettings->sensor[0].controller = NVAPI_THERMAL_CONTROLLER_GPU_INTERNAL;
+  pThermalSettings->sensor[0].defaultMinTemp = 0;
+  pThermalSettings->sensor[0].defaultMaxTemp = 95;
+  pThermalSettings->sensor[0].currentTemp = 50;
+  pThermalSettings->sensor[0].target = NVAPI_THERMAL_TARGET_GPU;
+  return NVAPI_OK;
+}
+
+/*
+ * Unified memory: both sizes are the Metal device's recommended working set
+ * (in KB), the number DXGI reports as DedicatedVideoMemory
+ */
+NVAPI_INTERFACE
+NvAPI_GPU_GetPhysicalFrameBufferSize(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSize) {
+  if (!hPhysicalGpu || !pSize)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto device = FindDevice(uint64_t(hPhysicalGpu));
+  if (!device)
+    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+
+  *pSize = NvU32(device.recommendedMaxWorkingSetSize() / 1024);
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetVirtualFrameBufferSize(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSize) {
+  return dxmt::NvAPI_GPU_GetPhysicalFrameBufferSize(hPhysicalGpu, pSize);
+}
+
 extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   switch (id) {
   case 0x0150e828:
@@ -899,6 +1115,22 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
   case 0x842b066e:
     return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
+  case 0xadd604d1:
+    return (void *)&NvAPI_GetLogicalGPUFromPhysicalGPU;
+  case 0xaea3fa32:
+    return (void *)&NvAPI_GetPhysicalGPUsFromLogicalGPU;
+  case 0x35c29134:
+    return (void *)&NvAPI_GetAssociatedNvidiaDisplayHandle;
+  case 0xd995937e:
+    return (void *)&NvAPI_GetAssociatedDisplayOutputId;
+  case 0x2ddfb66e:
+    return (void *)&NvAPI_GPU_GetPCIIdentifiers;
+  case 0xe3640a56:
+    return (void *)&NvAPI_GPU_GetThermalSettings;
+  case 0x46fbeb03:
+    return (void *)&NvAPI_GPU_GetPhysicalFrameBufferSize;
+  case 0x5a04b644:
+    return (void *)&NvAPI_GPU_GetVirtualFrameBufferSize;
   default:
     break;
   }
