@@ -7,13 +7,15 @@
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
+#include <atomic>
 
 namespace dxmt {
 
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config);
+LUID GetAdapterLuid(WMT::Device device);
 
-class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
+class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory7> {
 
 public:
   MTLDXGIFactory(UINT Flags) : flags_(Flags) {};
@@ -29,7 +31,8 @@ public:
         riid == __uuidof(IDXGIFactory) || riid == __uuidof(IDXGIFactory1) ||
         riid == __uuidof(IDXGIFactory2) || riid == __uuidof(IDXGIFactory2) ||
         riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4) ||
-        riid == __uuidof(IDXGIFactory5) || riid == __uuidof(IDXGIFactory6)) {
+        riid == __uuidof(IDXGIFactory5) || riid == __uuidof(IDXGIFactory6) ||
+        riid == __uuidof(IDXGIFactory7)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -258,7 +261,22 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID iid,
                                               void **adapter) override {
-    ERR("DXGIFactory::EnumAdapterByLuid: not implemented");
+    InitReturnPtr(adapter);
+
+    if (adapter == nullptr)
+      return DXGI_ERROR_INVALID_CALL;
+
+    auto devices = WMT::CopyAllDevices();
+    for (unsigned i = 0; i < devices.count(); i++) {
+      auto device = devices.object(i);
+      LUID device_luid = GetAdapterLuid(device);
+      if (device_luid.LowPart == luid.LowPart && device_luid.HighPart == luid.HighPart) {
+        Com<IMTLDXGIAdapter> found = CreateAdapter(device, this, Config::getInstance());
+        return found->QueryInterface(iid, adapter);
+      }
+    }
+
+    WARN("DXGIFactory::EnumAdapterByLuid: no adapter with LUID ", luid.HighPart, ":", luid.LowPart);
     return DXGI_ERROR_NOT_FOUND;
   }
 
@@ -300,6 +318,27 @@ public:
       return hr;
     return adapter->QueryInterface(riid, ppvAdapter);
   };
+
+  HRESULT STDMETHODCALLTYPE
+  RegisterAdaptersChangedEvent(HANDLE hEvent, DWORD *pdwCookie) override {
+    if (hEvent == nullptr || pdwCookie == nullptr)
+      return DXGI_ERROR_INVALID_CALL;
+
+    // Metal's adapters do not change while a process runs, so the event is
+    // never signalled; registration still succeeds, with a nonzero cookie
+    static std::atomic<DWORD> next_cookie = 0;
+    DWORD cookie;
+    do {
+      cookie = ++next_cookie;
+    } while (cookie == 0);
+    *pdwCookie = cookie;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  UnregisterAdaptersChangedEvent(DWORD dwCookie) override {
+    return S_OK;
+  }
 
 private:
   UINT flags_;
