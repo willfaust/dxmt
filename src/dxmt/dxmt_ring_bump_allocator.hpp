@@ -188,10 +188,15 @@ private:
 
 class StagingBufferBlockAllocator {
 public:
-  StagingBufferBlockAllocator(WMT::Device device, WMTResourceOptions block_options, bool placed_buffer = true) {
+  /* ml1243: census_owner lets the resource initializer's upload heap report as
+   * init-upload. Every instance used to bill staging-ring, so a load-time
+   * upload backlog was indistinguishable from the immediate context's ring. */
+  StagingBufferBlockAllocator(WMT::Device device, WMTResourceOptions block_options, bool placed_buffer = true,
+                              MemOwner census_owner = MEMOWN_STAGING_RING) {
     device_ = device;
     buffer_info_ = block_options;
     placed_buffer_ = placed_buffer;
+    census_owner_ = census_owner;
   }
 
   class Block {
@@ -201,7 +206,7 @@ public:
     void *mapped_address;
 
     ~Block() {
-      mem_census_sub(MEMOWN_STAGING_RING, census_bytes);   /* ml677 */
+      mem_census_sub(census_owner, census_bytes);          /* ml677 */
       census_bytes = 0;
       /* ml789: RELEASE THE BUFFER BEFORE FREEING ITS MEMORY.
        *
@@ -220,6 +225,7 @@ public:
       }
     };
     uint64_t census_bytes = 0;                             /* ml677 */
+    MemOwner census_owner = MEMOWN_STAGING_RING;           /* ml1243 */
 
     Block() = default;
 
@@ -229,6 +235,7 @@ public:
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
       census_bytes = move.census_bytes;                    /* ml677: move the debt too */
+      census_owner = move.census_owner;
       move.census_bytes = 0;
       move.mapped_address = nullptr;
     };
@@ -268,7 +275,8 @@ public:
     block.buffer = device_.newBuffer(info);
     block.gpu_address = info.gpu_address;
     block.census_bytes = block_size;                       /* ml677 */
-    mem_census_add(MEMOWN_STAGING_RING, block_size);
+    block.census_owner = census_owner_;
+    mem_census_add(census_owner_, block_size);
     return block;
   };
 
@@ -276,6 +284,7 @@ private:
   WMT::Device device_;
   WMTResourceOptions buffer_info_;
   bool placed_buffer_;
+  MemOwner census_owner_;
 };
 
 class HostBufferBlockAllocator {

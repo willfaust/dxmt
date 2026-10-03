@@ -11,6 +11,12 @@ constexpr size_t kResourceInitializerCpuCommandHeapSize = 0x100000; // 1MB
 constexpr size_t kResourceInitializerGpuUploadHeapSize = 0x2000000; // 32MB
 constexpr size_t kResourceInitializerGpuUploadHeapAlignment = 256;
 constexpr size_t kResourceInitializerChunks = 2;
+/* ml1243: commit the pending uploads once this many upload-heap bytes have
+ * piled up since the last flush. Otherwise only CommitCurrentChunk flushes, and
+ * a title that creates its textures without presenting (Hollow Knight's load)
+ * keeps every upload block pinned -- 960MB on A15, where BC decodes to RGBA8 at
+ * 4x -- until the first frame commits it all at once and jetsam fires. */
+constexpr size_t kResourceInitializerFlushThreshold = 0x4000000; // 64MB
 
 static_assert(kResourceInitializerChunks > 1);
 
@@ -118,6 +124,7 @@ private:
 
   uint64_t current_seq_id_ = 1;
   uint64_t cached_coherent_seq_id = 0;
+  size_t upload_bytes_since_flush_ = 0; /* ml1243 */
   WMT::Device device_;
   WMT::Reference<WMT::CommandQueue> upload_queue_;
   WMT::Reference<WMT::SharedEvent> upload_queue_event_;

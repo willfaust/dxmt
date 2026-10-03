@@ -49,7 +49,7 @@ namespace dxmt {
 ResourceInitializer::ResourceInitializer(WMT::Device device) :
     device_(device),
     gpu_command_heap_allocator(StagingBufferBlockAllocator(
-        device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false
+        device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false, MEMOWN_INIT_UPLOAD
     )) {
   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
   upload_queue_event_ = device.newSharedEvent();
@@ -597,6 +597,11 @@ ResourceInitializer::initWithData(
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
 
   std::lock_guard<dxmt::mutex> lock(mutex_);
+  /* ml1243: flush BEFORE the block, not through ALLOC_GPU's failure path --
+   * `continue` in a do/while(0) leaves the loop, so that path drops the upload. */
+  if (upload_bytes_since_flush_ &&
+      upload_bytes_since_flush_ + total_bytes_needed > kResourceInitializerFlushThreshold)
+    flushInternal();
   do {
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
@@ -669,6 +674,7 @@ ResourceInitializer::flushToWait() {
 void
 ResourceInitializer::reset() {
   cpu_command_heap_offset = 0;
+  upload_bytes_since_flush_ = 0;
 
   clear_render_pass_head.next = nullptr;
   clear_render_pass_tail = &clear_render_pass_head;
@@ -702,6 +708,7 @@ ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset) {
   auto [block, offset_] = gpu_command_heap_allocator.allocate(
       current_seq_id_, cached_coherent_seq_id, size, kResourceInitializerGpuUploadHeapAlignment
   );
+  upload_bytes_since_flush_ += size;
   offset = offset_;
   return block.buffer;
 }
