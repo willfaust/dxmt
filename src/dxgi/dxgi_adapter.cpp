@@ -209,9 +209,10 @@ public:
       hr = S_OK;
 
     // We can't really reconstruct the version numbers
-    // returned by Windows drivers from Metal
+    // returned by Windows drivers from Metal; report the one
+    // the kernel-mode side has for this adapter, if any
     if (SUCCEEDED(hr) && umd_version)
-      umd_version->QuadPart = ~0ull;
+      umd_version->QuadPart = GetUmdDriverVersion();
 
     if (FAILED(hr)) {
       Logger::err("DXGI: CheckInterfaceSupport: Unsupported interface");
@@ -379,6 +380,21 @@ private:
       return c == '1';
     }();
     return enabled;
+  }
+
+  /* What Windows' DXGI hands out: the UMD version the kernel reports for the
+   * adapter (KMTQAITYPE_UMD_DRIVER_VERSION, the registry DriverVersion
+   * a.b.c.d as a<<48 | b<<32 | c<<16 | d). ~0 when there is none. */
+  UINT64 GetUmdDriverVersion() {
+    D3DKMT_UMD_DRIVER_VERSION version = {};
+    D3DKMT_QUERYADAPTERINFO query = {};
+    query.hAdapter = local_kmt_;
+    query.Type = KMTQAITYPE_UMD_DRIVER_VERSION;
+    query.pPrivateDriverData = &version;
+    query.PrivateDriverDataSize = sizeof(version);
+    if (!local_kmt_ || D3DKMTQueryAdapterInfo(&query) || !version.DriverVersion.QuadPart)
+      return ~0ull;
+    return version.DriverVersion.QuadPart;
   }
 
   WMT::Reference<WMT::Device> device_;
