@@ -1368,6 +1368,57 @@ Converter::operator()(const InstBitFiledInsert &bfi) {
   StoreOperand(bfi.dst, Result);
 }
 
+/* D3D defines a texture load outside the texture (coordinate, mip level or
+ * array slice) to return 0 and an out-of-range typed UAV store to be dropped;
+ * Metal leaves both undefined. For 2D, 2D-array and 3D textures this returns
+ * the in-range condition and clamps Address, ArrayIndex and LOD (if given) so
+ * the access itself stays inside; nullptr for the kinds it does not check. */
+static llvm::Value *
+TextureAccessInBounds(
+    llvm::air::AIRBuilder &air, llvm::IRBuilderBase &ir, const TextureResourceHandle &Tex, llvm::Value *&Address,
+    llvm::Value *&ArrayIndex, llvm::Value *&LOD
+) {
+  using namespace llvm::air;
+  unsigned dims;
+  bool array = false;
+  switch (Tex.Logical) {
+  case Texture::texture2d:
+  case Texture::depth2d:
+    dims = 2;
+    break;
+  case Texture::texture2d_array:
+  case Texture::depth2d_array:
+    dims = 2;
+    array = true;
+    break;
+  case Texture::texture3d:
+    dims = 3;
+    break;
+  default:
+    return nullptr;
+  }
+  llvm::Value *Level = LOD ? LOD : ir.getInt32(0);
+  if (Level->getType() != ir.getInt32Ty())
+    return nullptr;
+  auto Mips = air.CreateTextureQuery(Tex.Texture, Tex.Handle, Texture::num_mip_levels, ir.getInt32(0));
+  llvm::Value *InBounds = ir.CreateICmpULT(Level, Mips);
+  Level = ir.CreateSelect(InBounds, Level, ir.getInt32(0));
+  const Texture::Query Queries[3] = {Texture::width, Texture::height, Texture::depth};
+  for (unsigned i = 0; i < dims; i++) {
+    auto Size = air.CreateTextureQuery(Tex.Texture, Tex.Handle, Queries[i], Level);
+    InBounds = ir.CreateAnd(InBounds, ir.CreateICmpULT(ir.CreateExtractElement(Address, (uint64_t)i), Size));
+  }
+  if (array && ArrayIndex) {
+    auto Length = air.CreateTextureQuery(Tex.Texture, Tex.Handle, Texture::array_length, ir.getInt32(0));
+    InBounds = ir.CreateAnd(InBounds, ir.CreateICmpULT(ArrayIndex, Length));
+    ArrayIndex = ir.CreateSelect(InBounds, ArrayIndex, ir.getInt32(0));
+  }
+  Address = ir.CreateSelect(InBounds, Address, llvm::Constant::getNullValue(Address->getType()));
+  if (LOD)
+    LOD = Level;
+  return InBounds;
+}
+
 void
 Converter::operator()(const InstLoad &load) {
   using namespace llvm::air;
@@ -1433,9 +1484,12 @@ Converter::operator()(const InstLoad &load) {
     Address = ir.CreateAdd(Address, Offset);
 
   llvm::Value *LOD = LoadOperand(load.src_address, kMaskComponentW);
+  llvm::Value *InBounds = SampleIndex ? nullptr : TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, LOD);
 
   auto [Value, Residency] =
       air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent);
+  if (InBounds)
+    Value = ir.CreateSelect(InBounds, Value, llvm::Constant::getNullValue(Value->getType()));
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
 }
@@ -1483,8 +1537,12 @@ Converter::operator()(const InstLoadUAVTyped &load) {
   if (Tex->Texture.memory_access == Texture::acesss_readwrite)
     air.CreateTextureFence(Tex->Texture, Tex->Handle);
 
+  llvm::Value *NoLOD = nullptr;
+  llvm::Value *InBounds = TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, NoLOD);
   auto [Value, Residency] =
       air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, air.getInt(0), Tex->GlobalCoherent);
+  if (InBounds)
+    Value = ir.CreateSelect(InBounds, Value, llvm::Constant::getNullValue(Value->getType()));
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
 }
@@ -1529,7 +1587,23 @@ Converter::operator()(const InstStoreUAVTyped &store) {
 
   auto Value = LoadOperand(store.src, kMaskAll);
 
+  llvm::Value *NoLOD = nullptr;
+  llvm::Value *InBounds = TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, NoLOD);
+  llvm::BasicBlock *Done = nullptr;
+  if (InBounds) {
+    auto Fn = ir.GetInsertBlock()->getParent();
+    auto Store = llvm::BasicBlock::Create(air.getContext(), "uav_store_in_bounds", Fn);
+    Done = llvm::BasicBlock::Create(air.getContext(), "uav_store_done", Fn);
+    ir.CreateCondBr(InBounds, Store, Done);
+    ir.SetInsertPoint(Store);
+  }
+
   air.CreateWrite(Tex->Texture, Tex->Handle, Address, ArrayIndex, nullptr, ir.getInt32(0), Value, Tex->GlobalCoherent);
+
+  if (Done) {
+    ir.CreateBr(Done);
+    ir.SetInsertPoint(Done);
+  }
 }
 
 llvm::Value *
