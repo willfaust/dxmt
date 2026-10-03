@@ -78,6 +78,9 @@ public:
       ctx_state({cmd_queue}),
       d3dmt_(this, mutex) {
         ignore_map_flag_no_wait_ = Config::getInstance().getOption<bool>("d3d11.ignoreMapFlagNoWait", false);
+        /* ml1246: 0 = never rename a staging resource that would need a fresh buffer */
+        staging_rename_budget_ =
+            uint64_t(std::max(0, Config::getInstance().getOption<int>("d3d11.stagingRenameBudgetMB", 256))) << 20;
       }
 
   HRESULT
@@ -242,6 +245,18 @@ public:
         auto result = staging->tryMap(coherent_seq_id, MapType & D3D11_MAP_READ, MapType & D3D11_MAP_WRITE);
         if (result == StagingMapResult::Mapped)
           return E_FAIL;
+        bool rename_refused = false;
+        if (result == StagingMapResult::Renamable && !staging->canRenameWithoutGrowth(coherent_seq_id) &&
+            StagingResource::spare_bytes.load(std::memory_order_relaxed) + staging->length > staging_rename_budget_) {
+          /* ml1246: over budget -- wait for the GPU instead of growing (see dxmt_staging.hpp) */
+          result = StagingMapResult(staging->gpuBusyDistance(coherent_seq_id));
+          rename_refused = true;
+          if (++staging_rename_refusals_ <= 8 || (staging_rename_refusals_ & 255) == 0)
+            ERR("[staging] ml1246 rename refused #", staging_rename_refusals_, ": ", staging->length >> 10,
+                "KB resource, spare ", StagingResource::spare_bytes.load(std::memory_order_relaxed) >> 20,
+                "MB of ", staging_rename_budget_ >> 20, "MB budget -- waiting ", uint64_t(result),
+                " seq for the GPU", (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) ? " (DO_NOT_WAIT: busy)" : "");
+        }
         if (result == StagingMapResult::Renamable) {
           // when write to a buffer that is gpu-readonly
           auto next_name = staging->allocate(coherent_seq_id);
@@ -261,6 +276,10 @@ public:
           return S_OK;
         }
         if (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) {
+          /* ml1246: the pending copy may sit in the unflushed seq, and a caller
+           * spinning on DO_NOT_WAIT would then never see the resource go idle */
+          if (rename_refused)
+            Flush();
           return DXGI_ERROR_WAS_STILL_DRAWING;
         }
         /* ml1254: is the work this read waits for still unsubmitted (recorded
@@ -626,6 +645,8 @@ private:
   std::atomic<uint32_t> refcount = 0;
   D3D11Multithread d3dmt_;
   bool ignore_map_flag_no_wait_;
+  uint64_t staging_rename_budget_;
+  uint64_t staging_rename_refusals_ = 0;
 };
 
 std::unique_ptr<MTLD3D11DeviceContextBase>
