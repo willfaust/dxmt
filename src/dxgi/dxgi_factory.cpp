@@ -1,3 +1,4 @@
+#include <d3d12.h>
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "dxgi_interfaces.h"
@@ -151,9 +152,18 @@ public:
       IUnknown *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
     InitReturnPtr(ppSwapChain);
-
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    if (!ppSwapChain || !pDevice || !pDesc || !pDesc->Width || !pDesc->Height ||
+        pDesc->SampleDesc.Count != 1 || pDesc->SampleDesc.Quality ||
+        pDesc->Scaling != DXGI_SCALING_STRETCH || pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
+      return DXGI_ERROR_INVALID_CALL;
+    if (pRestrictToOutput) return DXGI_ERROR_UNSUPPORTED;
+    Com<ID3D12CommandQueue> queue;
+    Com<IMTLDXGIDevice> device;
+    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&queue))) ||
+        FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&device))))
+      return DXGI_ERROR_UNSUPPORTED;
+    // The composition target supplies the HWND when its visual is committed.
+    return device->CreateSwapChain(this, nullptr, pDesc, nullptr, ppSwapChain);
   }
 
   HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter,
