@@ -173,6 +173,7 @@ _NSObject_retain(NSObject **obj) {
   return STATUS_SUCCESS;
 }
 
+static void wmt_guest_storage_reclaim(void);
 static NTSTATUS
 _NSObject_release(NSObject **obj);
 /* ml1155: WHICH object did we free? A command buffer's completion crashes in
@@ -244,6 +245,7 @@ static void wmt_stale_check_p(uintptr_t p, const char *where) {
 
 static NTSTATUS
 _NSObject_release(NSObject **obj) {
+  wmt_guest_storage_reclaim();
   if (wmtr_enabled() && RM_IS_REMOTE((uint64_t)(uintptr_t)*obj)) {
     struct rm_arg_handle a = { (uint64_t)(uintptr_t)*obj };
     wmtr_buf_remove(a.handle);   /* ml820: retires only on the LAST guest reference */
@@ -573,6 +575,7 @@ static void madeira_gpu_meter_attach(id<MTLCommandBuffer> cmdbuf) {
 
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
+  wmt_guest_storage_reclaim();
   struct unixcall_generic_obj_noret *params = obj;
   if (wmtr_enabled()) {
     /* Push guest shadows BEFORE the GPU reads them. The app writes into buffer
@@ -5696,8 +5699,11 @@ _NSString_getCString32(void *obj) {
   return status;
 }
 
+#include "winemetal_guest_buffers.h"
+
 static NTSTATUS
 _MTLDevice_newBuffer32(void *obj) {
+  wmt_guest_storage_reclaim();
   struct unixcall_mtldevice_newbuffer *params = obj;
   void *guest_info = params->info.ptr;
   struct WMTBufferInfo *info = wow_in(guest_info);
@@ -5710,34 +5716,17 @@ _MTLDevice_newBuffer32(void *obj) {
     return STATUS_INVALID_PARAMETER;
   }
 
-  /* MADEIRA (WOW64_DESIGN.md section 7.5).  Two paths exist here:
-   *
-   *  - caller-supplied memory (info->memory.ptr non-NULL) is DXMT's normal
-   *    path -- the ring bump allocator hands in its own PE-side heap block and
-   *    keeps writing argument-buffer contents through that same pointer.  For
-   *    a 32-bit caller that block came from a VirtualAlloc inside the guest
-   *    window, so adding B gives a host address that names the same bytes and
-   *    the app can keep using its 32-bit pointer.  This works.
-   *
-   *  - Metal-allocated memory (info->memory.ptr NULL on a CPU-visible buffer)
-   *    makes the handler write [buffer contents] back into the field.  That is
-   *    a pointer into Metal's own heap, which is NOT in the guest window, so
-   *    there is no 32-bit address that names it: truncating it would hand the
-   *    guest a pointer to something else entirely.  Refuse loudly instead.
-   *    Private and memoryless buffers are exempt: the CPU never maps them and
-   *    the handler leaves the field NULL. */
+  /* Supplied storage remains caller-owned. Otherwise allocate inside Wine's
+   * guest window, with lifetime tied to the Metal buffer's final release. */
   storage_mode = (uint64_t)info->options & 0x30;
   if (!info->memory.ptr && storage_mode != WMTResourceStorageModePrivate &&
       storage_mode != (uint64_t)WMTResourceStorageModeMemoryless) {
-    fprintf(
-        stderr,
-        "winemetal: MTLDevice_newBuffer from a 32-bit caller with no caller-supplied memory "
-        "(length %llu, options 0x%llx): [buffer contents] has no guest address, refusing. "
-        "Route the allocation through the ring allocator (WOW64_DESIGN.md section 7.5).\n",
-        (unsigned long long)info->length, (unsigned long long)info->options
-    );
+#if TARGET_OS_IOS
+    return wmt_guest_buffer_new(params, info);
+#else
     params->ret = 0;
     return STATUS_INVALID_ADDRESS;
+#endif
   }
 
   guest_memory = info->memory.ptr;
@@ -6366,22 +6355,8 @@ _d3d9_nop(void *obj) {
 extern int madeira_ir_convert(void *args);
 static NTSTATUS _madeira_ir_convert(void *args) { return (NTSTATUS)madeira_ir_convert(args); }
 
-/* The wow64 table must stay the SAME LENGTH as the native one, because the slot
- * number is the ABI. A 32-bit guest would hand us narrowed pointers, so pointing
- * this at the native handler would read the wrong addresses rather than fail.
- * Our ARM64EC guests are 64-bit and never take this path; if one ever does, it
- * gets a named refusal instead of silent corruption. */
-static NTSTATUS _madeira_ir_convert_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_newRenderPipelineStateVD_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_newResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLResidencySet_addAllocation_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLResidencySet_commit_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLCommandQueue_addResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_newGeometryEmulationPipelineState_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLResidencySet_removeAllocation_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_heapTextureSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_newPlacementHeap_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLHeap_newTextureAtOffset_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+/* The wow64 table keeps the native slot numbers. D3D12 handlers below
+ * translate CPU pointers while preserving fixed-width handles and GPU addresses. */
 
 /* ml1098: runtime control (winemetal.h, struct madeira_ctl_args). */
 static volatile int g_madeira_capture_req;
@@ -6482,15 +6457,21 @@ static NTSTATUS _madeira_ctl(void *args) {
   }
   return STATUS_SUCCESS;
 }
-/* ml2000: the other ops carry guest pointers in ptr (which would need
- * UInt32ToPtr) and stay unimplemented for 32-bit callers. Op 7 is pointer-free
- * and struct madeira_ctl_args has the same offsets on i386 (two uint32, then
- * uint64s at 8 and 16, name at 24), so the i386 d3d11.dll gets the same
- * headroom reading. */
+/* The control ABI has fixed-width fields. ptr is a CPU address for these
+ * four operations, a thread ID for op 4, and an output byte count for op 7. */
 static NTSTATUS _madeira_ctl_wow64(void *args) {
-  struct madeira_ctl_args *a = args;
-  if (a && a->op == 7) return _madeira_ctl(args);
-  return STATUS_NOT_IMPLEMENTED;
+  struct madeira_ctl_args *guest = args, native;
+  NTSTATUS status;
+  if (!guest) return STATUS_INVALID_PARAMETER;
+  native = *guest;
+  if (guest->op == 1 || guest->op == 2 || guest->op == 3 || guest->op == 5) {
+    if (guest->ptr > UINT32_MAX) { guest->ret = 0; return STATUS_INVALID_PARAMETER; }
+    native.ptr = (uintptr_t)wow_in((void *)(uintptr_t)guest->ptr);
+  }
+  status = _madeira_ctl(&native);
+  if (guest->op != 7) native.ptr = guest->ptr;
+  *guest = native;
+  return status;
 }
 
 #if TARGET_OS_IOS
@@ -6642,8 +6623,6 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   }
   return STATUS_SUCCESS;
 }
-static NTSTATUS _MTLDevice_heapBufferSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLHeap_newBufferAtOffset_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 
 static NTSTATUS
 _MTLResidencySet_commit(void *obj) {
@@ -6853,6 +6832,8 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
 }
 
 #include "wmt_remote_guard.h"
+
+#include "winemetal_d3d12_wow64.h"
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -7153,20 +7134,20 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_MTLSharedEvent_waitUntilSignaledValue,
     &_madeira_ir_convert_wow64,
     &_MTLDevice_newRenderPipelineStateVD_wow64,
-    &_MTLDevice_newResidencySet_wow64,
-    &_MTLResidencySet_addAllocation_wow64,
-    &_MTLResidencySet_commit_wow64,
-    &_MTLCommandQueue_addResidencySet_wow64,
+    &_MTLDevice_newResidencySet,
+    &_MTLResidencySet_addAllocation,
+    &_MTLResidencySet_commit,
+    &_MTLCommandQueue_addResidencySet,
     &_MTLDevice_newGeometryEmulationPipelineState_wow64,
-    &_MTLResidencySet_removeAllocation_wow64,
+    &_MTLResidencySet_removeAllocation,
     &_MTLDevice_heapTextureSizeAndAlign_wow64,
-    &_MTLDevice_newPlacementHeap_wow64,
+    &_MTLDevice_newPlacementHeap,
     &_MTLHeap_newTextureAtOffset_wow64,
     &_madeira_ctl_wow64,
     /* 127-138 are madeira-d3d12 (above); 139-140 are the placement-heap buffers; 141-144 stay NULL;
      * 145-149 are the DXSO (D3D9 shader) compiler; 150 is the unix-call benchmark nop.
      * The slot number is the ABI: never insert, never reuse. */
-    &_MTLDevice_heapBufferSizeAndAlign_wow64,   /* 139 */
+    &_MTLDevice_heapBufferSizeAndAlign,   /* 139 */
     &_MTLHeap_newBufferAtOffset_wow64,   /* 140 */
     NULL, /* 141 */
     NULL, /* 142 */

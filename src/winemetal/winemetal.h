@@ -1986,7 +1986,7 @@ WINEMETAL_API obj_handle_t MTLHeap_newBufferAtOffset(obj_handle_t heap, struct W
  *   1  write file: Documents/capture/<name> from ptr/len; ret = 1 on success
  *   2  config get: madeira.cfg value of key <name> copied into ptr/len (NUL-terminated); ret = 1 when set
  *   7  ml2000 memory: len = os_proc_available_memory() bytes, ptr = phys_footprint bytes; ret = 1 when known
- *      (the only op the wow64 entry forwards; 0 in remote mode)
+ *      (0 in remote mode; WOW64 translates CPU pointers for the other ops)
  * Local in both backends: it never touches a Metal object. */
 struct madeira_ctl_args {
   uint32_t op;
