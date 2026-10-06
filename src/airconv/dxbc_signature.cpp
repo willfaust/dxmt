@@ -113,15 +113,18 @@ void handle_signature_vs(
       });
       max_input_register = std::max(reg + 1, max_input_register);
       if (sig.mask() == 0) break;
+      // out-of-range vertex fetches read zero; only checked for shader model
+      // 4.x so far, the only shaders this has been run with on a device
       signature_handlers.push_back(
         [=, type = (InputAttributeComponentType)sig.componentType(),
-         name = sig.fullSemanticString()](SignatureContext &ctx) {
+         name = sig.fullSemanticString(),
+         check_bounds = sm50_shader->shader_model_major < 5](SignatureContext &ctx) {
           if (ctx.ia_layout) {
             for (unsigned i = 0; i < ctx.ia_layout->num_elements; i++) {
               if (ctx.ia_layout->elements[i].reg == reg) {
                 ctx.prologue << pull_vertex_input(
                   ctx.func_signature, reg, mask, ctx.ia_layout->elements[i],
-                  ctx.ia_layout->slot_mask
+                  ctx.ia_layout->slot_mask, check_bounds
                 );
                 break;
               }

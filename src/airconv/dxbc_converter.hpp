@@ -290,7 +290,7 @@ pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_elemen
 
 IREffect pull_vertex_input(
   air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask
+  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask, bool check_bounds
 );
 
 IREffect pop_mesh_output_render_taget_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id);
@@ -427,6 +427,7 @@ public:
    * see with_parsed_program */
   std::vector<uint8_t> bytecode;
   microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
+  uint32_t shader_model_major = 5;
   /* for domain shader, it refers to patch constant input count */
   uint32_t max_input_register = 0;
   uint32_t max_output_register = 0;

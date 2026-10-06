@@ -1099,6 +1099,7 @@ static int parse_shader(
 
   auto sm50_shader = new SM50ShaderInternal();
   sm50_shader->shader_type = CodeParser.ShaderType();
+  sm50_shader->shader_model_major = CodeParser.ShaderMajorVersion();
   auto shader_info = &(sm50_shader->shader_info);
 
   {
