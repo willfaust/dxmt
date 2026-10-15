@@ -7087,7 +7087,14 @@ _MTLDevice_newPlacementHeap(void *obj) {
     hd.type = MTLHeapTypePlacement;
     hd.size = params->size;
     hd.storageMode = ((params->options & 0x30) == WMTResourceStorageModePrivate) ? MTLStorageModePrivate : MTLStorageModeShared;
-    hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    { /* madeira-bcd: heap-untracked (tools/patch-winemetal-heap-untracked.py) */
+      static int untracked = -1, said;
+      if (untracked < 0) untracked = madeira_cfg_int("heap-untracked", 0) > 0;
+      hd.hazardTrackingMode = untracked ? MTLHazardTrackingModeUntracked : MTLHazardTrackingModeTracked;
+      if (untracked && said++ < 3)
+        fprintf(stderr, "[heap-untracked] madeira-bcd placement heap %llu MB: hazard tracking OFF (madeira.cfg heap-untracked = 1; "
+                        "the D3D12 runtime's encoder fences order its work)\n", (unsigned long long)(params->size >> 20));
+    }
     params->ret = (obj_handle_t)[(id<MTLDevice>)params->device newHeapWithDescriptor:hd];
     [hd release];
   }
