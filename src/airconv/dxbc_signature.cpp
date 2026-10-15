@@ -1,4 +1,5 @@
 #include "dxbc_converter.hpp"
+#include <cstdio> /* madeira-bcd: [gs-siv] */
 #include <format>
 
 using namespace microsoft;
@@ -1039,6 +1040,7 @@ handle_signature_gs(
     auto sgv = Inst.m_InputDeclSGV.Name;
     switch (sgv) {
     default:
+      fprintf(stderr, "[gs-siv] madeira-bcd: geometry shader input generated value %u is not handled\n", (unsigned)sgv);
       assert(0 && "Unexpected/unhandled geometry shader sgv");
       break;
     }
@@ -1050,7 +1052,17 @@ handle_signature_gs(
     switch (siv) {
     case D3D10_SB_NAME_POSITION:
       break;
+    /* madeira-bcd: geometry shader input system values -- the GS copies the
+     * vertex stage's whole output register file (load_vertex), and the vertex
+     * stage counts these registers in max_output_register, so they read like
+     * SV_Position: plain input registers. GTA V Legacy aborted here. */
+    case D3D10_SB_NAME_CLIP_DISTANCE:
+    case D3D10_SB_NAME_CULL_DISTANCE:
+    case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
+    case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
+      break;
     default:
+      fprintf(stderr, "[gs-siv] madeira-bcd: geometry shader input system value %u is not handled\n", (unsigned)siv);
       assert(0 && "Unexpected/unhandled geometry shader siv");
       break;
     }
