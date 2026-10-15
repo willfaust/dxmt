@@ -523,6 +523,18 @@ _MTLCommandQueue_commandBuffer(void *obj) {
     wmtr_pool_push(params->ret);   /* ml820: autoreleased natively */
     return STATUS_SUCCESS;
   }
+  {   /* madeira-bcd: DXMT fault info -- env.MADEIRA_DXMT_FAULT_INFO = 1 creates
+       * command buffers with encoder execution status, so a GPU fault or hang
+       * names its encoder (tools/patch-dxmt-d3d11-fault-info.py). */
+    const char *fi = getenv("MADEIRA_DXMT_FAULT_INFO");
+    if (fi && fi[0] == '1') {
+      MTLCommandBufferDescriptor *desc = [MTLCommandBufferDescriptor new];
+      desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+      params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:desc];
+      [desc release];
+      return STATUS_SUCCESS;
+    }
+  }
   params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBuffer];
   return STATUS_SUCCESS;
 }

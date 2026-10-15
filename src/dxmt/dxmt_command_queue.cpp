@@ -183,6 +183,23 @@ CommandQueue::WaitForFinishThread() {
     const bool device_error = chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError;
     if (device_error) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+#ifndef __i386__
+      /* madeira-bcd: DXMT fault info -- the encoders of this command buffer
+       * that faulted, were affected or are unknown (madeira_ctl op 9). */
+      static const bool madeira_fi = env::getEnvVar("MADEIRA_DXMT_FAULT_INFO").starts_with("1");
+      if (madeira_fi) {
+        char fi_text[2048];
+        struct { uint64_t cb, buf, size; } fi_req = {
+            (uint64_t)chunk.attached_cmdbuf.handle, (uint64_t)(uintptr_t)fi_text, sizeof fi_text};
+        struct madeira_ctl_args fi_args = {};
+        fi_text[0] = 0;
+        fi_args.op = 9;
+        fi_args.ptr = (uint64_t)(uintptr_t)&fi_req;
+        MadeiraCtl(&fi_args);
+        if (fi_args.ret)
+          ERR("[fault-enc] madeira-bcd frame ", chunk.frame_, ": ", fi_text);
+      }
+#endif
       MarkDeviceError();
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {

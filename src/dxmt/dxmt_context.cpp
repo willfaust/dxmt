@@ -11,6 +11,26 @@
 #include <cstdint>
 #include <cfloat>
 #include "dxmt_mem_census.hpp"
+#include "util_env.hpp"
+#include <cstdio>
+
+/* madeira-bcd: DXMT fault info -- env.MADEIRA_DXMT_FAULT_INFO = 1 labels every
+ * encoder (tools/patch-dxmt-d3d11-fault-info.py); off, nothing is labelled. */
+static bool
+madeira_fault_info_on() {
+  static const bool on = dxmt::env::getEnvVar("MADEIRA_DXMT_FAULT_INFO").starts_with("1");
+  return on;
+}
+
+template <typename Head>
+static unsigned
+madeira_cmd_count(Head *head) {
+  unsigned n = 0;
+  for (auto *c = (wmtcmd_base *)head->next.get_accessible_or_null(); c && n < 1000000;
+       c = (wmtcmd_base *)c->next.get_accessible_or_null())
+    n++;
+  return n;
+}
 #include "config/config.hpp"   /* ml754 */
 #include "util_madeira_switch.hpp"
 #include <algorithm>
@@ -1056,6 +1076,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+      if (madeira_fault_info_on()) {   /* madeira-bcd: DXMT fault info */
+        char label[160];
+        snprintf(label, sizeof label, "rp#%llu %ux%u cmds=%u gs=%d ts=%d gs_tasks=%u ts_tasks=%u",
+                 (unsigned long long)seq_id_, data->render_target_width, data->render_target_height,
+                 madeira_cmd_count(&data->cmd_head), (int)data->use_geometry, (int)data->use_tessellation,
+                 (unsigned)data->gs_arg_marshal_tasks.size(), (unsigned)data->ts_arg_marshal_tasks.size());
+        encoder.setLabel(WMT::String::string(label, WMTUTF8StringEncoding));
+      }
       encoder.setVertexBuffer(gpu_buffer_, 0, 16);
       encoder.setVertexBuffer(gpu_buffer_, 0, 29);
       encoder.setVertexBuffer(gpu_buffer_, 0, 30);
@@ -1168,6 +1196,12 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::Compute: {
       auto data = static_cast<ComputeEncoderData *>(current);
       auto encoder = cmdbuf.computeCommandEncoder(false);
+      if (madeira_fault_info_on()) {   /* madeira-bcd: DXMT fault info */
+        char label[96];
+        snprintf(label, sizeof label, "cs#%llu cmds=%u", (unsigned long long)seq_id_,
+                 madeira_cmd_count(&data->cmd_head));
+        encoder.setLabel(WMT::String::string(label, WMTUTF8StringEncoding));
+      }
       struct wmtcmd_compute_setbuffer setcmd;
       setcmd.type = WMTComputeCommandSetBuffer;
       setcmd.next.set(nullptr);
@@ -1185,6 +1219,12 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::Blit: {
       auto data = static_cast<BlitEncoderData *>(current);
       auto encoder = cmdbuf.blitCommandEncoder();
+      if (madeira_fault_info_on()) {   /* madeira-bcd: DXMT fault info */
+        char label[96];
+        snprintf(label, sizeof label, "blit#%llu cmds=%u", (unsigned long long)seq_id_,
+                 madeira_cmd_count(&data->cmd_head));
+        encoder.setLabel(WMT::String::string(label, WMTUTF8StringEncoding));
+      }
       encoder.encodeCommands(&data->cmd_head);
       encoder.endEncoding();
       data->~BlitEncoderData();
