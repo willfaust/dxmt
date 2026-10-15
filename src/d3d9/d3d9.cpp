@@ -38,8 +38,23 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 }
 #endif
 
+/* MADEIRA: the 64-bit (ARM64EC) build is the x64 programs' d3d9.dll, in place
+ * of Wine's, which needs OpenGL and so always failed to create here.
+ * MADEIRA_D3D9_X64=0 makes creation fail the same way again. */
+#if defined(_WIN32) && defined(_WIN64) && !defined(DXMT_MADEIRA)
+static bool madeira_d3d9_x64_disabled() {
+  char v[8];
+  DWORD n = GetEnvironmentVariableA("MADEIRA_D3D9_X64", v, sizeof(v));
+  return n > 0 && n < sizeof(v) && v[0] == '0';
+}
+#else
+static bool madeira_d3d9_x64_disabled() { return false; }
+#endif
+
 extern "C" IDirect3D9 *WINAPI
 Direct3DCreate9(UINT SDKVersion) {
+  if (madeira_d3d9_x64_disabled())
+    return nullptr;
   auto *iface = new dxmt::MTLD3D9Interface(SDKVersion, /*isEx=*/false);
   iface->AddRef();
   return static_cast<IDirect3D9 *>(iface);
@@ -49,6 +64,10 @@ extern "C" HRESULT WINAPI
 Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex **ppD3D) {
   if (!ppD3D)
     return D3DERR_INVALIDCALL;
+  if (madeira_d3d9_x64_disabled()) {
+    *ppD3D = nullptr;
+    return D3DERR_NOTAVAILABLE;
+  }
   auto *iface = new dxmt::MTLD3D9Interface(SDKVersion, /*isEx=*/true);
   iface->AddRef();
   *ppD3D = static_cast<IDirect3D9Ex *>(iface);
