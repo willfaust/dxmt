@@ -8961,6 +8961,10 @@ MTLD3D9Device::PackDrawConstants(
       amb[3] = static_cast<float>((a >> 24) & 0xFF) / 255.0f;
     }
     std::memcpy(ffp_base + 240, amb, sizeof(amb));
+    // The generated VS evaluates all eight light slots before masking inactive
+    // contributions. Recycled NaNs survive multiplication by zero and can
+    // poison a color channel, so initialize the complete uploaded light array.
+    std::memset(ffp_base + 256, 0, 8 * 112);
     for (uint32_t li = 0; li < pod.ffp_light_count; ++li) {
       const D3DLIGHT9 *lp = reinterpret_cast<const D3DLIGHT9 *>(pod.ffp->lights[li]);
       float blk[28] = {};
