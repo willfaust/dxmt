@@ -10944,6 +10944,57 @@ MTLD3D9Device::forceFlushAndCommit() {
   commitCurrentChunkTimed(4);
 }
 
+bool
+MTLD3D9Device::drainForDynamicRename() {
+  static const bool enabled = [] {
+    const bool value = env::getEnvVar("DXMT_D9_RENAME_WAIT") != "0";
+    Logger::warn(str::format("[d9-rename-wait] enabled=", value, " (DXMT_D9_RENAME_WAIT=0 keeps the stale draw)"));
+    return value;
+  }();
+  if (!enabled)
+    return false;
+  const auto start = std::chrono::steady_clock::now();
+  // The shape of the readback drains: queued draws, open work and the tail
+  // signal go into the chunk, the chunk is committed and the CPU fence and the
+  // GPU are waited for. forceFlushAndCommit is the rename-pressure submit.
+  FlushDrawBatch();
+  flushOpenWork();
+  emitCmdbufTailSignal();
+  // emitCmdbufTailSignal signalled the pre-increment sequence.
+  const uint64_t signal = m_currentCmdSeq - 1;
+  const auto seq = m_dxmtQueue->CurrentSeqId();
+  commitCurrentChunkTimed(4);
+  m_dxmtQueue->WaitCPUFence(seq);
+  if (!waitForGpuOrDeviceError(signal))
+    return false;
+  // Fold the event's progress in now and trim the rings against it, as
+  // refreshSignaledAndTrimRings does without its every-8-sequences throttle, so
+  // the retry sees every generation the GPU has released and the ring blocks it
+  // released give their address space back too.
+  const uint64_t event_signalled = m_completionEvent.signaledValue();
+  uint64_t prev = m_cachedSignaled.load(std::memory_order_relaxed);
+  while (prev < event_signalled &&
+         !m_cachedSignaled.compare_exchange_weak(prev, event_signalled, std::memory_order_relaxed))
+    ;
+  const uint64_t signalled = m_cachedSignaled.load(std::memory_order_acquire);
+  m_constRing.free_blocks(signalled);
+  m_uploadRing.free_blocks(signalled);
+  m_constRingResolve.free_blocks(signalled);
+  m_renameDrainUs += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  if (++m_renameDrains <= 4 || !(m_renameDrains % 256))
+    Logger::warn(str::format("[d9-rename-wait] drains=", m_renameDrains, " avg-us=", m_renameDrainUs / m_renameDrains,
+                             " in-place=", m_renameInPlace));
+  return true;
+}
+
+void
+MTLD3D9Device::noteRenameInPlace() {
+  if (++m_renameInPlace <= 4 || !(m_renameInPlace % 256))
+    Logger::warn(str::format("[d9-rename-wait] in-place=", m_renameInPlace,
+                             " (nothing left to recycle; the store went into the GPU-idle current generation)"));
+}
+
 void
 MTLD3D9Device::settleUploadPressure() {
   static const uint64_t threshold = [] {

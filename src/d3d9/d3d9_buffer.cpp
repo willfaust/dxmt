@@ -118,16 +118,30 @@ MTLD3D9VertexBuffer::refreshWholeMirror() {
           m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
           m_device->m_cachedSignaled.load(std::memory_order_acquire)
       ))) {
-    // Video memory is exhausted, so the cache keeps the previous generation and
-    // the draw reads one refresh of stale geometry. Say so once: the failure is
-    // otherwise invisible, and stale vertices look like a rendering bug rather
-    // than an allocation one. Calling thread under the device lock.
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+    // iOS-Madeira: no room for a new generation. Wait for the
+    // GPU to finish what is recorded (MTLD3D9Device::drainForDynamicRename) and
+    // try again: a released generation is recycled, and with none to recycle the
+    // store goes into the current generation, which no unfinished draw reads now.
+    // A refresh with room never comes here. Calling thread under the device lock,
+    // between draws (BuildDrawCapture), where a state change drains the batch too.
+    if (m_device->drainForDynamicRename()) {
+      if (FAILED(renameDynamicBuffer(
+              m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+              m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          )))
+        m_device->noteRenameInPlace();
+    } else {
+      // Video memory is exhausted, so the cache keeps the previous generation and
+      // the draw reads one refresh of stale geometry. Say so once: the failure is
+      // otherwise invisible, and stale vertices look like a rendering bug rather
+      // than an allocation one. Calling thread under the device lock.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+      }
+      return;
     }
-    return;
   }
   // The name installed above is GPU-idle by construction, so it takes the
   // mirror directly, the same shape d3d11's dynamic Unmap uses
@@ -381,16 +395,30 @@ MTLD3D9IndexBuffer::refreshWholeMirror() {
           m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
           m_device->m_cachedSignaled.load(std::memory_order_acquire)
       ))) {
-    // Video memory is exhausted, so the cache keeps the previous generation and
-    // the draw reads one refresh of stale geometry. Say so once: the failure is
-    // otherwise invisible, and stale vertices look like a rendering bug rather
-    // than an allocation one. Calling thread under the device lock.
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+    // iOS-Madeira: no room for a new generation. Wait for the
+    // GPU to finish what is recorded (MTLD3D9Device::drainForDynamicRename) and
+    // try again: a released generation is recycled, and with none to recycle the
+    // store goes into the current generation, which no unfinished draw reads now.
+    // A refresh with room never comes here. Calling thread under the device lock,
+    // between draws (BuildDrawCapture), where a state change drains the batch too.
+    if (m_device->drainForDynamicRename()) {
+      if (FAILED(renameDynamicBuffer(
+              m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+              m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          )))
+        m_device->noteRenameInPlace();
+    } else {
+      // Video memory is exhausted, so the cache keeps the previous generation and
+      // the draw reads one refresh of stale geometry. Say so once: the failure is
+      // otherwise invisible, and stale vertices look like a rendering bug rather
+      // than an allocation one. Calling thread under the device lock.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+      }
+      return;
     }
-    return;
   }
   // See MTLD3D9VertexBuffer::refreshWholeMirror for why the store goes straight
   // into the fresh name and why it is charged to the staging axis.

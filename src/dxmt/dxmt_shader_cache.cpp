@@ -60,7 +60,9 @@ ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
   if (env::getEnvVar("DXMT_SHADER_CACHE") == "0")
     return;
   std::string path = GetDXMTShaderCacheDirectory();
-  path += str::format("shaders_", (unsigned int)metal_version, ".db");
+  /* madeira ml1382: shaders built with DXMT_PRECISE_MINMAX=0 (fast min/max) get their own file */
+  path += str::format("shaders_", (unsigned int)metal_version,
+                      env::getEnvVar("DXMT_PRECISE_MINMAX") == "0" ? "_fastminmax" : "", ".db");
   scache_writer_ = WMT::CacheWriter::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
   scache_reader_ = WMT::CacheReader::alloc_init(path.c_str(), kDXMTShaderCacheVersion);
 }

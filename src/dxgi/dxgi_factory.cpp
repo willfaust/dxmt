@@ -2,6 +2,7 @@
 #include "config/config.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
+#include "dxgi_vk_interfaces.h"
 #include "com/com_guid.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
@@ -18,6 +19,13 @@ namespace dxmt {
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config);
 LUID GetAdapterLuid(WMT::Device device);
+
+bool VkSwapChainEnabled();
+HRESULT CreateVkSwapChain(IDXGIFactory1 *pFactory, IUnknown *pDevice,
+                          IDXGIVkSwapChainFactory *pVkFactory, HWND hWnd,
+                          const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+                          const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
+                          IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain);
 
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory7> {
 
@@ -113,8 +121,13 @@ public:
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
 
+    // A device of DXMT's own, or a Direct3D 12 queue that presents through
+    // Vulkan (vkd3d-proton); see dxgi_swapchain_vk.cpp
     Com<IMTLDXGIDevice> metal_dxgi_device;
-    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&metal_dxgi_device)))) {
+    Com<IDXGIVkSwapChainFactory> vk_swapchain_factory;
+    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&metal_dxgi_device))) &&
+        (!VkSwapChainEnabled() ||
+         FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&vk_swapchain_factory))))) {
       ERR("Unsupported device type");
       return DXGI_ERROR_UNSUPPORTED;
     }
@@ -137,6 +150,10 @@ public:
       fsDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
       fsDesc.Windowed = TRUE;
     }
+
+    if (metal_dxgi_device == nullptr)
+      return CreateVkSwapChain(this, pDevice, vk_swapchain_factory.ptr(), hWnd,
+                               &desc, &fsDesc, pRestrictToOutput, ppSwapChain);
 
     return metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
                                               ppSwapChain);

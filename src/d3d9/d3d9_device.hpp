@@ -268,6 +268,19 @@ public:
   // vertex/index buffer Lock helpers so both share one shape.
   void forceFlushAndCommit();
 
+  // iOS-Madeira: a dynamic buffer's refresh found no room
+  // for a new generation (a 32-bit process whose address space was full) and its draw read
+  // the previous one: stale geometry on the screen. Before that happens, this submits what is
+  // recorded, waits for the GPU to finish it and folds the progress in, so the refresh can
+  // recycle a generation the GPU has released, or, with none to recycle, store into the
+  // current one, which no unfinished draw reads any more. Called only after a failed rename.
+  // False when DXMT_D9_RENAME_WAIT=0 or the wait was abandoned (the old stale draw then).
+  bool drainForDynamicRename();
+  // Counts for the [d9-rename-wait] line: drains, their total wait, and stores that went
+  // into the current generation because nothing was left to recycle.
+  uint64_t m_renameDrains = 0, m_renameDrainUs = 0, m_renameInPlace = 0;
+  void noteRenameInPlace();
+
   // Bytes of dynamic-buffer allocations minted since the last commit, and the
   // point at which the next draw submits rather than accumulating further.
   //

@@ -9,6 +9,26 @@
 #include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include <cstdio>
+#include <cstdlib>
+
+/* madeira ml1382: DXBC min/max are IEEE minNum/maxNum: when one operand is NaN the other
+ * one is returned, and shaders rely on max(0, x) to throw NaNs away. Metal's
+ * fast_fmin/fast_fmax leave the NaN case undefined, so a NaN from a degenerate normal or
+ * 0/0 can reach lighting results. Emit the precise variants (air.fmin/air.fmax).
+ * DXMT_PRECISE_MINMAX=0 restores the fast ones; dxmt_shader_cache.cpp keeps a separate
+ * cache file for that setting. */
+static bool
+madeira_precise_minmax() {
+  static int mode = -1;
+  if (mode < 0) {
+    const char *e = getenv("DXMT_PRECISE_MINMAX");
+    mode = (e && e[0] == '0') ? 0 : 1;
+    fprintf(stderr, "[airconv] ml1382 DXBC min/max %s\n",
+            mode ? "precise (NaN-suppressing, as D3D11 requires)" : "fast (DXMT_PRECISE_MINMAX=0)");
+  }
+  return mode != 0;
+}
 
 namespace dxmt::dxbc {
 
@@ -1012,11 +1032,11 @@ Converter::operator()(const InstFloatBinaryOp &bin) {
     Result = ir.CreateFDiv(LHS, RHS);
     break;
   case FloatBinaryOp::Min: {
-    Result = air.CreateFPBinOp(AIRBuilder::fmin, LHS, RHS);
+    Result = air.CreateFPBinOp(AIRBuilder::fmin, LHS, RHS, !madeira_precise_minmax());
     break;
   }
   case FloatBinaryOp::Max: {
-    Result = air.CreateFPBinOp(AIRBuilder::fmax, LHS, RHS);
+    Result = air.CreateFPBinOp(AIRBuilder::fmax, LHS, RHS, !madeira_precise_minmax());
     break;
   }
   }

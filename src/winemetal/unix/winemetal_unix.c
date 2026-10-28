@@ -370,6 +370,28 @@ static uint64_t madeira_mem_limit(uint64_t foot) {
   return limit;
 }
 static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended);
+/* The swap tier's donor pool (ntdll): memory another task owns, so it is not in
+ * our footprint or under the process limit, but it is the device's RAM all the
+ * same. Log 96 (an 8 GB phone, 4088 MB donated, footprint 4.4 -> 5.9 GB, host free
+ * ~120 MB, sub-1 FPS for seconds at a time): the trim below saw only the footprint
+ * and kept the budget at 2.8-4 GB the whole run. Log 95 had the same full pool and
+ * the same trims and played at 26-53 FPS, so the budget was not shown to be the
+ * cause: madeira.cfg vram-count-donor = 1 counts the donated pages too (an A/B,
+ * off by default; the trim then judges the footprint alone, as before). */
+extern void madeira_swap_overlay_stats(unsigned long long *file_mb, unsigned long long *donor_mb,
+                                       unsigned long long *donor_pool_mb, unsigned long long *donor_guarded) __attribute__((weak));
+static uint64_t madeira_donor_in_use(void) {
+  static int on = -1;
+  unsigned long long mb = 0;
+  if (on < 0) {
+    on = madeira_cfg_int("vram-count-donor", 0) != 0;
+    fprintf(stderr, "[wmt] video budget trim %s donated RAM (madeira.cfg vram-count-donor; 1 = counts it, default the footprint alone)\n",
+            on ? "counts" : "leaves out");
+  }
+  if (!on || !madeira_swap_overlay_stats) return 0;
+  madeira_swap_overlay_stats(NULL, &mb, NULL, NULL);
+  return (uint64_t)mb << 20;
+}
 /* ml1075: DYNAMIC BUDGET. The number above is a one-off: the game read it once
  * and then grew its heap through a cutscene until jetsam (ph-rdr42: guest heap
  * 2.3 -> 4.0 GB, footprint 4.7 -> 7.9 GB, killed at 8.19). On Windows, DXGI's
@@ -388,7 +410,7 @@ static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {
   last_ns = now;
   {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    uint64_t foot = 0, limit, high, budget = base;
+    uint64_t foot = 0, limit, high, budget = base, donor = 0, over = 0;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
     limit = madeira_mem_limit(foot);
     /* ml1103: madeira.cfg vram-trim-mb = distance below the kill line where the
@@ -398,14 +420,21 @@ static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {
      * game went back to evicting and re-streaming (the pop-in). */
     { static long long trim_mb = -1; if (trim_mb < 0) { trim_mb = madeira_cfg_int("vram-trim-mb", 1536); if (trim_mb < 0) trim_mb = 1536;
         fprintf(stderr, "[wmt] ml1103 video budget trim starts %lld MB below the kill line (madeira.cfg vram-trim-mb; 0 = never)\n", trim_mb); }
-      high = trim_mb ? (limit > ((uint64_t)trim_mb << 20) ? limit - ((uint64_t)trim_mb << 20) : 0) : ~0ull; }
-    if (foot > high) budget = base > foot - high ? base - (foot - high) : 0;
+      high = trim_mb ? (limit > ((uint64_t)trim_mb << 20) ? limit - ((uint64_t)trim_mb << 20) : 0) : ~0ull;
+      if (foot > high) over = foot - high;
+      /* The same distance below the RAM cap, for the footprint and the donated pages together. */
+      donor = madeira_donor_in_use();
+      if (donor && trim_mb) {
+        uint64_t cap = madeira_ram_cap(), room = cap > ((uint64_t)trim_mb << 20) ? cap - ((uint64_t)trim_mb << 20) : 0;
+        if (cap && foot + donor > room && foot + donor - room > over) over = foot + donor - room;
+      } }
+    if (over) budget = base > over ? base - over : 0;
     if (budget < (768ull << 20)) budget = 768ull << 20;
     if (budget > base) budget = base;
     if (!last_logged || (last_logged > budget ? last_logged - budget : budget - last_logged) >= (64ull << 20) || (calls % 5000) == 0) {
-      fprintf(stderr, "[wmt] ml1075 video budget now %llu MB (base %llu, footprint %llu of %llu MB; %lu queries so far)\n",
+      fprintf(stderr, "[wmt] ml1075 video budget now %llu MB (base %llu, footprint %llu of %llu MB, donated %llu MB; %lu queries so far)\n",
               (unsigned long long)(budget >> 20), (unsigned long long)(base >> 20), (unsigned long long)(foot >> 20),
-              (unsigned long long)(limit >> 20), calls);
+              (unsigned long long)(limit >> 20), (unsigned long long)(donor >> 20), calls);
       last_logged = budget;
     }
     last_budget = budget;
@@ -1373,6 +1402,380 @@ _NSObject_description(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* PIPELINE ARCHIVE (madeira.cfg pso-archive = 1, read by madeira-d3d12;
+ * default 0). Metal keeps what it compiled in its own cache, which iOS can empty
+ * between sessions: logs 2026-10-26 found 6,904 of 6,986 pipelines there in one
+ * session and 19 of the first 500 in the next, which then compiled for minutes at
+ * 420-550 ms each. madeira-d3d12 names a directory (MadeiraCtl op 11: its shader
+ * cache build directory, one folder per executable). Every render and compute
+ * pipeline created below looks in the archives saved there first
+ * (MTLPipelineOptionFailOnBinaryArchiveMiss, so a miss costs a lookup, not a
+ * compile). A pipeline that is not there is created as before and added, on a
+ * utility queue, to an open archive that is saved as the next chunk file every
+ * MADEIRA_ARCH_CHUNK pipelines and 10 s after the last one; a saved chunk joins
+ * the lookup list at once. A chunk Metal cannot load (another OS or GPU) is
+ * deleted. The files live in the app's Documents (the Wine prefix), which iOS
+ * does not purge. madeira-d3d12 names a directory that outlives builds (a new
+ * build's converter that writes the same shader finds it; a changed shader is
+ * a miss), so the chunks are capped: MADEIRA_PSO_ARCHIVE_MB (default 1024) in
+ * all, the oldest deleted at load down to three quarters of it, and no chunk
+ * added once a session reaches it.
+ *
+ * Inline add (log 2026-10-27 01:00, the first session with an empty directory):
+ * the queue add compiled every pipeline a second time (avg 94 ms rising to
+ * 403 ms an add, one queue) and kept 1,536 of the 6,027 misses by the end. A
+ * miss now takes one of MADEIRA_ARCH_SLOTS open archives (one thread at a time),
+ * is compiled once by the add and created from that archive; with every slot
+ * busy, or the add refused, it is created and queued as before. A full slot is
+ * saved as a chunk on the queue. MADEIRA_PSO_ARCHIVE_INLINE=0 = the queue only. */
+#include <dirent.h>
+#define MADEIRA_ARCH_CHUNK 128
+static char madeira_arch_dir[1024];
+static _Atomic int madeira_arch_named;           /* 0 none, 1 being written, 2 ready */
+static os_unfair_lock madeira_arch_lock = OS_UNFAIR_LOCK_INIT;
+static NSArray *madeira_arch_list;               /* saved chunks; replaced whole, never mutated */
+static dispatch_queue_t madeira_arch_q;          /* adds and saves, in order */
+static id<MTLDevice> madeira_arch_device;
+static id<MTLBinaryArchive> madeira_arch_open;   /* madeira_arch_q only */
+static unsigned madeira_arch_open_n, madeira_arch_next, madeira_arch_timer;
+static uint64_t madeira_arch_last_add;
+static _Atomic unsigned long long madeira_arch_bytes, madeira_arch_cap;   /* all chunks; the cap */
+static _Atomic long madeira_arch_hits, madeira_arch_misses, madeira_arch_added, madeira_arch_add_failed;
+static _Atomic uint64_t madeira_arch_add_ns;
+#define MADEIRA_ARCH_SLOTS 4
+static struct madeira_arch_slot {
+  os_unfair_lock lock;
+  id<MTLBinaryArchive> open;
+  unsigned n;
+  uint64_t last;
+} madeira_arch_slots[MADEIRA_ARCH_SLOTS];
+static _Atomic long madeira_arch_inline, madeira_arch_inline_slow;
+static _Atomic uint64_t madeira_arch_inline_add_ns, madeira_arch_inline_create_ns;
+
+static int madeira_arch_inline_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_PSO_ARCHIVE_INLINE");
+    on = !(e && !strcmp(e, "0"));
+  }
+  return on;
+}
+
+static int madeira_arch_name(const char *dir) {
+  int expect = 0;
+  if (!dir || !*dir || strlen(dir) >= sizeof madeira_arch_dir) return 0;
+  if (!atomic_compare_exchange_strong(&madeira_arch_named, &expect, 1))
+    return !strcmp(madeira_arch_dir, dir);   /* named already: the same directory is fine */
+  strcpy(madeira_arch_dir, dir);
+  mkdir(madeira_arch_dir, 0755);
+  atomic_store_explicit(&madeira_arch_named, 2, memory_order_release);
+  return 1;
+}
+
+static id<MTLBinaryArchive> madeira_arch_open_file(const char *path, NSError **err) {
+  MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
+  id<MTLBinaryArchive> a;
+  desc.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+  a = [madeira_arch_device newBinaryArchiveWithDescriptor:desc error:err];
+  [desc release];
+  return a;
+}
+
+struct madeira_arch_file { unsigned k; unsigned long long size; };
+static int madeira_arch_file_cmp(const void *x, const void *y) {
+  unsigned a = ((const struct madeira_arch_file *)x)->k, b = ((const struct madeira_arch_file *)y)->k;
+  return a < b ? -1 : a > b;
+}
+
+static void madeira_arch_load(id<MTLDevice> device) {
+  NSMutableArray *list = [[NSMutableArray alloc] init];
+  struct madeira_arch_file *files = NULL;
+  unsigned bad = 0, old = 0, next = 0, nfiles = 0, room = 0;
+  int prune;
+  unsigned long long bytes = 0, total = 0, cap;
+  const char *env = getenv("MADEIRA_PSO_ARCHIVE_MB");
+  DIR *d;
+  struct dirent *e;
+  cap = (env && atoi(env) > 0 ? (unsigned long long)atoi(env) : 1024ull) << 20;
+  atomic_store_explicit(&madeira_arch_cap, cap, memory_order_relaxed);
+  madeira_arch_device = [device retain];
+  madeira_arch_q = dispatch_queue_create("madeira.pso-archive",
+      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  if ((d = opendir(madeira_arch_dir))) {
+    while ((e = readdir(d))) {
+      char path[1200];
+      unsigned k;
+      int used = 0;
+      struct stat st;
+      if (sscanf(e->d_name, "chunk-%u%n", &k, &used) != 1 || !used) continue;
+      snprintf(path, sizeof path, "%s/%s", madeira_arch_dir, e->d_name);
+      if (strcmp(e->d_name + used, ".metalar")) { unlink(path); continue; }   /* a save that did not finish */
+      if (k >= next) next = k + 1;
+      if (stat(path, &st)) continue;
+      if (nfiles == room) {
+        struct madeira_arch_file *grown = realloc(files, (room = room ? room * 2 : 64) * sizeof *files);
+        if (!grown) break;
+        files = grown;
+      }
+      files[nfiles].k = k;
+      files[nfiles++].size = (unsigned long long)st.st_size;
+      total += (unsigned long long)st.st_size;
+    }
+    closedir(d);
+  }
+  if (nfiles) qsort(files, nfiles, sizeof *files, madeira_arch_file_cmp);
+  prune = total > cap;
+  for (unsigned i = 0; i < nfiles; i++) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/chunk-%u.metalar", madeira_arch_dir, files[i].k);
+    if (prune && total > cap / 4 * 3) {   /* over the cap: the oldest go, down to three quarters */
+      unlink(path);
+      total -= files[i].size;
+      old++;
+      continue;
+    }
+    @autoreleasepool {
+      NSError *err = nil;
+      id<MTLBinaryArchive> a = madeira_arch_open_file(path, &err);
+      if (a && !err) {
+        [list addObject:a];
+        bytes += files[i].size;
+      } else {
+        unlink(path);
+        bad++;
+      }
+      [a release];
+    }
+  }
+  free(files);
+  atomic_store_explicit(&madeira_arch_bytes, bytes, memory_order_relaxed);
+  madeira_arch_next = next;
+  os_unfair_lock_lock(&madeira_arch_lock);
+  madeira_arch_list = list;
+  os_unfair_lock_unlock(&madeira_arch_lock);
+  fprintf(stderr, "[pso-archive] %lu saved chunk(s), %llu MB of %llu, in %s; %u unreadable and %u old chunk(s) "
+                  "deleted (madeira.cfg pso-archive, MADEIRA_PSO_ARCHIVE_MB)\n", (unsigned long)list.count, bytes >> 20,
+          cap >> 20, madeira_arch_dir, bad, old);
+}
+
+static int madeira_arch_full(void) {
+  return atomic_load_explicit(&madeira_arch_bytes, memory_order_relaxed) >=
+         atomic_load_explicit(&madeira_arch_cap, memory_order_relaxed);
+}
+
+/* The saved chunks (retained; the caller releases), an empty list while none is
+ * saved yet, or nil when no directory was named. */
+static NSArray *madeira_arch_lookup(id<MTLDevice> device) {
+  static dispatch_once_t once;
+  NSArray *list;
+  if (atomic_load_explicit(&madeira_arch_named, memory_order_acquire) != 2 || !device) return nil;
+  dispatch_once(&once, ^{ madeira_arch_load(device); });
+  os_unfair_lock_lock(&madeira_arch_lock);
+  list = [madeira_arch_list retain];
+  os_unfair_lock_unlock(&madeira_arch_lock);
+  return list;
+}
+
+static void madeira_arch_say(const char *what) {
+  long added = atomic_load_explicit(&madeira_arch_added, memory_order_relaxed);
+  long in = atomic_load_explicit(&madeira_arch_inline, memory_order_relaxed);
+  fprintf(stderr, "[pso-archive] %s: %ld pipelines found in the saved chunks, %ld not (%ld added, avg %.1f ms "
+                  "an add, %ld failed); inline %ld (avg %.1f ms the add, %.1f ms the create from it, %ld created slowly)\n",
+          what,
+          atomic_load_explicit(&madeira_arch_hits, memory_order_relaxed),
+          atomic_load_explicit(&madeira_arch_misses, memory_order_relaxed), added,
+          added ? (double)atomic_load_explicit(&madeira_arch_add_ns, memory_order_relaxed) / 1e6 / added : 0.0,
+          atomic_load_explicit(&madeira_arch_add_failed, memory_order_relaxed), in,
+          in ? (double)atomic_load_explicit(&madeira_arch_inline_add_ns, memory_order_relaxed) / 1e6 / in : 0.0,
+          in ? (double)atomic_load_explicit(&madeira_arch_inline_create_ns, memory_order_relaxed) / 1e6 / in : 0.0,
+          atomic_load_explicit(&madeira_arch_inline_slow, memory_order_relaxed));
+}
+
+static void madeira_arch_note_hit(void) {
+  long n = atomic_fetch_add_explicit(&madeira_arch_hits, 1, memory_order_relaxed) + 1;
+  if (n == 1 || (n % 2000) == 0) madeira_arch_say(n == 1 ? "first pipeline from the saved chunks" : "so far");
+}
+
+/* madeira_arch_q: an archive of n pipelines becomes the next chunk file and joins
+ * the lookup list. The caller keeps its reference. */
+static void madeira_arch_save_archive(id<MTLBinaryArchive> open, unsigned n) {
+  char tmp[1200], path[1200];
+  NSError *err = nil;
+  unsigned k;
+  id<MTLBinaryArchive> a;
+  struct stat st;
+  BOOL ok;
+  if (!open || !n) return;
+  k = madeira_arch_next++;
+  snprintf(tmp, sizeof tmp, "%s/chunk-%u.tmp", madeira_arch_dir, k);
+  snprintf(path, sizeof path, "%s/chunk-%u.metalar", madeira_arch_dir, k);
+  ok = [open serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp]] error:&err];
+  if (!ok || err || rename(tmp, path)) {
+    unlink(tmp);
+    fprintf(stderr, "[pso-archive] chunk %u NOT saved (%u pipelines): %s\n", k, n,
+            err ? [[err localizedDescription] UTF8String] : "rename failed");
+    return;
+  }
+  if (!stat(path, &st)) atomic_fetch_add_explicit(&madeira_arch_bytes, (unsigned long long)st.st_size, memory_order_relaxed);
+  err = nil;
+  a = madeira_arch_open_file(path, &err);
+  if (a && !err) {
+    NSArray *old;
+    os_unfair_lock_lock(&madeira_arch_lock);
+    old = madeira_arch_list;
+    madeira_arch_list = [[old arrayByAddingObject:a] retain];
+    os_unfair_lock_unlock(&madeira_arch_lock);
+    [old release];
+  }
+  [a release];
+  {
+    char what[160];
+    snprintf(what, sizeof what, "chunk %u saved, %u pipelines, %lld KB", k, n,
+             stat(path, &st) ? -1ll : (long long)(st.st_size >> 10));
+    madeira_arch_say(what);
+  }
+}
+
+/* madeira_arch_q: the queue's open archive. */
+static void madeira_arch_save(void) {
+  unsigned n = madeira_arch_open_n;
+  madeira_arch_open_n = 0;
+  madeira_arch_save_archive(madeira_arch_open, n);
+  [madeira_arch_open release];
+  madeira_arch_open = nil;
+}
+
+/* madeira_arch_q: a slot's archive, handed over when it filled up or went idle. */
+static void madeira_arch_save_handed(id<MTLBinaryArchive> open, unsigned n) {
+  dispatch_async(madeira_arch_q, ^{
+    @autoreleasepool { madeira_arch_save_archive(open, n); }
+    [open release];
+  });
+}
+
+/* madeira_arch_q: save the open archive once 10 s have passed without an add. */
+static void madeira_arch_arm(void) {
+  if (madeira_arch_timer) return;
+  madeira_arch_timer = 1;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), madeira_arch_q, ^{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int again = 0;
+    madeira_arch_timer = 0;
+    if (madeira_arch_open_n) {
+      if (now - madeira_arch_last_add >= 9500000000ull) madeira_arch_save();
+      else again = 1;
+    }
+    for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
+      struct madeira_arch_slot *s = &madeira_arch_slots[i];
+      if (!os_unfair_lock_trylock(&s->lock)) { again = 1; continue; }
+      if (s->n && now - s->last >= 9500000000ull) {
+        @autoreleasepool { madeira_arch_save_archive(s->open, s->n); }
+        [s->open release];
+        s->open = nil;
+        s->n = 0;
+      } else if (s->n) {
+        again = 1;
+      }
+      os_unfair_lock_unlock(&s->lock);
+    }
+    if (again) madeira_arch_arm();
+  });
+}
+
+/* A pipeline the saved chunks did not have, created: add its functions to the
+ * open archive. kind 0 render, 1 compute. The descriptor is copied (the copy
+ * holds the functions); its lookup list is cleared. */
+static void madeira_arch_add(id descriptor, int kind) {
+  id copy;
+  if (madeira_arch_full()) return;
+  copy = [descriptor copy];
+  [copy setBinaryArchives:nil];
+  atomic_fetch_add_explicit(&madeira_arch_misses, 1, memory_order_relaxed);
+  dispatch_async(madeira_arch_q, ^{
+    @autoreleasepool {
+      NSError *err = nil;
+      BOOL ok = NO;
+      uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      if (!madeira_arch_open && !madeira_arch_full()) {
+        MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
+        madeira_arch_open = [madeira_arch_device newBinaryArchiveWithDescriptor:desc error:&err];
+        [desc release];
+        err = nil;
+      }
+      if (madeira_arch_open)
+        ok = kind ? [madeira_arch_open addComputePipelineFunctionsWithDescriptor:copy error:&err]
+                  : [madeira_arch_open addRenderPipelineFunctionsWithDescriptor:copy error:&err];
+      [copy release];
+      madeira_arch_last_add = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      if (ok && !err) {
+        atomic_fetch_add_explicit(&madeira_arch_added, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&madeira_arch_add_ns, madeira_arch_last_add - t0, memory_order_relaxed);
+        if (++madeira_arch_open_n >= MADEIRA_ARCH_CHUNK) madeira_arch_save();
+      } else if (atomic_fetch_add_explicit(&madeira_arch_add_failed, 1, memory_order_relaxed) < 3) {
+        fprintf(stderr, "[pso-archive] an add failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "no open archive");
+      }
+      if (madeira_arch_open_n) madeira_arch_arm();
+    }
+  });
+}
+
+/* A pipeline the saved chunks did not have: compiled once by an add to a slot's
+ * archive and created from it; the pipeline (retained), or 0 with *err untouched
+ * when no slot was free or the add refused it (the caller creates and queues it).
+ * kind 0 render, 1 compute. */
+static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int kind, MTLPipelineOption options,
+                                        NSError **err) {
+  struct madeira_arch_slot *s = NULL;
+  obj_handle_t pso = 0;
+  NSError *e = nil;
+  BOOL ok;
+  uint64_t t0, t1, t2;
+  if (!madeira_arch_inline_on() || !madeira_arch_q || madeira_arch_full()) return 0;
+  for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS && !s; i++)
+    if (os_unfair_lock_trylock(&madeira_arch_slots[i].lock)) s = &madeira_arch_slots[i];
+  if (!s) return 0;
+  if (!s->open) {
+    MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
+    s->open = [device newBinaryArchiveWithDescriptor:desc error:&e];
+    [desc release];
+    e = nil;
+  }
+  t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  ok = s->open && (kind ? [s->open addComputePipelineFunctionsWithDescriptor:descriptor error:&e]
+                        : [s->open addRenderPipelineFunctionsWithDescriptor:descriptor error:&e]);
+  t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  if (ok && !e) {
+    [descriptor setBinaryArchives:@[ s->open ]];
+    pso = kind ? (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options
+                                                                  reflection:nil error:err]
+               : (obj_handle_t)[device newRenderPipelineStateWithDescriptor:descriptor options:options
+                                                                 reflection:nil error:err];
+    [descriptor setBinaryArchives:nil];
+    t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    s->last = t2;
+    if (pso) {
+      atomic_fetch_add_explicit(&madeira_arch_misses, 1, memory_order_relaxed);
+      atomic_fetch_add_explicit(&madeira_arch_inline, 1, memory_order_relaxed);
+      atomic_fetch_add_explicit(&madeira_arch_inline_add_ns, t1 - t0, memory_order_relaxed);
+      atomic_fetch_add_explicit(&madeira_arch_inline_create_ns, t2 - t1, memory_order_relaxed);
+      if (t2 - t1 > 20000000ull)   /* not taken from the archive: compiled again */
+        atomic_fetch_add_explicit(&madeira_arch_inline_slow, 1, memory_order_relaxed);
+      if (++s->n >= MADEIRA_ARCH_CHUNK) {
+        madeira_arch_save_handed(s->open, s->n);   /* the queue takes the reference */
+        s->open = nil;
+        s->n = 0;
+      }
+    }
+  } else if (atomic_fetch_add_explicit(&madeira_arch_add_failed, 1, memory_order_relaxed) < 3) {
+    fprintf(stderr, "[pso-archive] an inline add failed: %s\n",
+            e ? [[e localizedDescription] UTF8String] : "no open archive");
+  }
+  os_unfair_lock_unlock(&s->lock);
+  if (pso) dispatch_async(madeira_arch_q, ^{ madeira_arch_arm(); });
+  return pso;
+}
+
 static NTSTATUS
 _MTLDevice_newComputePipelineState(void *obj) {
   struct unixcall_mtldevice_newcomputepso *params = obj;
@@ -1401,8 +1804,28 @@ _MTLDevice_newComputePipelineState(void *obj) {
                                                     count:info->num_binary_archives_for_lookup];
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso =
-      (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
+  NSArray *madeira_arch = descriptor.binaryArchives ? nil : madeira_arch_lookup(device);
+  params->ret_pso = 0;
+  if (madeira_arch.count) {   /* pso-archive: the saved chunks first */
+    descriptor.binaryArchives = madeira_arch;
+    params->ret_pso = (obj_handle_t)[device
+        newComputePipelineStateWithDescriptor:descriptor
+                                      options:(MTLPipelineOption)(options | MTLPipelineOptionFailOnBinaryArchiveMiss)
+                                   reflection:nil
+                                        error:&err];
+    descriptor.binaryArchives = nil;
+    if (params->ret_pso) madeira_arch_note_hit();
+    else err = NULL;
+  }
+  if (!params->ret_pso && madeira_arch)
+    params->ret_pso = madeira_arch_create(device, descriptor, 1, options, &err);
+  if (!params->ret_pso) {
+    err = NULL;
+    params->ret_pso =
+        (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
+    if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 1);
+  }
+  [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
@@ -1685,10 +2108,30 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
-                                                                                              options:options
-                                                                                           reflection:nil
-                                                                                                error:&err];
+  NSArray *madeira_arch = descriptor.binaryArchives ? nil : madeira_arch_lookup((id<MTLDevice>)params->device);
+  params->ret_pso = 0;
+  if (madeira_arch.count) {   /* pso-archive: the saved chunks first */
+    descriptor.binaryArchives = madeira_arch;
+    params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device
+        newRenderPipelineStateWithDescriptor:descriptor
+                                     options:(MTLPipelineOption)(options | MTLPipelineOptionFailOnBinaryArchiveMiss)
+                                  reflection:nil
+                                       error:&err];
+    descriptor.binaryArchives = nil;
+    if (params->ret_pso) madeira_arch_note_hit();
+    else err = NULL;
+  }
+  if (!params->ret_pso && madeira_arch)
+    params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  if (!params->ret_pso) {
+    err = NULL;
+    params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
+                                                                                                options:options
+                                                                                             reflection:nil
+                                                                                                  error:&err];
+    if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
+  }
+  [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
@@ -1784,10 +2227,30 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
-                                                                                              options:options
-                                                                                           reflection:nil
-                                                                                                error:&err];
+  NSArray *madeira_arch = descriptor.binaryArchives ? nil : madeira_arch_lookup((id<MTLDevice>)params->device);
+  params->ret_pso = 0;
+  if (madeira_arch.count) {   /* pso-archive: the saved chunks first */
+    descriptor.binaryArchives = madeira_arch;
+    params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device
+        newRenderPipelineStateWithDescriptor:descriptor
+                                     options:(MTLPipelineOption)(options | MTLPipelineOptionFailOnBinaryArchiveMiss)
+                                  reflection:nil
+                                       error:&err];
+    descriptor.binaryArchives = nil;
+    if (params->ret_pso) madeira_arch_note_hit();
+    else err = NULL;
+  }
+  if (!params->ret_pso && madeira_arch)
+    params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  if (!params->ret_pso) {
+    err = NULL;
+    params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
+                                                                                                options:options
+                                                                                             reflection:nil
+                                                                                                  error:&err];
+    if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
+  }
+  [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
@@ -3059,6 +3522,15 @@ static inline void madeira_log_present_cadence(const char *path, double after) {
   }
 }
 
+/* The performance overlay's frame times (Madeira's Winios.m, owner 2026-10-28):
+ * each present is marked with its drawable's layer, after any frame cap's wait,
+ * so the intervals are the ones the player sees. Weak: a winemetal linked
+ * without the app has no marks. */
+extern void madeira_frame_mark(const void *layer) __attribute__((weak));
+static inline void madeira_frame_mark_drawable(id drawable) {
+  if (madeira_frame_mark && drawable) madeira_frame_mark((const void *)[(id<CAMetalDrawable>)drawable layer]);
+}
+
 /* iOS-Madeira 2026-05-18: exposed for SwiftUI FPS overlay. Reads the
  * atomic counter on the calling thread (typically a 100ms Swift Timer). */
 uint64_t madeira_get_present_count(void) {
@@ -3497,6 +3969,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
   /* ml1050: this call IS the frame boundary on the encode thread. */
   if (madeira_frame_hooks_on())
     ios_frame_encode_present(0);
+  madeira_frame_mark_drawable((id)params->arg);
   /* Frame generation presents both frames itself (madeira_fg_present). */
   if (mode != 2 && madeira_fg_enabled() &&
       madeira_fg_present((id<MTLCommandBuffer>)params->handle, (id<CAMetalDrawable>)params->arg)) {
@@ -3544,6 +4017,7 @@ static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
   madeira_log_present_cadence("presentDrawableAfterMinDuration", params->arg1);
+  madeira_frame_mark_drawable((id)params->arg0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
   return STATUS_SUCCESS;
@@ -3875,6 +4349,7 @@ _MetalLayer_nextDrawable(void *obj) {
       if (madeira_frame_hooks_on())
         ios_frame_encode_present(1);   /* ml1050: a frame that reaches no glass */
       madeira_log_present_cadence("presentSkipped", 0.0);
+      if (madeira_frame_mark) madeira_frame_mark((const void *)params->handle);
       return STATUS_SUCCESS;
     }
     last_acquire = now;
@@ -6867,6 +7342,9 @@ static NTSTATUS _madeira_ctl(void *args) {
   }
   case 6:     /* ml1136: requested fence-chain mode (0 = none) */
     a->ret = (uint32_t)g_madeira_fence_req;
+    break;
+  case 11:    /* pipeline archive directory (pso-archive); ptr = a unix path */
+    if (a->ptr && !wmtr_enabled()) a->ret = madeira_arch_name((const char *)(uintptr_t)a->ptr);
     break;
   case 10: {  /* madeira-bcd: pipeline cache warm-up (tools/patch-winemetal-pso-warm.py); len = kind
                * (0 render, 1 render + vertex descriptor, 2 compute), ptr = { device, info, vd } */
