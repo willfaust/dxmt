@@ -224,6 +224,22 @@ Texture::import(mach_port_t mach_port) {
   return nullptr;
 }
 
+Rc<Texture>
+Texture::shareTo(WMT::Device device) {
+  auto source = current_.ptr();
+  if (!source || !source->texture())
+    return nullptr;
+  Rc<Texture> texture = new Texture(info_, device);
+  texture->mip_bias_ = mip_bias_;
+  WMTTextureInfo info = info_;
+  info.gpu_resource_id = source->gpuResourceID;
+  info.mach_port = 0;
+  auto flags = source->flags();
+  flags.set(TextureAllocationFlag::Shared);
+  texture->rename(new TextureAllocation(texture.ptr(), WMT::Reference<WMT::Texture>(source->texture()), info, flags));
+  return texture;
+}
+
 TextureView &
 Texture::view(TextureViewKey key) {
   return view(key, current_.ptr());
