@@ -31,3 +31,4 @@ executable('dx11_hdr_pq', ['dx11_hdr_pq.cpp'],
 )
 
 executable('dx11_local_share', ['dx11_local_share.cpp'], dependencies: [lib_d3d11, lib_dxgi])
+executable('dx11_typeless_views', ['dx11_typeless_views.cpp'], dependencies: [lib_d3d11, lib_dxgi])

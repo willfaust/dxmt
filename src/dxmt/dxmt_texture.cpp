@@ -1,5 +1,6 @@
 #include "dxmt_texture.hpp"
 #include "dxmt_residency.hpp"
+#include "log/log.hpp"
 #include "wsi_platform.hpp"
 #include <atomic>
 #include <cassert>
@@ -31,6 +32,23 @@ TextureView::TextureView(TextureAllocation *allocation, TextureViewKey key, Text
     allocation(allocation),
     key(key) {
   auto parent = allocation->texture();
+  /* Playport: a view that changes the pixel format of a texture made without
+   * pixelFormatView (a colour typeless family, see
+   * CreateMTLTextureDescriptorInternal) is reported, the first 32 such views, so
+   * a layout change there shows in the log. */
+  if (!(allocation->descriptor->usage() & WMTTextureUsagePixelFormatView)) {
+    unsigned from = ORIGINAL_FORMAT(allocation->descriptor->pixelFormat());
+    unsigned to = ORIGINAL_FORMAT(descriptor.format);
+    auto srgb_pair = [](unsigned a, unsigned b) {
+      return (a == WMTPixelFormatRGBA8Unorm && b == WMTPixelFormatRGBA8Unorm_sRGB) ||
+             (a == WMTPixelFormatBGRA8Unorm && b == WMTPixelFormatBGRA8Unorm_sRGB);
+    };
+    if (from != to && !srgb_pair(from, to) && !srgb_pair(to, from)) {
+      static std::atomic<unsigned> reported{0};
+      if (reported.fetch_add(1, std::memory_order_relaxed) < 32)
+        ERR("[pfv-view] texture format ", from, " viewed as ", to, " without pixelFormatView");
+    }
+  }
   texture = parent.newTextureView(
       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
       descriptor.firstArraySlice, descriptor.arraySize, descriptor.swizzle, gpuResourceID

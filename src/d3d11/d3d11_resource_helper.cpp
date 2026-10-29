@@ -4,6 +4,7 @@
 #include "d3d11_resource.hpp"
 #include "d3d11_1.h"
 #include "util_math.hpp"
+#include "util_env.hpp"
 
 namespace dxmt {
 
@@ -369,8 +370,19 @@ CreateMTLTextureDescriptorInternal(
   }
 
   if (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) {
-    // well this is necessary for passing validation layer
-    metal_usage |= WMTTextureUsagePixelFormatView;
+    /* Playport: pixelFormatView turns off Apple's lossless framebuffer
+     * compression (GPU family 5 and later), and Unity makes its render
+     * textures TYPELESS, so every full-screen pass paid uncompressed
+     * bandwidth. Metal needs the flag only for a view that changes the
+     * component layout; a colour typeless family keeps the layout (UNORM,
+     * SNORM, UINT, SINT, and sRGB, which needs no flag). Depth/stencil
+     * (plane views) and block-compressed formats keep it.
+     * DXMT_TYPELESS_PFV=1 restores the flag on every typeless format. */
+    static const bool always_pfv = env::getEnvVar("DXMT_TYPELESS_PFV") == "1";
+    if (always_pfv ||
+        (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                              MTL_DXGI_FORMAT_BC)))
+      metal_usage |= WMTTextureUsagePixelFormatView;
   }
 
   if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) {
