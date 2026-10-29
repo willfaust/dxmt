@@ -1,4 +1,6 @@
 #include "com/com_pointer.hpp"
+#include <mutex>
+#include <unordered_map>
 #include "d3d11_device.hpp"
 #include "d3d11_enumerable.hpp"
 #include "d3d11_view.hpp"
@@ -17,6 +19,66 @@
 
 namespace dxmt {
 
+/* In-process shared handles. A shared texture's handle normally comes from
+ * D3DKMT and names a mach port registered with the bootstrap server, which an
+ * iOS app may not do. Wine, the game and the host are one process there, so
+ * such a texture gets a handle 0x40000000 | n instead (a real D3DKMT global
+ * handle has both of the top bits set), and the texture's destructor retires
+ * it. OpenSharedResource resolves it here: on the device that made the
+ * texture, to the same object; on another device, to a new texture on that
+ * device over the same Metal texture, as the mach port import does. Handing
+ * the same object to a second device mixed two command queues' encoder ids in
+ * one set of dependency trackers, and DXMT's deptrack assertion
+ * (c - id_before <= Forward) ended the process at a video's first frame.
+ *
+ * An open first takes a reference under the lock, and only while the
+ * application still holds one: a texture whose last reference is gone stays
+ * in the table until its destructor retires the handle, and must not be
+ * revived. The open itself, and the release of that reference, which may
+ * destroy the texture and retire its handle, run outside the lock. */
+struct LocalShare {
+  void *texture;
+  bool (*acquire)(void *texture);
+  HRESULT (*open)(void *texture, MTLD3D11Device *pDevice, REFIID riid, void **ppTexture);
+};
+static std::mutex local_share_mutex;
+static std::unordered_map<uint32_t, LocalShare> local_shares;
+static uint32_t local_share_next = 1;
+constexpr uint32_t kLocalShareTag = 0x40000000u;
+
+static void
+LocalShareAdd(const LocalShare &share, uint32_t &handle) {
+  std::lock_guard<std::mutex> lock(local_share_mutex);
+  if (handle)
+    return;
+  handle = kLocalShareTag | (local_share_next++ & 0x3fffffffu);
+  local_shares[handle] = share;
+}
+
+static void
+LocalShareRemove(uint32_t handle) {
+  std::lock_guard<std::mutex> lock(local_share_mutex);
+  local_shares.erase(handle);
+}
+
+static bool
+IsLocalShare(uintptr_t handle) {
+  return (handle & 0xc0000000u) == kLocalShareTag && handle <= 0xffffffffu;
+}
+
+static HRESULT
+LocalShareOpen(MTLD3D11Device *pDevice, uintptr_t handle, REFIID riid, void **ppTexture) {
+  LocalShare share;
+  {
+    std::lock_guard<std::mutex> lock(local_share_mutex);
+    auto it = local_shares.find((uint32_t)handle);
+    if (it == local_shares.end() || !it->second.acquire(it->second.texture))
+      return E_INVALIDARG;
+    share = it->second;
+  }
+  return share.open(share.texture, pDevice, riid, ppTexture);
+}
+
 #pragma region DeviceTexture
 
 template <typename tag_texture>
@@ -33,6 +95,7 @@ private:
   float min_lod = 0.0;
   D3DKMT_HANDLE local_kmt_ = 0;
   D3DKMT_HANDLE global_kmt_ = 0;
+  uint32_t local_share_ = 0;
 
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
@@ -189,7 +252,50 @@ public:
     return (mip - mip_bias_) + slice * (logicalMips - mip_bias_);
   }
 
+  /* Share this texture within the process (see LocalShareOpen). */
+  void ShareLocally() { LocalShareAdd({this, &AcquireLocalShare, &OpenLocalShare}, local_share_); }
+
+  /* AddRef, unless the public count has already reached zero. */
+  static bool
+  AcquireLocalShare(void *pTexture) {
+    auto self = static_cast<DeviceTexture *>(pTexture);
+    uint32_t count = self->m_refCount.load();
+    while (count)
+      if (self->m_refCount.compare_exchange_weak(count, count + 1))
+        return true;
+    return false;
+  }
+
+  /* Called with the reference AcquireLocalShare took, which it releases. */
+  static HRESULT
+  OpenLocalShare(void *pTexture, MTLD3D11Device *pDevice, REFIID riid, void **ppTexture) {
+    auto self = static_cast<DeviceTexture *>(pTexture);
+    HRESULT hr = self->OpenOn(pDevice, riid, ppTexture);
+    self->Release();
+    return hr;
+  }
+
+  HRESULT
+  OpenOn(MTLD3D11Device *pDevice, REFIID riid, void **ppTexture) {
+    if (this->m_parent == pDevice)
+      return this->QueryInterface(riid, ppTexture);
+    if (renamable_) {
+      /* a renamed texture changes its Metal texture under the other device */
+      ERR("DeviceTexture: cannot open a renamable texture on another device");
+      return E_INVALIDARG;
+    }
+    auto texture = this->underlying_texture_->shareTo(pDevice->GetMTLDevice());
+    if (!texture)
+      return E_FAIL;
+    auto desc = this->desc;
+    Com<DeviceTexture> opened = ref(new DeviceTexture(&desc, std::move(texture), pDevice));
+    opened->SetMipBias(mip_bias_);
+    return opened->QueryInterface(riid, ppTexture);
+  }
+
   ~DeviceTexture() {
+    if (local_share_)
+      LocalShareRemove(local_share_);
     if (local_kmt_) {
       D3DKMT_DESTROYALLOCATION destroy = {};
       destroy.hDevice = this->m_parent->GetLocalD3DKMT();
@@ -360,7 +466,19 @@ public:
     }
 
     if (!(this->desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
-      *pSharedHandle = NULL;
+      /* Unity's video output (WindowsVideoTextureOutput) asks its own render
+       * textures, made without a shared flag, for a shared handle to open
+       * them on the video device, and gives up on NULL: Hollow Knight's
+       * cinematics stayed black. Windows returns NULL here; in one process an
+       * in-process handle costs nothing (see LocalShareOpen), so hand one
+       * out. */
+      ShareLocally();
+      *pSharedHandle = reinterpret_cast<HANDLE>((uintptr_t)local_share_);
+      return S_OK;
+    }
+
+    if (local_share_) {
+      *pSharedHandle = reinterpret_cast<HANDLE>((uintptr_t)local_share_);
       return S_OK;
     }
 
@@ -671,8 +789,22 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     SharedResourceData runtimeData;
     MakeUniqueSharedName(runtimeData.mach_port_name);
     if (!WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
-      ERR("DeviceTexture: Failed to register mach port for shared texture");
-      return E_FAIL;
+      /* An iOS app may not register a service with the bootstrap server, so
+       * no texture can be shared by name there; and with Wine, the game and
+       * the host in one process, nothing opens it by name either. Keep the
+       * texture unshared, as for a missing port above: Media Foundation's
+       * sample allocator asks for MISC_SHARED on every video frame
+       * (MF_SA_D3D11_SHARED_WITHOUT_MUTEX), and E_FAIL here failed every
+       * frame of a video. */
+      static bool said = false;
+      if (!said) { said = true; ERR("DeviceTexture: cannot register a shared texture's mach port; sharing it within the process"); }
+      initialize(std::move(allocation));
+      auto *tex = ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice));
+      tex->SetMipBias(mip_bias);
+      if (!(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
+        tex->ShareLocally();
+      *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(tex);
+      return S_OK;
     }
     runtimeData.dimension = tag::dimension;
     memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
@@ -781,6 +913,12 @@ ImportSharedTextureInternal(
 HRESULT
 ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture) {
   InitReturnPtr(ppTexture);
+
+  if (IsLocalShare(reinterpret_cast<uintptr_t>(hResource))) {
+    if (ppTexture == nullptr)
+      return S_FALSE;
+    return LocalShareOpen(pDevice, reinterpret_cast<uintptr_t>(hResource), riid, ppTexture);
+  }
 
   if (!(reinterpret_cast<uintptr_t>(hResource) & 0xc0000000)) {
     WARN("ImportSharedTexture: Invalid shared handle type");

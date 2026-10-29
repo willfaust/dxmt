@@ -284,6 +284,9 @@ public:
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
 
+  // A second device needs its own dependency tracking over the same Metal texture.
+  Rc<Texture> shareTo(WMT::Device device);
+
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
 
