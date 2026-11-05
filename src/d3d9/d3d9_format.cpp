@@ -1,4 +1,5 @@
 #include "d3d9_format.hpp"
+#include "util_env.hpp"
 
 namespace dxmt {
 
@@ -528,6 +529,20 @@ isColorRTFormat(D3DFORMAT format) {
   case D3DFMT_A8B8G8R8:
   case D3DFMT_X8B8G8R8:
     return true;
+  // Luminance formats as render targets: the storage is R8Unorm / RG8Unorm /
+  // R16Unorm, all colour-renderable on every Metal GPU; a pixel shader's .r
+  // (.rg for A8L8) lands in the luminance channel and the sampler view's
+  // {R,R,R,1} swizzle reads it back as (L, L, L, 1). Native drivers and
+  // DXVK allow them, and a program that builds its own one-channel targets
+  // (ambient occlusion, blur, masks) through the engine's format table gets
+  // a NULL target otherwise and may never finish setting up its frame.
+  // MADEIRA_D3D9_LUMINANCE_RT=0 restores the refusal.
+  case D3DFMT_L8:
+  case D3DFMT_A8L8:
+  case D3DFMT_L16: {
+    static const bool luminanceRT = env::getEnvVar("MADEIRA_D3D9_LUMINANCE_RT") != "0";
+    return luminanceRT;
+  }
   // D3DFMT_R8G8B8 (24-bit RGB) is intentionally not listed: Metal has
   // no padded-RGB8 pixel format and Vulkan/DXVK also reject it. Apps
   // that probe and get NOTAVAILABLE fall back to a 32-bit variant
