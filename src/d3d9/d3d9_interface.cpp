@@ -1225,12 +1225,17 @@ MTLD3D9Interface::CheckDeviceFormatConversionProbe(
   // RGB format with a real red channel. Packed YUV is a valid source (StretchRect
   // YUV->RGB, which real hardware performs though WARP does not); the float-color
   // formats carry no fixed-function blit cap and are rejected as a source, while
-  // remaining valid RGB destinations. isColorRTFormat is exactly the simple-RGB
-  // set for the destination: it excludes luminance, YUV, A8 and the compressed
-  // formats.
+  // remaining valid RGB destinations. isColorRTFormat is the simple-RGB set for
+  // the destination, minus the luminance formats it may accept as render
+  // targets (MADEIRA_D3D9_LUMINANCE_RT): wined3d's conversion table never has
+  // them, so they stay out of StretchRect conversions on both sides. It
+  // excludes YUV, A8 and the compressed formats on its own.
+  const auto simple_rgb = [](D3DFORMAT f) {
+    return isColorRTFormat(f) && f != D3DFMT_L8 && f != D3DFMT_A8L8 && f != D3DFMT_L16;
+  };
   const bool src_blittable = SourceFormat == D3DFMT_YUY2 || SourceFormat == D3DFMT_UYVY ||
-                             (isColorRTFormat(SourceFormat) && !IsFloatColorFormat(SourceFormat));
-  if (!src_blittable || !isColorRTFormat(TargetFormat))
+                             (simple_rgb(SourceFormat) && !IsFloatColorFormat(SourceFormat));
+  if (!src_blittable || !simple_rgb(TargetFormat))
     return D3DERR_NOTAVAILABLE;
   return D3D_OK;
 }
