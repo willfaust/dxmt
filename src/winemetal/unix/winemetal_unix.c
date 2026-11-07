@@ -600,6 +600,365 @@ static void madeira_gpu_meter_attach(id<MTLCommandBuffer> cmdbuf) {
   }];
 }
 
+/* madeira-duo gpu-pass-timing: GPU time per Metal encoder, measured on the device.
+ * madeira.cfg gpu-pass-timing = P (seconds, 0 = off): for one second in every P,
+ * every render, compute and blit encoder gets Metal timestamp samples at its stage
+ * boundaries (render: vertex start/end and fragment start/end; compute and blit:
+ * encoder start/end) in a per-command-buffer MTLCounterSampleBuffer. When the
+ * buffer completes, the samples become per-encoder GPU intervals, summed per pass
+ * (keyed by the encoder label with its sequence number dropped, so set
+ * encoder-labels = 1 for names) and logged as [gpu-pass] once per window:
+ * GPU busy per frame, the union of the encoder intervals (what's left are gaps
+ * where no encoder ran: fence waits, scheduling), the overlap between encoders,
+ * and the passes ranked by GPU time. Every gpu-pass-dump-s seconds (default 30)
+ * the next three command buffers are also listed encoder by encoder, in order,
+ * with start offsets, so gaps and overlaps can be seen in place. Off = nothing
+ * attached, one relaxed load per encoder. Remote (wmtr) command buffers are not
+ * timed. */
+#define GPT_STATES 12
+#define GPT_SAMPLES 2048
+#define GPT_MAX_ENC (GPT_SAMPLES / 4)
+#define GPT_KEYS 512
+struct gpt_enc {
+  id encoder;              /* only compared, never messaged after endEncoding */
+  uint16_t base, nsamp;
+  uint16_t w, h;
+  uint8_t kind;            /* 0 render, 1 compute, 2 blit */
+  char label[56];
+};
+struct gpt_cb {
+  int busy;
+  id cb;                   /* the command buffer while it is being encoded; nil once committed */
+  id<MTLCounterSampleBuffer> sb;
+  unsigned n_enc, n_samp;
+  struct gpt_enc enc[GPT_MAX_ENC];
+};
+struct gpt_key {
+  char label[56]; uint8_t kind; uint16_t w, h;
+  unsigned count;
+  double span_ns, vtx_ns, frag_ns;
+};
+static int g_gpt_period = -1, g_gpt_dump_s = 30;
+static _Atomic int g_gpt_open;                 /* states in use; 0 = endEncoding skips the search */
+static os_unfair_lock g_gpt_lock = OS_UNFAIR_LOCK_INIT;
+static struct gpt_cb *g_gpt_state[GPT_STATES];
+static id<MTLCounterSet> g_gpt_set;
+static int g_gpt_ok = -1;                      /* -1 unchecked, 0 unsupported, 1 ready */
+static double g_gpt_ns_per_tick;               /* 0 until two GPU/CPU clock pairs are taken */
+static uint64_t g_gpt_ref_gpu, g_gpt_ref_ns;
+static struct gpt_key g_gpt_keys[GPT_KEYS];
+static unsigned g_gpt_nkeys, g_gpt_dump_left;
+static uint64_t g_gpt_win_start, g_gpt_last_dump;
+static unsigned g_gpt_cbs, g_gpt_encs, g_gpt_lost, g_gpt_nosamp;
+static double g_gpt_busy_ns, g_gpt_union_ns, g_gpt_sum_ns;
+static _Atomic unsigned g_gpt_presents;
+
+static uint64_t gpt_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static int gpt_period(void) {
+  if (g_gpt_period < 0) {
+    g_gpt_dump_s = (int)madeira_cfg_int("gpu-pass-dump-s", 30);
+    g_gpt_period = (int)madeira_cfg_int("gpu-pass-timing", 0);
+    if (g_gpt_period < 0) g_gpt_period = 0;
+  }
+  return g_gpt_period;
+}
+
+/* Whether a command buffer starting to encode now is timed: inside the first
+ * second of each period. */
+static int gpt_window(void) {
+  int p = gpt_period();
+  if (!p) return 0;
+  return (gpt_now_ns() / 1000000000ull) % (uint64_t)p == 0;
+}
+
+static int gpt_device_ready(id<MTLDevice> dev) {
+  if (g_gpt_ok >= 0) return g_gpt_ok;
+  g_gpt_ok = 0;
+  if (![dev respondsToSelector:@selector(supportsCounterSampling:)] ||
+      ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+    fprintf(stderr, "[gpu-pass] madeira-duo: this GPU can't sample counters at stage boundaries; gpu-pass-timing stays off\n");
+    return 0;
+  }
+  for (id<MTLCounterSet> s in dev.counterSets)
+    if ([s.name isEqualToString:MTLCommonCounterSetTimestamp]) { g_gpt_set = [s retain]; break; }
+  if (!g_gpt_set) {
+    fprintf(stderr, "[gpu-pass] madeira-duo: no timestamp counter set; gpu-pass-timing stays off\n");
+    return 0;
+  }
+  g_gpt_ok = 1;
+  fprintf(stderr, "[gpu-pass] madeira-duo: per-encoder GPU timing on, 1 s in every %d s, %d samples per command buffer\n",
+          g_gpt_period, GPT_SAMPLES);
+  return 1;
+}
+
+/* GPU timestamp ticks to nanoseconds: pairs of (GPU timestamp, our clock) taken
+ * at least a second apart. */
+static void gpt_calibrate(id<MTLDevice> dev) {
+  MTLTimestamp cpu = 0, gpu = 0;
+  uint64_t ns;
+  [dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
+  ns = gpt_now_ns();
+  if (!g_gpt_ref_ns) { g_gpt_ref_gpu = gpu; g_gpt_ref_ns = ns; return; }
+  if (ns - g_gpt_ref_ns < 1000000000ull || gpu <= g_gpt_ref_gpu) return;
+  {
+    double r = (double)(ns - g_gpt_ref_ns) / (double)(gpu - g_gpt_ref_gpu);
+    if (!g_gpt_ns_per_tick)
+      fprintf(stderr, "[gpu-pass] madeira-duo: GPU timestamps run at %.4f ns per tick\n", r);
+    g_gpt_ns_per_tick = r;
+  }
+  g_gpt_ref_gpu = gpu; g_gpt_ref_ns = ns;
+}
+
+/* The timing state of a command buffer being encoded; a new one when the buffer
+ * starts encoding inside a window (create). Caller holds g_gpt_lock. */
+static struct gpt_cb *gpt_find_locked(id cb, int create) {
+  struct gpt_cb *freeslot = NULL;
+  for (unsigned i = 0; i < GPT_STATES; i++) {
+    struct gpt_cb *g = g_gpt_state[i];
+    if (g && g->busy && g->cb == cb) return g;
+  }
+  if (!create) return NULL;
+  for (unsigned i = 0; i < GPT_STATES && !freeslot; i++) {
+    if (!g_gpt_state[i]) g_gpt_state[i] = calloc(1, sizeof(struct gpt_cb));
+    if (g_gpt_state[i] && !g_gpt_state[i]->busy) freeslot = g_gpt_state[i];
+  }
+  if (!freeslot) { g_gpt_lost++; return NULL; }
+  if (!freeslot->sb) {
+    MTLCounterSampleBufferDescriptor *d = [[MTLCounterSampleBufferDescriptor alloc] init];
+    NSError *err = nil;
+    d.counterSet = g_gpt_set;
+    d.storageMode = MTLStorageModeShared;
+    d.sampleCount = GPT_SAMPLES;
+    d.label = @"madeira gpu-pass-timing";
+    freeslot->sb = [[(id<MTLCommandBuffer>)cb device] newCounterSampleBufferWithDescriptor:d error:&err];
+    [d release];
+    if (!freeslot->sb) {
+      fprintf(stderr, "[gpu-pass] madeira-duo: no counter sample buffer (%s); gpu-pass-timing off\n",
+              err ? err.localizedDescription.UTF8String : "no error given");
+      g_gpt_ok = 0;
+      return NULL;
+    }
+  }
+  freeslot->busy = 1; freeslot->cb = cb; freeslot->n_enc = 0; freeslot->n_samp = 0;
+  atomic_fetch_add_explicit(&g_gpt_open, 1, memory_order_relaxed);
+  return freeslot;
+}
+
+/* Reserve samples for an encoder about to be created on cb: returns the state
+ * and sets *idx, or NULL when this encoder isn't timed. */
+static struct gpt_cb *gpt_begin(id cb, unsigned kind, unsigned nsamp, unsigned w, unsigned h, unsigned *idx) {
+  struct gpt_cb *g;
+  if (!gpt_period() || !cb) return NULL;
+  if (g_gpt_ok == 0) return NULL;
+  os_unfair_lock_lock(&g_gpt_lock);
+  g = gpt_find_locked(cb, 0);
+  if (!g && gpt_window() && gpt_device_ready([(id<MTLCommandBuffer>)cb device])) {
+    gpt_calibrate([(id<MTLCommandBuffer>)cb device]);
+    g = gpt_find_locked(cb, 1);
+  }
+  if (g && (g->n_enc >= GPT_MAX_ENC || g->n_samp + nsamp > GPT_SAMPLES)) g = NULL;
+  if (g) {
+    struct gpt_enc *e = &g->enc[g->n_enc];
+    e->encoder = nil; e->base = (uint16_t)g->n_samp; e->nsamp = (uint16_t)nsamp;
+    e->w = (uint16_t)(w > 65535 ? 65535 : w); e->h = (uint16_t)(h > 65535 ? 65535 : h);
+    e->kind = (uint8_t)kind; e->label[0] = 0;
+    *idx = g->n_enc++; g->n_samp += nsamp;
+  }
+  os_unfair_lock_unlock(&g_gpt_lock);
+  return g;
+}
+
+static void gpt_created(struct gpt_cb *g, unsigned idx, id encoder) {
+  if (!g) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  if (encoder) g->enc[idx].encoder = encoder;
+  else g->enc[idx].nsamp = 0;   /* the encoder wasn't created: nothing to read */
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+/* At endEncoding: keep the encoder's label (set right after it was created). */
+static void gpt_end(id encoder) {
+  if (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed)) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  for (unsigned i = 0; i < GPT_STATES; i++) {
+    struct gpt_cb *g = g_gpt_state[i];
+    if (!g || !g->busy || !g->cb || !g->n_enc) continue;
+    for (unsigned k = g->n_enc; k-- > 0;) {
+      if (g->enc[k].encoder != encoder) continue;
+      NSString *l = [(id<MTLCommandEncoder>)encoder label];
+      const char *s = l ? l.UTF8String : NULL;
+      if (s) {   /* drop the "#<seq>" so passes of the same kind sum together */
+        char *o = g->enc[k].label, *end = o + sizeof g->enc[k].label - 1;
+        while (*s && o < end) {
+          if (*s == '#') { s++; while (*s >= '0' && *s <= '9') s++; continue; }
+          *o++ = *s++;
+        }
+        *o = 0;
+      }
+      g->enc[k].encoder = nil;
+      os_unfair_lock_unlock(&g_gpt_lock);
+      return;
+    }
+  }
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+static int gpt_cmp_iv(const void *a, const void *b) {
+  const uint64_t *x = a, *y = b;
+  return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+static int gpt_cmp_key(const void *a, const void *b) {
+  const struct gpt_key *x = a, *y = b;
+  return x->span_ns < y->span_ns ? 1 : x->span_ns > y->span_ns ? -1 : 0;
+}
+
+static void gpt_report_locked(uint64_t now) {
+  unsigned presents = atomic_exchange_explicit(&g_gpt_presents, 0, memory_order_relaxed);
+  double f = presents ? (double)presents : 1.0, total = 0;
+  unsigned i, shown;
+  if (!g_gpt_cbs) return;
+  qsort(g_gpt_keys, g_gpt_nkeys, sizeof g_gpt_keys[0], gpt_cmp_key);
+  for (i = 0; i < g_gpt_nkeys; i++) total += g_gpt_keys[i].span_ns;
+  fprintf(stderr, "[gpu-pass] window: %u presents, %u command buffers, %u encoders timed, %u without samples (%u buffers missed); per frame: "
+          "GPU busy %.2f ms, encoders running %.2f ms (gaps %.2f ms), encoder time summed %.2f ms (overlap %.2f ms)\n",
+          presents, g_gpt_cbs, g_gpt_encs, g_gpt_nosamp, g_gpt_lost, g_gpt_busy_ns / f / 1e6, g_gpt_union_ns / f / 1e6,
+          (g_gpt_busy_ns - g_gpt_union_ns) / f / 1e6, g_gpt_sum_ns / f / 1e6, (g_gpt_sum_ns - g_gpt_union_ns) / f / 1e6);
+  for (i = 0, shown = 0; i < g_gpt_nkeys && shown < 40; i++, shown++) {
+    struct gpt_key *k = &g_gpt_keys[i];
+    fprintf(stderr, "[gpu-pass] %2u %6.2f ms/f %4.1f%% x%-5.1f %c %4ux%-4u vtx %5.2f frag %5.2f | %s\n", i + 1,
+            k->span_ns / f / 1e6, total > 0 ? 100.0 * k->span_ns / total : 0.0, k->count / f,
+            k->kind == 0 ? 'R' : k->kind == 1 ? 'C' : 'B', k->w, k->h, k->vtx_ns / f / 1e6, k->frag_ns / f / 1e6,
+            k->label[0] ? k->label : "(no label: encoder-labels = 1)");
+  }
+  g_gpt_nkeys = 0; g_gpt_cbs = 0; g_gpt_encs = 0; g_gpt_lost = 0; g_gpt_nosamp = 0;
+  g_gpt_busy_ns = g_gpt_union_ns = g_gpt_sum_ns = 0;
+  g_gpt_win_start = 0;
+  (void)now;
+}
+
+static void gpt_complete(struct gpt_cb *g, id<MTLCommandBuffer> buffer) {
+  NSData *data = nil;
+  const MTLCounterResultTimestamp *ts;
+  uint64_t (*iv)[2] = NULL, cb0 = 0;
+  unsigned n = 0, i, dump = 0;
+  double npt, union_ns = 0, sum_ns = 0, busy_ns;
+  if (g->n_samp && g_gpt_ns_per_tick > 0)
+    data = [g->sb resolveCounterRange:NSMakeRange(0, g->n_samp)];
+  if (data.length < g->n_samp * sizeof(MTLCounterResultTimestamp)) data = nil;
+  busy_ns = (buffer.GPUEndTime - buffer.GPUStartTime) * 1e9;
+  os_unfair_lock_lock(&g_gpt_lock);
+  npt = g_gpt_ns_per_tick;
+  if (data && (iv = malloc(sizeof *iv * g->n_enc))) {
+    uint64_t now = gpt_now_ns();
+    ts = data.bytes;
+    if (!g_gpt_dump_left && g_gpt_dump_s > 0 && (!g_gpt_last_dump || now - g_gpt_last_dump >= (uint64_t)g_gpt_dump_s * 1000000000ull)) {
+      g_gpt_last_dump = now; g_gpt_dump_left = 3;   /* about one frame's command buffers */
+    }
+    if (g_gpt_dump_left && g->n_enc >= 5) { dump = 1; g_gpt_dump_left--; }
+    for (i = 0; i < g->n_enc; i++) {
+      const struct gpt_enc *e = &g->enc[i];
+      uint64_t s = ~0ull, t = 0, v = 0, fr = 0;
+      unsigned k;
+      if (!e->nsamp) continue;
+      for (k = 0; k < e->nsamp; k++) {
+        uint64_t x = ts[e->base + k].timestamp;
+        if (x == MTLCounterErrorValue || !x) continue;
+        if (x < s) s = x;
+        if (x > t) t = x;
+      }
+      if (t <= s) { g_gpt_nosamp++; continue; }   /* no usable samples (all zero or MTLCounterErrorValue) */
+      if (e->kind == 0) {
+        uint64_t a = ts[e->base].timestamp, b = ts[e->base + 1].timestamp;
+        uint64_t c = ts[e->base + 2].timestamp, d = ts[e->base + 3].timestamp;
+        if (a != MTLCounterErrorValue && b != MTLCounterErrorValue && b > a) v = b - a;
+        if (c != MTLCounterErrorValue && d != MTLCounterErrorValue && d > c) fr = d - c;
+      }
+      if (!n || s < cb0) cb0 = s;
+      iv[n][0] = s; iv[n][1] = t; n++;
+      sum_ns += (t - s) * npt;
+      {   /* sum per pass */
+        struct gpt_key *key = NULL;
+        unsigned j;
+        for (j = 0; j < g_gpt_nkeys; j++)
+          if (g_gpt_keys[j].kind == e->kind && g_gpt_keys[j].w == e->w && g_gpt_keys[j].h == e->h &&
+              !strcmp(g_gpt_keys[j].label, e->label)) { key = &g_gpt_keys[j]; break; }
+        if (!key && g_gpt_nkeys < GPT_KEYS) {
+          key = &g_gpt_keys[g_gpt_nkeys++];
+          memset(key, 0, sizeof *key);
+          memcpy(key->label, e->label, sizeof key->label);
+          key->kind = e->kind; key->w = e->w; key->h = e->h;
+        }
+        if (key) { key->count++; key->span_ns += (t - s) * npt; key->vtx_ns += v * npt; key->frag_ns += fr * npt; }
+      }
+    }
+    if (dump) {
+      fprintf(stderr, "[gpu-pass-dump] command buffer: GPU %.2f ms, %u encoders (start offset us, span us, vtx us, frag us)\n",
+              busy_ns / 1e3 / 1e3, g->n_enc);
+      for (i = 0; i < g->n_enc && i < 400; i++) {
+        const struct gpt_enc *e = &g->enc[i];
+        uint64_t a = ~0ull, b = 0;
+        unsigned k;
+        if (!e->nsamp) continue;
+        for (k = 0; k < e->nsamp; k++) {
+          uint64_t x = ts[e->base + k].timestamp;
+          if (x == MTLCounterErrorValue || !x) continue;
+          if (x < a) a = x;
+          if (x > b) b = x;
+        }
+        if (b <= a) { fprintf(stderr, "[gpu-pass-dump] %3u  (no samples) %c %ux%u %s\n", i, e->kind == 0 ? 'R' : e->kind == 1 ? 'C' : 'B', e->w, e->h, e->label); continue; }
+        fprintf(stderr, "[gpu-pass-dump] %3u %8.1f %7.1f", i, (a - cb0) * npt / 1e3, (b - a) * npt / 1e3);
+        if (e->kind == 0) {
+          uint64_t p = ts[e->base].timestamp, q = ts[e->base + 1].timestamp, r = ts[e->base + 2].timestamp, s2 = ts[e->base + 3].timestamp;
+          fprintf(stderr, " %7.1f %7.1f", (p != MTLCounterErrorValue && q > p) ? (q - p) * npt / 1e3 : 0.0,
+                  (r != MTLCounterErrorValue && s2 > r) ? (s2 - r) * npt / 1e3 : 0.0);
+        } else fprintf(stderr, "       -       -");
+        fprintf(stderr, " %c %ux%u %s\n", e->kind == 0 ? 'R' : e->kind == 1 ? 'C' : 'B', e->w, e->h, e->label);
+      }
+    }
+    qsort(iv, n, sizeof *iv, gpt_cmp_iv);
+    {
+      uint64_t cs = 0, ce = 0;
+      for (i = 0; i < n; i++) {
+        if (!i || iv[i][0] > ce) { if (i) union_ns += (ce - cs) * npt; cs = iv[i][0]; ce = iv[i][1]; }
+        else if (iv[i][1] > ce) ce = iv[i][1];
+      }
+      if (n) union_ns += (ce - cs) * npt;
+    }
+    free(iv);
+    g_gpt_cbs++; g_gpt_encs += n;
+    if (busy_ns > 0) g_gpt_busy_ns += busy_ns;
+    g_gpt_union_ns += union_ns; g_gpt_sum_ns += sum_ns;
+    if (!g_gpt_win_start) g_gpt_win_start = now;
+  }
+  g->busy = 0; g->cb = nil;
+  atomic_fetch_sub_explicit(&g_gpt_open, 1, memory_order_relaxed);
+  /* one report per period, once the window's buffers have come back (or 3 s on,
+   * should a timed buffer never complete) */
+  if (g_gpt_cbs && !gpt_window() &&
+      (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed) || gpt_now_ns() - g_gpt_win_start >= 3000000000ull))
+    gpt_report_locked(gpt_now_ns());
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+/* At commit: read the samples once the GPU is done with the buffer. */
+static void gpt_commit(id<MTLCommandBuffer> cb) {
+  struct gpt_cb *g;
+  if (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed)) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  g = gpt_find_locked(cb, 0);
+  if (g) g->cb = nil;
+  os_unfair_lock_unlock(&g_gpt_lock);
+  if (!g) return;
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> buffer) { gpt_complete(g, buffer); }];
+}
+
+/* Presents inside the timed second: the frames the window's numbers divide by. */
+static void gpt_note_present(void) {
+  if (g_gpt_ok == 1 && gpt_window())
+    atomic_fetch_add_explicit(&g_gpt_presents, 1, memory_order_relaxed);
+}
+
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
@@ -625,6 +984,7 @@ _MTLCommandBuffer_commit(void *obj) {
   }
   if (atomic_load_explicit(&g_madeira_gpu_meter, memory_order_relaxed))
     madeira_gpu_meter_attach((id<MTLCommandBuffer>)params->handle);
+  gpt_commit((id<MTLCommandBuffer>)params->handle);   /* madeira-duo gpu-pass-timing */
   [(id<MTLCommandBuffer>)params->handle commit];
   return STATUS_SUCCESS;
 }
@@ -1846,7 +2206,19 @@ _MTLCommandBuffer_blitCommandEncoder(void *obj) {
     wmtr_enc_note(params->ret, params->handle);  /* ml820: blit destinations read back per cmdbuf */
     return STATUS_SUCCESS;
   }
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoder];
+  {   /* madeira-duo gpu-pass-timing: a timed blit takes its samples through a pass descriptor */
+    unsigned gi = 0;
+    struct gpt_cb *gt = gpt_begin((id)params->handle, 2, 2, 0, 0, &gi);
+    if (gt) {
+      MTLBlitPassDescriptor *bd = [MTLBlitPassDescriptor blitPassDescriptor];
+      bd.sampleBufferAttachments[0].sampleBuffer = gt->sb;
+      bd.sampleBufferAttachments[0].startOfEncoderSampleIndex = gt->enc[gi].base;
+      bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = gt->enc[gi].base + 1;
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoderWithDescriptor:bd];
+      gpt_created(gt, gi, (id)params->ret);
+    } else
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoder];
+  }
   if (params->ret && madeira_frame_hooks_on()) ios_frame_pass(1, 0, 0, 0);
   return STATUS_SUCCESS;
 }
@@ -1864,8 +2236,21 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
     if (!params->ret) fprintf(stderr, "[wmt-remote] host refused a compute encoder\n");
     return STATUS_SUCCESS;
   }
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle
-      computeCommandEncoderWithDispatchType:params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+  {   /* madeira-duo gpu-pass-timing: a timed compute encoder takes its samples through a pass descriptor */
+    unsigned gi = 0;
+    struct gpt_cb *gt = gpt_begin((id)params->handle, 1, 2, 0, 0, &gi);
+    if (gt) {
+      MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+      cd.dispatchType = params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+      cd.sampleBufferAttachments[0].sampleBuffer = gt->sb;
+      cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = gt->enc[gi].base;
+      cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = gt->enc[gi].base + 1;
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle computeCommandEncoderWithDescriptor:cd];
+      gpt_created(gt, gi, (id)params->ret);
+    } else
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle
+          computeCommandEncoderWithDispatchType:params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+  }
   if (params->ret && madeira_frame_hooks_on()) ios_frame_pass(2, 0, 0, 0);
   return STATUS_SUCCESS;
 }
@@ -1965,7 +2350,26 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
+  {   /* madeira-duo gpu-pass-timing: vertex and fragment start/end samples for a timed pass */
+    unsigned gi = 0, gw = info->render_target_width, gh = info->render_target_height;
+    struct gpt_cb *gt;
+    if (!gw && gpt_period()) {
+      id<MTLTexture> t = (id<MTLTexture>)(info->colors[0].texture ? info->colors[0].texture : info->depth.texture);
+      unsigned lv = info->colors[0].texture ? info->colors[0].level : info->depth.level;
+      if (t) { gw = (unsigned)(t.width >> lv); gh = (unsigned)(t.height >> lv); if (!gw) gw = 1; if (!gh) gh = 1; }
+    }
+    gt = gpt_begin((id)params->handle, 0, 4, gw, gh, &gi);
+    if (gt) {
+      MTLRenderPassSampleBufferAttachmentDescriptor *sa = descriptor.sampleBufferAttachments[0];
+      sa.sampleBuffer = gt->sb;
+      sa.startOfVertexSampleIndex = gt->enc[gi].base;
+      sa.endOfVertexSampleIndex = gt->enc[gi].base + 1;
+      sa.startOfFragmentSampleIndex = gt->enc[gi].base + 2;
+      sa.endOfFragmentSampleIndex = gt->enc[gi].base + 3;
+    }
+    params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
+    gpt_created(gt, gi, (id)params->ret);
+  }
 
   /* Count realized native passes, including clears and the final present.
    * No new PE ABI or emulated hot-path counters are needed. */
@@ -2001,6 +2405,7 @@ _MTLCommandEncoder_endEncoding(void *obj) {
     wmtr_call(RM_OP_END_ENCODING, &a, sizeof a, 0, 0, 0);
     return STATUS_SUCCESS;
   }
+  gpt_end((id)params->handle);   /* madeira-duo gpu-pass-timing: keep the label */
   [(id<MTLCommandEncoder>)params->handle endEncoding];
   return STATUS_SUCCESS;
 }
@@ -4013,6 +4418,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     return STATUS_SUCCESS;
   }
   int mode = g_madeira_vsync_mode;
+  gpt_note_present();   /* madeira-duo gpu-pass-timing */
   {   /* madeira-bcd fps-gov (tools/patch-winemetal-fps-cap.py): the governor's frame cap, opt-in */
     extern unsigned long long ios_fps_cap_dxmt_pace(void);
     unsigned long long fps_cap_ns = ios_fps_cap_dxmt_pace();
@@ -4070,6 +4476,7 @@ static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
   madeira_log_present_cadence("presentDrawableAfterMinDuration", params->arg1);
+  gpt_note_present();   /* madeira-duo gpu-pass-timing */
   madeira_frame_mark_drawable((id)params->arg0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
