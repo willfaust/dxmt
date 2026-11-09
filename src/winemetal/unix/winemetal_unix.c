@@ -1918,6 +1918,9 @@ static void madeira_arch_load(id<MTLDevice> device) {
           cap >> 20, madeira_arch_dir, bad, old);
 }
 
+static int madeira_arch_in_use(void) {   /* madeira-duo overlay-shader: lookups are on */
+  return atomic_load_explicit(&madeira_arch_named, memory_order_acquire) == 2;
+}
 static int madeira_arch_full(void) {
   return atomic_load_explicit(&madeira_arch_bytes, memory_order_relaxed) >=
          atomic_load_explicit(&madeira_arch_cap, memory_order_relaxed);
@@ -1954,6 +1957,53 @@ static void madeira_arch_say(const char *what) {
 static void madeira_arch_note_hit(void) {
   long n = atomic_fetch_add_explicit(&madeira_arch_hits, 1, memory_order_relaxed) + 1;
   if (n == 1 || (n % 2000) == 0) madeira_arch_say(n == 1 ? "first pipeline from the saved chunks" : "so far");
+}
+
+/* madeira-duo overlay-shader: pipelines the saved chunks did not have, compiled for the
+ * game (inline add, queued add, or a plain create once the archive is full); pso-warm's
+ * own background compiles are left out (madeira_pso_warm_self). One relaxed add on a
+ * path that compiles anyway; read by madeira_shader_overlay_stats. */
+static _Atomic unsigned long long madeira_ovl_arch_miss;
+static _Thread_local int madeira_pso_warm_self;
+static void madeira_ovl_note_miss(void) {
+  if (!madeira_pso_warm_self) atomic_fetch_add_explicit(&madeira_ovl_arch_miss, 1, memory_order_relaxed);
+}
+
+/* madeira-duo overlay-shader: the performance overlay's shader cells, read once per
+ * overlay tick. madeira-d3d12 keeps its counts after the fps-gov fields of the counter
+ * block it publishes with MadeiraCtl op 5 (struct mad_xp in madeira_d3d12.c; byte 184,
+ * after struct ios_xp_pe and struct ios_xp_pe_cap in server_ios.c). Cumulative counts
+ * (the overlay takes the rate) and current queue depths:
+ *   shader_misses    stages madeira-d3d12's shader cache did not have (converted or refused)
+ *   pipeline_misses  pipelines the pso-archive did not have, compiled for the game
+ *   pso_queue        pso-async: pipelines a draw is waiting for, queued or being built
+ *   pso_background   pso-create-build / cs-create-build: queued at creation, not built yet
+ * flags: 1 = madeira-d3d12's block is there, 2 = its shader cache is on, 4 = pso-async
+ * is on, 8 = the pso-archive is in use. Without the block the d3d12 figures are 0. */
+#define MADEIRA_XP_SHADER_AT 184
+struct madeira_xp_shader { int64_t magic, flags, sc_miss, pa_wait, pcb_wait; };
+extern volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;
+void madeira_shader_overlay_stats(unsigned long long *shader_misses, unsigned long long *pipeline_misses,
+                                  long long *pso_queue, long long *pso_background, int *flags) {
+  uint64_t block = ios_xp_pe_block, len = ios_xp_pe_len;
+  int f = madeira_arch_in_use() ? 8 : 0;
+  *shader_misses = 0; *pso_queue = 0; *pso_background = 0;
+  *pipeline_misses = atomic_load_explicit(&madeira_ovl_arch_miss, memory_order_relaxed);
+  /* The block is the game process's memory, which goes when the game exits (Steam can
+   * stay): read it with vm_read_overwrite, as server_ios.c reads guest memory, so a
+   * stale address gives no figures instead of a fault. */
+  if (block && len >= MADEIRA_XP_SHADER_AT + sizeof(struct madeira_xp_shader)) {
+    struct madeira_xp_shader x;
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(block + MADEIRA_XP_SHADER_AT), sizeof x, (vm_address_t)&x,
+                          &got) == KERN_SUCCESS && got == sizeof x && x.magic == 0x31304448534d4d4dLL) {
+      f |= 1 | (int)(x.flags & 3) << 1;
+      *shader_misses = (unsigned long long)x.sc_miss;
+      *pso_queue = x.pa_wait > 0 ? x.pa_wait : 0;
+      *pso_background = x.pcb_wait > 0 ? x.pcb_wait : 0;
+    }
+  }
+  *flags = f;
 }
 
 /* madeira_arch_q: an archive of n pipelines becomes the next chunk file and joins
@@ -2177,8 +2227,10 @@ _MTLDevice_newComputePipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create(device, descriptor, 1, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso =
@@ -2526,8 +2578,10 @@ _MTLDevice_newRenderPipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
@@ -2645,8 +2699,10 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
@@ -7535,6 +7591,7 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
     @autoreleasepool {
       uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       obj_handle_t pso = 0;
+      madeira_pso_warm_self = 1;   /* madeira-duo overlay-shader: not a miss the game waits for */
       if (kind == 2) {
         struct unixcall_mtldevice_newcomputepso p;
         memset(&p, 0, sizeof p);
@@ -7554,6 +7611,7 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
         _MTLDevice_newRenderPipelineState(&p);
         pso = p.ret_pso;
       }
+      madeira_pso_warm_self = 0;
       madeira_pso_warm_note(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, pso != 0);
       if (pso) [(id)pso release];
       if (f0) [(id)f0 release];
