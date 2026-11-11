@@ -377,9 +377,11 @@ CreateMTLTextureDescriptorInternal(
      * component layout; a colour typeless family keeps the layout (UNORM,
      * SNORM, UINT, SINT, and sRGB, which needs no flag). Depth/stencil
      * (plane views) and block-compressed formats keep it.
-     * DXMT_TYPELESS_PFV=1 restores the flag on every typeless format. */
+     * DXMT_TYPELESS_COMPRESSION=1 opts in; DXMT_TYPELESS_PFV=1 restores
+     * the flag on every typeless format. */
+    static const bool compression = env::getEnvVar("DXMT_TYPELESS_COMPRESSION") == "1";
     static const bool always_pfv = env::getEnvVar("DXMT_TYPELESS_PFV") == "1";
-    if (always_pfv ||
+    if (!compression || always_pfv ||
         (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
                               MTL_DXGI_FORMAT_BC)))
       metal_usage |= WMTTextureUsagePixelFormatView;
