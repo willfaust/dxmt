@@ -6801,8 +6801,24 @@ _MTLHeap_newBuffer(void *obj) {
 static NTSTATUS
 _MTLHeap_newTexture(void *obj) {
   struct unixcall_mtlheap_newtexture *params = obj;
-  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   struct WMTTextureInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    if (!info) return STATUS_INVALID_PARAMETER;
+    info->mach_port = 0;
+    info->gpu_resource_id = 0;
+    struct { struct rm_heap_new_texture header; struct WMTTextureInfo info; } payload = {
+      { params->heap, params->offset }, *info
+    };
+    _Static_assert(sizeof(payload) == sizeof(struct rm_heap_new_texture) + sizeof(struct WMTTextureInfo), "wire layout");
+    struct rm_ret_handle_u64 result = {0};
+    if (wmtr_call(RM_OP_HEAP_NEW_TEXTURE, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    info->gpu_resource_id = result.value;
+    return STATUS_SUCCESS;
+  }
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
 
@@ -8609,7 +8625,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_newTimestampBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
-WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
@@ -8619,7 +8634,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
 #undef WMT_REMOTE_UPSTREAM_GUARD
@@ -8806,7 +8820,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_heapBufferSizeAndAlign,
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLHeap_newBuffer,
-    &_rmg_upstream_MTLHeap_newTexture,
+    &_MTLHeap_newTexture,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
     &_rmg_upstream_MTLDevice_newLibraryWithSource,
     &_rmg_upstream_MTLTexture_getBytes,
@@ -8988,7 +9002,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_heapBufferSizeAndAlign,
     &_MTLDevice_heapTextureSizeAndAlign_wow64,
     &_MTLHeap_newBuffer_wow64,
-    &_rmg_upstream_MTLHeap_newTexture_wow64,
+    &_MTLHeap_newTexture_wow64,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,
     &_rmg_upstream_MTLDevice_newLibraryWithSource_wow64,
     &_rmg_upstream_MTLTexture_getBytes_wow64,
