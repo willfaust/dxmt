@@ -8782,16 +8782,6 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
 
 #include "wmt_remote_guard.h"
 
-/* shortcut: new upstream Metal calls are unavailable in remote mode until the remote protocol supports them. */
-#define WMT_REMOTE_UPSTREAM_GUARD(name) \
-static NTSTATUS _rmg_upstream_##name(void *obj) { \
-  if (wmtr_enabled()) return wmtr_unimplemented(#name); \
-  return _##name(obj); \
-}
-#ifndef DXMT_NATIVE
-#endif
-#undef WMT_REMOTE_UPSTREAM_GUARD
-
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,
