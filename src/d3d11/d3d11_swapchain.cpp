@@ -958,7 +958,7 @@ public:
             frame.sync_count,
             average.sync_interval.count() / 1000000.0,
             statistics.max().event_stall,
-            average.present_lantency_interval.count() / 1000000.0,
+            average.present_latency_interval.count() / 1000000.0,
             average.encode_prepare_interval.count() / 1000000.0,
             average.encode_flush_interval.count() / 1000000.0,
             average.drawable_blocking_interval.count() / 1000000.0,
