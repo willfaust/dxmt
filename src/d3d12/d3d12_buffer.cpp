@@ -53,24 +53,25 @@ public:
 
     if (pHeap) {
       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
-      if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
+      const auto heap_size = pHeap->GetDesc().SizeInBytes;
+      if (Offset > heap_size || size_and_align.size > heap_size - Offset)
         return E_INVALIDARG;
     }
 
     buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
 
     Flags<BufferAllocationFlag> flags;
-    if (pHeap)
-      buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
-    else
-      buffer->rename(buffer->allocate(flags));
+    auto allocation = pHeap ? buffer->allocate(flags, pHeap->heap, Offset) : buffer->allocate(flags);
+    if (!allocation->buffer())
+      return E_OUTOFMEMORY;
+    buffer->rename(std::move(allocation));
     device_->RegisterResidencyAndVA(buffer->current());
 
     return S_OK;
   };
 
   ~MTLD3D12Buffer() {
-    if (buffer)
+    if (buffer && buffer->current())
       device_->UnregisterResidencyAndVA(buffer->current());
   }
 

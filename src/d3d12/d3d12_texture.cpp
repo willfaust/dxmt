@@ -213,16 +213,18 @@ public:
 
     if (pHeap) {
       auto size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
-      if (size_and_align.size + HeapOffset > pHeap->GetDesc().SizeInBytes)
+      const auto heap_size = pHeap->GetDesc().SizeInBytes;
+      if (HeapOffset > heap_size || size_and_align.size > heap_size - HeapOffset)
         return E_INVALIDARG;
     }
 
     texture = new Texture(texture_info, device_->GetMTLDevice());
     Flags<TextureAllocationFlag> flags = {};
-    if (pHeap) {
-      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
-    } else {
-      texture->rename(texture->allocate(flags));
+    auto allocation = pHeap ? texture->allocate(flags, pHeap->heap, HeapOffset) : texture->allocate(flags);
+    if (!allocation->texture())
+      return E_OUTOFMEMORY;
+    texture->rename(std::move(allocation));
+    if (!pHeap) {
       device_->RegisterResidency(texture->current()->texture());
     }
 
