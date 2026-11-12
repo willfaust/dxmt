@@ -7006,6 +7006,65 @@ _MTLDevice_newLibraryWithSource(void *obj) {
 static NTSTATUS
 _MTLTexture_getBytes(void *obj) {
   struct unixcall_mtltexture_replaceregion *params = obj;
+  if (wmtr_enabled()) {
+    if (!params->size.width || !params->size.height || !params->size.depth) return STATUS_SUCCESS;
+    if (!params->data.ptr) return STATUS_INVALID_PARAMETER;
+    struct rm_arg_handle query = {params->texture};
+    struct rm_texture_read_layout layout = {0};
+    uint32_t received = 0;
+    if (wmtr_call(RM_OP_TEXTURE_READ_LAYOUT, &query, sizeof(query), &layout, sizeof(layout), &received) != RM_OK ||
+        received != sizeof(layout) || layout.reserved || !layout.block_width || layout.block_width > 16 ||
+        !layout.block_height || layout.block_height > 16 || !layout.block_bytes || layout.block_bytes > 16)
+      return STATUS_UNSUCCESSFUL;
+    uint64_t columns = (params->size.width - 1) / layout.block_width + 1;
+    uint64_t rows = (params->size.height - 1) / layout.block_height + 1;
+    if (columns > SIZE_MAX / layout.block_bytes || params->origin.x > UINT64_MAX - params->size.width ||
+        params->origin.y > UINT64_MAX - params->size.height || params->origin.z > UINT64_MAX - params->size.depth)
+      return STATUS_INVALID_PARAMETER;
+    uint64_t row_bytes = columns * layout.block_bytes;
+    if ((rows > 1 && params->bytes_per_row < row_bytes) ||
+        (rows > 1 && params->bytes_per_row > (SIZE_MAX - row_bytes) / (rows - 1))) return STATUS_INVALID_PARAMETER;
+    uint64_t image_bytes = (rows - 1) * params->bytes_per_row + row_bytes;
+    if (params->size.depth > 1 && (params->bytes_per_image < image_bytes ||
+        params->bytes_per_image > (SIZE_MAX - image_bytes) / (params->size.depth - 1))) return STATUS_INVALID_PARAMETER;
+    size_t span = (size_t)((params->size.depth - 1) * params->bytes_per_image + image_bytes);
+    if ((uintptr_t)params->data.ptr > UINTPTR_MAX - span) return STATUS_INVALID_PARAMETER;
+    uint8_t *chunk = malloc(RM_CHUNK_BYTES);
+    if (!chunk) return STATUS_UNSUCCESSFUL;
+    NTSTATUS result = STATUS_SUCCESS;
+    for (uint64_t z = 0; z < params->size.depth && result == STATUS_SUCCESS; ++z) {
+      for (uint64_t col = 0; col < columns && result == STATUS_SUCCESS;) {
+        uint64_t tile_columns = columns - col;
+        if (tile_columns > RM_CHUNK_BYTES / layout.block_bytes) tile_columns = RM_CHUNK_BYTES / layout.block_bytes;
+        uint64_t tile_row_bytes = tile_columns * layout.block_bytes;
+        uint64_t max_rows = RM_CHUNK_BYTES / tile_row_bytes;
+        for (uint64_t row = 0; row < rows && result == STATUS_SUCCESS;) {
+          uint64_t tile_rows = rows - row;
+          if (tile_rows > max_rows) tile_rows = max_rows;
+          uint64_t px = col * layout.block_width, py = row * layout.block_height;
+          uint64_t width = params->size.width - px, height = params->size.height - py;
+          if (width > tile_columns * layout.block_width) width = tile_columns * layout.block_width;
+          if (height > tile_rows * layout.block_height) height = tile_rows * layout.block_height;
+          struct rm_texture_read_region arg = {params->texture, params->origin.x + px, params->origin.y + py,
+            params->origin.z + z, width, height, params->level, params->slice};
+          uint32_t bytes = (uint32_t)(tile_row_bytes * tile_rows);
+          received = 0;
+          if (wmtr_call(RM_OP_TEXTURE_READ_REGION, &arg, sizeof(arg), chunk, bytes, &received) != RM_OK || received != bytes) {
+            result = STATUS_UNSUCCESSFUL;
+            break;
+          }
+          for (uint64_t r = 0; r < tile_rows; ++r) {
+            size_t dst = (size_t)(z * params->bytes_per_image + (row + r) * params->bytes_per_row + col * layout.block_bytes);
+            memcpy((uint8_t *)params->data.ptr + dst, chunk + r * tile_row_bytes, (size_t)tile_row_bytes);
+          }
+          row += tile_rows;
+        }
+        col += tile_columns;
+      }
+    }
+    free(chunk);
+    return result;
+  }
   [(id<MTLTexture>)params->texture getBytes:params->data.ptr
                                 bytesPerRow:params->bytes_per_row
                               bytesPerImage:params->bytes_per_image
@@ -8729,9 +8788,7 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
   if (wmtr_enabled()) return wmtr_unimplemented(#name); \
   return _##name(obj); \
 }
-WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
-WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
 #undef WMT_REMOTE_UPSTREAM_GUARD
 
@@ -8920,7 +8977,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
-    &_rmg_upstream_MTLTexture_getBytes,
+    &_MTLTexture_getBytes,
 };
 
 #ifndef DXMT_NATIVE
@@ -9102,6 +9159,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newTexture_wow64,
     &_MTLDevice_newIndirectCommandBuffer_wow64,
     &_MTLDevice_newLibraryWithSource_wow64,
-    &_rmg_upstream_MTLTexture_getBytes_wow64,
+    &_MTLTexture_getBytes_wow64,
 };
 #endif
