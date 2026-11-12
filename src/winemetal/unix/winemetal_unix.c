@@ -6567,9 +6567,35 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* Remote residency batches contain only tagged handles, never guest pointers. */
+static NTSTATUS
+wmt_remote_residency_batch(uint64_t set, uint32_t action, const obj_handle_t *allocations, uint64_t count) {
+  if (count > RM_RESIDENCY_BATCH_MAX || (count && !allocations)) return STATUS_INVALID_PARAMETER;
+  size_t size = sizeof(struct rm_residency_batch) + (size_t)count * sizeof(uint64_t);
+  struct rm_residency_batch *a = malloc(size);
+  if (!a) return STATUS_UNSUCCESSFUL;
+  *a = (struct rm_residency_batch){set, action, (uint32_t)count};
+  if (count) memcpy(a + 1, allocations, count * sizeof(uint64_t));
+  uint32_t status = wmtr_call(RM_OP_RESIDENCY_BATCH, a, (uint32_t)size, NULL, 0, NULL);
+  free(a);
+  return status == RM_OK ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static NTSTATUS
 _MTLDevice_newResidencySet(void *obj) {
   struct unixcall_mtldevice_newresidencyset *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle_u64 request = {params->device, params->init_capacity};
+    struct rm_ret_handle result = {0};
+    params->ret_error = 0;
+    params->ret_set = 0;
+    if (wmt_remote_residency_batch(0, RM_RESIDENCY_PROBE, NULL, 0) != STATUS_SUCCESS)
+      return STATUS_NOT_IMPLEMENTED;
+    if (wmtr_call(RM_OP_NEW_RESIDENCY_SET, &request, sizeof(request), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret_set = result.handle;
+    return STATUS_SUCCESS;
+  }
   NSError *err = NULL;
   MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
   descriptor.initialCapacity = params->init_capacity;
@@ -6582,6 +6608,8 @@ _MTLDevice_newResidencySet(void *obj) {
 static NTSTATUS
 _MTLResidencySet_addAllocations(void *obj) {
   struct unixcall_mtlresidencyset_addallocations *params = obj;
+  if (wmtr_enabled())
+    return wmt_remote_residency_batch(params->set, RM_RESIDENCY_ADD, params->allocations.ptr, params->count);
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->set;
   [set addAllocations:(id<MTLAllocation> const *)params->allocations.ptr count:params->count];
   return STATUS_SUCCESS;
@@ -6590,6 +6618,8 @@ _MTLResidencySet_addAllocations(void *obj) {
 static NTSTATUS
 _MTLResidencySet_removeAllocations(void *obj) {
   struct unixcall_mtlresidencyset_addallocations *params = obj;
+  if (wmtr_enabled())
+    return wmt_remote_residency_batch(params->set, RM_RESIDENCY_REMOVE, params->allocations.ptr, params->count);
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->set;
   [set removeAllocations:(id<MTLAllocation> const *)params->allocations.ptr count:params->count];
   return STATUS_SUCCESS;
@@ -6598,6 +6628,7 @@ _MTLResidencySet_removeAllocations(void *obj) {
 static NTSTATUS
 _MTLResidencySet_removeAllAllocations(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
+  if (wmtr_enabled()) return wmt_remote_residency_batch(params->handle, RM_RESIDENCY_REMOVE_ALL, NULL, 0);
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->handle;
   [set removeAllAllocations];
   return STATUS_SUCCESS;
@@ -6606,6 +6637,10 @@ _MTLResidencySet_removeAllAllocations(void *obj) {
 static NTSTATUS
 _MTLResidencySet_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle a = {params->handle};
+    return wmtr_call(RM_OP_RESIDENCY_COMMIT, &a, sizeof(a), NULL, 0, NULL) == RM_OK ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+  }
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->handle;
   [set commit];
   return STATUS_SUCCESS;
@@ -6614,6 +6649,10 @@ _MTLResidencySet_commit(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_addResidencySet(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle_u64 a = {params->handle, params->arg};
+    return wmtr_call(RM_OP_QUEUE_ADD_RESIDENCY, &a, sizeof(a), NULL, 0, NULL) == RM_OK ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+  }
   id<MTLCommandQueue> queue = (id<MTLCommandQueue>)params->handle;
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->arg;
   [queue addResidencySet:set];
@@ -8492,12 +8531,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_property)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newResidencySet)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_addAllocations)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllocations)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllAllocations)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_commit)
-WMT_REMOTE_UPSTREAM_GUARD(MTLCommandQueue_addResidencySet)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapBufferSizeAndAlign)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign)
@@ -8516,8 +8549,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_addAllocations_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllocations_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
 #undef WMT_REMOTE_UPSTREAM_GUARD
@@ -8694,12 +8725,12 @@ const void *__wine_unix_call_funcs[] = {
     &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_rmg_upstream_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState,
-    &_rmg_upstream_MTLDevice_newResidencySet,
-    &_rmg_upstream_MTLResidencySet_addAllocations,
-    &_rmg_upstream_MTLResidencySet_removeAllocations,
-    &_rmg_upstream_MTLResidencySet_removeAllAllocations,
-    &_rmg_upstream_MTLResidencySet_commit,
-    &_rmg_upstream_MTLCommandQueue_addResidencySet,
+    &_MTLDevice_newResidencySet,
+    &_MTLResidencySet_addAllocations,
+    &_MTLResidencySet_removeAllocations,
+    &_MTLResidencySet_removeAllAllocations,
+    &_MTLResidencySet_commit,
+    &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap,
     &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
     &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign,
@@ -8876,12 +8907,12 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
     &_rmg_upstream_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState_wow64,
-    &_rmg_upstream_MTLDevice_newResidencySet,
-    &_rmg_upstream_MTLResidencySet_addAllocations_wow64,
-    &_rmg_upstream_MTLResidencySet_removeAllocations_wow64,
-    &_rmg_upstream_MTLResidencySet_removeAllAllocations,
-    &_rmg_upstream_MTLResidencySet_commit,
-    &_rmg_upstream_MTLCommandQueue_addResidencySet,
+    &_MTLDevice_newResidencySet,
+    &_MTLResidencySet_addAllocations_wow64,
+    &_MTLResidencySet_removeAllocations_wow64,
+    &_MTLResidencySet_removeAllAllocations,
+    &_MTLResidencySet_commit,
+    &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap_wow64,
     &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
     &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign_wow64,

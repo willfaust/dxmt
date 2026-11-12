@@ -43,9 +43,12 @@ pointer_calls = {
     'MTLHeap_newBuffer', 'MTLHeap_newTexture', 'MTLDevice_newIndirectCommandBuffer',
     'MTLDevice_newLibraryWithSource', 'MTLTexture_getBytes',
 }
+routed = {'MTLDevice_newResidencySet', 'MTLResidencySet_addAllocations',
+          'MTLResidencySet_removeAllocations', 'MTLResidencySet_removeAllAllocations'}
 for slot, name in wrappers.items():
-    assert native[slot] == '&_rmg_upstream_' + name, (slot, name, native[slot])
-    expected = '&_rmg_upstream_' + name + ('_wow64' if name in pointer_calls else '')
+    prefix = '&_' if name in routed else '&_rmg_upstream_'
+    assert native[slot] == prefix + name, (slot, name, native[slot])
+    expected = prefix + name + ('_wow64' if name in pointer_calls else '')
     assert wow64[slot] == expected, (slot, name, wow64[slot])
 with tempfile.TemporaryDirectory(prefix='madeira-guard-test-') as tmp:
     src = root / 'src/winemetal'
