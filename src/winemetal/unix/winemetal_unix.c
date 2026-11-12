@@ -6669,8 +6669,21 @@ _MTLCommandQueue_addResidencySet(void *obj) {
 static NTSTATUS
 _MTLDevice_newHeap(void *obj) {
   struct unixcall_mtldevice_newheap *params = obj;
-  id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTHeapInfo const *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    if (!info) return STATUS_INVALID_PARAMETER;
+    struct { struct rm_wmt_info header; struct WMTHeapInfo info; } payload = {
+      { params->device, sizeof(*info), 0 }, *info
+    };
+    _Static_assert(sizeof(payload) == sizeof(struct rm_wmt_info) + sizeof(struct WMTHeapInfo), "wire layout");
+    struct rm_ret_handle result = {0};
+    if (wmtr_call(RM_OP_HEAP_CREATE, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    return STATUS_SUCCESS;
+  }
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
   MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
   desc.resourceOptions = (MTLResourceOptions)info->options;
   desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
@@ -6756,8 +6769,22 @@ _MTLDevice_heapTextureSizeAndAlign(void *obj) {
 static NTSTATUS
 _MTLHeap_newBuffer(void *obj) {
   struct unixcall_mtlheap_newbuffer *params = obj;
-  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   struct WMTBufferInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    if (!info) return STATUS_INVALID_PARAMETER;
+    info->memory.ptr = NULL;
+    info->gpu_address = 0;
+    struct rm_heap_new_buffer arg = {params->heap, params->offset, info->length, info->options};
+    struct rm_ret_handle_u64 result = {0};
+    if (wmtr_call(RM_OP_HEAP_NEW_PRIVATE_BUFFER, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    info->gpu_address = result.value;
+    if (result.handle) wmtr_buf_add(result.handle, NULL, info->length, info->options, 0, 0);
+    return STATUS_SUCCESS;
+  }
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   id<MTLBuffer> buffer;
   if (~params->offset == 0)
     buffer = [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
@@ -8562,7 +8589,7 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
   translated.info.ptr = UInt32ToPtr((uint32_t)(uintptr_t)original->info.ptr);
   if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;
   /* shortcut: shared heap memory is not guest-addressable, add guest-backed heaps before enabling it. */
-  if (wmtr_enabled() || [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate)
+  if (!wmtr_enabled() && [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate)
     return STATUS_NOT_IMPLEMENTED;
   NTSTATUS status = _MTLHeap_newBuffer(&translated);
   original->ret = translated.ret;
@@ -8582,8 +8609,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_newTimestampBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
-WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource)
@@ -8591,11 +8616,9 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
@@ -8779,10 +8802,10 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLResidencySet_removeAllAllocations,
     &_MTLResidencySet_commit,
     &_MTLCommandQueue_addResidencySet,
-    &_rmg_upstream_MTLDevice_newHeap,
+    &_MTLDevice_newHeap,
     &_MTLDevice_heapBufferSizeAndAlign,
     &_MTLDevice_heapTextureSizeAndAlign,
-    &_rmg_upstream_MTLHeap_newBuffer,
+    &_MTLHeap_newBuffer,
     &_rmg_upstream_MTLHeap_newTexture,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
     &_rmg_upstream_MTLDevice_newLibraryWithSource,
@@ -8961,10 +8984,10 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLResidencySet_removeAllAllocations,
     &_MTLResidencySet_commit,
     &_MTLCommandQueue_addResidencySet,
-    &_rmg_upstream_MTLDevice_newHeap_wow64,
+    &_MTLDevice_newHeap_wow64,
     &_MTLDevice_heapBufferSizeAndAlign,
     &_MTLDevice_heapTextureSizeAndAlign_wow64,
-    &_rmg_upstream_MTLHeap_newBuffer_wow64,
+    &_MTLHeap_newBuffer_wow64,
     &_rmg_upstream_MTLHeap_newTexture_wow64,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,
     &_rmg_upstream_MTLDevice_newLibraryWithSource_wow64,
