@@ -6878,9 +6878,23 @@ _MTLHeap_newTexture(void *obj) {
 static NTSTATUS
 _MTLDevice_newIndirectCommandBuffer(void *obj) {
   struct unixcall_mtldevice_newicb *params = obj;
-  id<MTLDevice> device = (id<MTLDevice>)params->device;
-
   struct WMTIndirectCommandBufferInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    if (!info) return STATUS_INVALID_PARAMETER;
+    info->gpu_resource_id = 0;
+    struct { struct rm_new_icb header; struct WMTIndirectCommandBufferInfo info; } payload = {
+      {params->device, params->max_count, params->options}, *info
+    };
+    _Static_assert(sizeof(payload) == sizeof(struct rm_new_icb) + sizeof(struct WMTIndirectCommandBufferInfo), "wire layout");
+    struct rm_ret_handle_u64 result = {0};
+    if (wmtr_call(RM_OP_NEW_INDIRECT_COMMAND_BUFFER, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    info->gpu_resource_id = result.value;
+    return STATUS_SUCCESS;
+  }
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
 
   MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
 
@@ -8687,10 +8701,8 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
   return _##name(obj); \
 }
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
@@ -8879,7 +8891,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_heapTextureSizeAndAlign,
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
-    &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
+    &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
     &_rmg_upstream_MTLTexture_getBytes,
 };
@@ -9061,7 +9073,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_heapTextureSizeAndAlign_wow64,
     &_MTLHeap_newBuffer_wow64,
     &_MTLHeap_newTexture_wow64,
-    &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,
+    &_MTLDevice_newIndirectCommandBuffer_wow64,
     &_MTLDevice_newLibraryWithSource_wow64,
     &_rmg_upstream_MTLTexture_getBytes_wow64,
 };
