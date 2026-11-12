@@ -56,6 +56,8 @@ ROUTED = {
     # resources and sync
     '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
     '_MTLCommandBuffer_property',
+    '_MTLCounterSampleBuffer_newTimestampBuffer', '_MTLCounterSampleBuffer_resolveCounterRange',
+    '_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers',
     '_MTLDevice_heapBufferSizeAndAlign',
     '_MTLDevice_heapTextureSizeAndAlign',
     '_MTLDevice_newHeap', '_MTLHeap_newBuffer', '_MTLHeap_newTexture',

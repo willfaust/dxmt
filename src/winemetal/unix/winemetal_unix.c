@@ -6439,6 +6439,15 @@ _MTLSharedEvent_waitUntilSignaledValue(void *obj) {
 static NTSTATUS
 _MTLCounterSampleBuffer_newTimestampBuffer(void *obj) {
   struct unixcall_mtlcountersamplebuffer_newtimestampbuffer *params = obj;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    struct rm_counter_new arg = {params->device, params->sample_count, params->shared};
+    struct rm_ret_handle result = {0};
+    if (wmtr_call(RM_OP_COUNTER_NEW_TIMESTAMP, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    return STATUS_SUCCESS;
+  }
   id<MTLDevice> device = (id<MTLDevice>)params->device;
 
   MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
@@ -6464,6 +6473,15 @@ _MTLCounterSampleBuffer_newTimestampBuffer(void *obj) {
 static NTSTATUS
 _MTLCounterSampleBuffer_resolveCounterRange(void *obj) {
   struct unixcall_mtlcountersamplebuffer_resolvecounterrange *params = obj;
+  if (wmtr_enabled()) {
+    if (!params->data_out.ptr) return STATUS_SUCCESS;
+    if (params->data_length > RM_CHUNK_BYTES) return STATUS_INVALID_PARAMETER;
+    struct rm_counter_resolve arg = {params->sample_buffer, params->start, params->len, params->data_length};
+    uint32_t received = 0;
+    uint32_t result = wmtr_call(RM_OP_COUNTER_RESOLVE, &arg, sizeof(arg), params->data_out.ptr,
+                                (uint32_t)params->data_length, &received);
+    return result == RM_OK && received == params->data_length ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+  }
   id<MTLCounterSampleBuffer> sample_buffer = (id<MTLCounterSampleBuffer>)params->sample_buffer;
 
   NSData *data = [sample_buffer resolveCounterRange:NSMakeRange(params->start, params->len)];
@@ -6476,8 +6494,26 @@ _MTLCounterSampleBuffer_resolveCounterRange(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
   struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
-  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
   struct WMTSampleBufferAttachmentInfo *attachments = params->attachments.ptr;
+  if (wmtr_enabled()) {
+    params->ret = 0;
+    if (params->num_attachments > RM_MAX_BLIT_SAMPLES || (params->num_attachments && !attachments))
+      return STATUS_INVALID_PARAMETER;
+    struct { struct rm_blit_samples header; struct rm_sample_attachment attachments[RM_MAX_BLIT_SAMPLES]; } payload = {0};
+    payload.header.cmdbuf = params->cmdbuf;
+    payload.header.count = (uint32_t)params->num_attachments;
+    for (uint32_t i = 0; i < payload.header.count; ++i) {
+      payload.attachments[i] = (struct rm_sample_attachment){attachments[i].sample_buffer,
+        attachments[i].start_of_encoder_sample_index, attachments[i].end_of_encoder_sample_index};
+    }
+    struct rm_ret_handle result = {0};
+    uint32_t length = sizeof(payload.header) + payload.header.count * sizeof(payload.attachments[0]);
+    if (wmtr_call(RM_OP_BLIT_WITH_SAMPLES, &payload, length, &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret = result.handle;
+    return STATUS_SUCCESS;
+  }
+  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
 
   MTLBlitPassDescriptor *blit_desc = [[MTLBlitPassDescriptor alloc] init];
   for (uint64_t i = 0; i < params->num_attachments; i++) {
@@ -8621,16 +8657,11 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
   if (wmtr_enabled()) return wmtr_unimplemented(#name); \
   return _##name(obj); \
 }
-WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_newTimestampBuffer)
-WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
-WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
-WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
@@ -8805,9 +8836,9 @@ const void *__wine_unix_call_funcs[] = {
      * rules 3 and 4 of section 7.4. 150 in both. */
     &_d3d9_nop,                         /* 150 */
     /* Upstream calls 127-145 are mapped to 151-169. */
-    &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
-    &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange,
-    &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+    &_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_MTLCounterSampleBuffer_resolveCounterRange,
+    &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState,
     &_MTLDevice_newResidencySet,
@@ -8987,9 +9018,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
      * same about slots 47, 66, 67 and 72). */
     &_d3d9_nop,                         /* 150 */
     /* Upstream calls 127-145 are mapped to 151-169. */
-    &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
-    &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange_wow64,
-    &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
+    &_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_MTLCounterSampleBuffer_resolveCounterRange_wow64,
+    &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
     &_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState_wow64,
     &_MTLDevice_newResidencySet,
