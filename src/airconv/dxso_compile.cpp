@@ -227,7 +227,7 @@ compile_dxso(
       input_arg_idx[d.bound_to.num] = (int)sig.DefineInput(
           air::InputVertexStageIn{
               .attribute = d.bound_to.num,
-              .type = air::InputAttributeComponentType::Float,
+              .type = air::msl_float4,
               .name = "in" + std::to_string(d.bound_to.num),
           }
       );

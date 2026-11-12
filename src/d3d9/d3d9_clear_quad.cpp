@@ -99,7 +99,7 @@ D3D9ClearQuad::begin(ArgumentEncodingContext &ctx, Rc<Texture> texture, TextureV
   auto &pass_info = *ctx.startRenderPass(0, 0, 1, 0);
 
   auto &color = pass_info.colors[0];
-  color.attachment = ctx.access<false>(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  color.attachment = ctx.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
   color.depth_plane = 0;
   color.load_action = WMTLoadActionLoad;
   color.store_action = WMTStoreActionStore;
@@ -181,7 +181,7 @@ D3D9ClearQuad::beginDepthStencil(
   auto &pass_info = *ctx.startRenderPass(dsv_flag, 0, 0, 0);
 
   auto &depth = pass_info.depth;
-  depth.attachment = ctx.access<false>(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  depth.attachment = ctx.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
   depth.depth_plane = 0;
   depth.load_action = WMTLoadActionLoad;
   depth.store_action = WMTStoreActionStore;
@@ -190,7 +190,7 @@ D3D9ClearQuad::beginDepthStencil(
     // even for a depth-only write; the depth-stencil state keeps the
     // untouched plane intact.
     auto &stencil = pass_info.stencil;
-    stencil.attachment = ctx.access<false>(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+    stencil.attachment = ctx.access<PipelineStage::Pixel>(texture, view, ResourceAccess::Write);
     stencil.depth_plane = 0;
     stencil.load_action = WMTLoadActionLoad;
     stencil.store_action = WMTStoreActionStore;

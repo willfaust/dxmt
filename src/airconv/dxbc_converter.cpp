@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "dxil_converter.hpp"
 #include "metallib_writer.hpp"
 #include "nt/air_builder.hpp"
 #include "shader_common.hpp"
@@ -29,11 +30,6 @@
 class SM50CompiledBitcodeInternal {
 public:
   llvm::SmallVector<char, 0> vec;
-};
-
-class SM50ErrorInternal {
-public:
-  llvm::SmallVector<char, 0> buf;
 };
 
 namespace dxmt::dxbc {
@@ -94,176 +90,6 @@ uint32_t next_pow2(uint32_t x) {
   return x == 1 ? 1 : 1 << (32 - __builtin_clz(x - 1));
 }
 
-auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
-  return make_irvalue([=](context ctx) {
-    auto argbuf = ctx.function->getArg(argbuf_index);
-    auto argbuf_struct_type = llvm::cast<llvm::StructType>(
-      llvm::cast<llvm::PointerType>(argbuf->getType())
-        ->getNonOpaquePointerElementType()
-    );
-    return ctx.builder.CreateLoad(
-      argbuf_struct_type->getElementType(index),
-      ctx.builder.CreateStructGEP(
-        llvm::cast<llvm::PointerType>(argbuf->getType())
-          ->getNonOpaquePointerElementType(),
-        argbuf, index
-      )
-    );
-  });
-};
-
-void setup_binding_table(
-  const ShaderInfo *shader_info, io_binding_map &resource_map,
-  air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
-  uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot
-) {
-  uint32_t binding_table_index = ~0u;
-  uint32_t cbuf_table_index = ~0u;
-  if (!shader_info->binding_table.Empty()) {
-    auto [type, metadata] = shader_info->binding_table.Build(
-      module.getContext(), module.getDataLayout()
-    );
-    std::string arg_name = "binding_table";
-    if (argbuffer_slot != kArgumentBufferBindIndex)
-      arg_name += std::to_string(argbuffer_slot);
-    binding_table_index =
-      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
-        .location_index = argbuffer_slot, // kArgumentBufferBindIndex
-        .array_size = 1,
-        .memory_access = air::MemoryAccess::read,
-        .address_space = air::AddressSpace::constant,
-        .struct_type = type,
-        .struct_type_info = metadata,
-        .arg_name = arg_name,
-      });
-  }
-  if (!shader_info->binding_table_cbuffer.Empty()) {
-    auto [type, metadata] = shader_info->binding_table_cbuffer.Build(
-      module.getContext(), module.getDataLayout()
-    );
-    std::string arg_name = "cbuffer_table";
-    if (argbuffer_constant_slot != kConstantBufferBindIndex)
-      arg_name += std::to_string(argbuffer_constant_slot);
-    cbuf_table_index =
-      func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
-        .location_index = argbuffer_constant_slot, // kConstantBufferBindIndex
-        .array_size = 1,
-        .memory_access = air::MemoryAccess::read,
-        .address_space = air::AddressSpace::constant,
-        .struct_type = type,
-        .struct_type_info = metadata,
-        .arg_name = arg_name,
-      });
-  }
-
-  for (auto &[range_id, cbv] : shader_info->cbufferMap) {
-    // TODO: abstract SM 5.0 binding
-    auto index = cbv.arg_index;
-    resource_map.cb_range_map[range_id] = [=](pvalue) {
-      // ignore index in SM 5.0
-      return get_item_in_argbuf_binding_table(cbuf_table_index, index);
-    };
-  }
-  for (auto &[range_id, sampler] : shader_info->samplerMap) {
-    // TODO: abstract SM 5.0 binding
-    resource_map.sampler_range_map[range_id] = {
-      [=, index = sampler.arg_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      },
-      [=, index = sampler.arg_cube_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      },
-      [=, index = sampler.arg_metadata_index](pvalue) {
-        // ignore index in SM 5.0
-        return get_item_in_argbuf_binding_table(binding_table_index, index);
-      }
-    };
-  }
-  for (auto &[range_id, srv] : shader_info->srvMap) {
-    if (srv.resource_type != shader::common::ResourceType::NonApplicable) {
-      // TODO: abstract SM 5.0 binding
-      auto access =
-        srv.sampled ? air::MemoryAccess::sample : air::MemoryAccess::read;
-      auto texture_kind_logical = air::to_air_resource_type(srv.resource_type, srv.compared);
-      auto scaler_type = air::to_air_scaler_type(srv.scaler_type);
-      resource_map.srv_range_map[range_id] = {
-        air::MSLTexture{
-          .component_type = scaler_type,
-          .memory_access = access,
-          .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
-          .resource_kind_logical = texture_kind_logical,
-        },
-        [=, index = srv.arg_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = srv.arg_metadata_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        false
-      };
-    } else {
-      resource_map.srv_buf_range_map[range_id] = {
-        srv.strucure_stride,
-        [=, index = srv.arg_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = srv.arg_metadata_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        false
-      };
-    }
-  }
-  for (auto &[range_id, uav] : shader_info->uavMap) {
-    auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
-                                          : air::MemoryAccess::write)
-                              : air::MemoryAccess::read;
-    if (uav.resource_type != shader::common::ResourceType::NonApplicable) {
-      auto texture_kind_logical = air::to_air_resource_type(uav.resource_type);
-      auto scaler_type = air::to_air_scaler_type(uav.scaler_type);
-      resource_map.uav_range_map[range_id] = {
-        air::MSLTexture{
-          .component_type = scaler_type,
-          .memory_access = access,
-          .resource_kind = air::lowering_texture_1d_to_2d(texture_kind_logical),
-          .resource_kind_logical = texture_kind_logical,
-        },
-        [=, index = uav.arg_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = uav.arg_metadata_index](pvalue) {
-          // ignore index in SM 5.0
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        uav.global_coherent
-      };
-    } else {
-      resource_map.uav_buf_range_map[range_id] = {
-        uav.strucure_stride,
-        [=, index = uav.arg_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        [=, index = uav.arg_metadata_index](pvalue) {
-          return get_item_in_argbuf_binding_table(binding_table_index, index);
-        },
-        uav.global_coherent
-      };
-      if (uav.with_counter) {
-        auto argbuf_index_counterptr = uav.arg_counter_index;
-        resource_map.uav_counter_range_map[range_id] = [=](pvalue) {
-          return get_item_in_argbuf_binding_table(
-            binding_table_index, argbuf_index_counterptr
-          );
-        };
-      }
-    }
-  }
-};
 
 void setup_immediate_constant_buffer(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
@@ -366,12 +192,9 @@ void setup_temp_register(
       ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
     };
   }
-  if (shader_info->use_cmp_exch) {
-    resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
-  }
 }
 
-void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_verison) {
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
   using namespace llvm;
   auto &context = module.getContext();
   auto createUnsignedInteger = [&](uint32_t s) {
@@ -381,7 +204,7 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
 
   auto airVersion = module.getOrInsertNamedMetadata("air.version");
   auto airLangVersion = module.getOrInsertNamedMetadata("air.language_version");
-  switch (metal_verison) {
+  switch (metal_version) {
   case SM50_SHADER_METAL_320: {
     airVersion->addOperand(
         MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(7), createUnsignedInteger(0)})
@@ -404,6 +227,87 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
   }
 }
 
+RegisterComponentType
+component_type_from_pixel_format(air::MTLPixelFormat format) {
+  switch (format) {
+  case air::MTLPixelFormat::R8Sint:
+  case air::MTLPixelFormat::R16Sint:
+  case air::MTLPixelFormat::RG8Sint:
+  case air::MTLPixelFormat::R32Sint:
+  case air::MTLPixelFormat::RG16Sint:
+  case air::MTLPixelFormat::RGBA8Sint:
+  case air::MTLPixelFormat::RG32Sint:
+  case air::MTLPixelFormat::RGBA16Sint:
+  case air::MTLPixelFormat::RGBA32Sint:
+    return RegisterComponentType::Int;
+  case air::MTLPixelFormat::R8Uint:
+  case air::MTLPixelFormat::R16Uint:
+  case air::MTLPixelFormat::RG8Uint:
+  case air::MTLPixelFormat::R32Uint:
+  case air::MTLPixelFormat::RG16Uint:
+  case air::MTLPixelFormat::RGBA8Uint:
+  case air::MTLPixelFormat::RGB10A2Uint:
+  case air::MTLPixelFormat::RG32Uint:
+  case air::MTLPixelFormat::RGBA16Uint:
+  case air::MTLPixelFormat::RGBA32Uint:
+    return RegisterComponentType::Uint;
+  case air::MTLPixelFormat::A8Unorm:
+  case air::MTLPixelFormat::R8Unorm:
+  case air::MTLPixelFormat::R8Unorm_sRGB:
+  case air::MTLPixelFormat::R8Snorm:
+  case air::MTLPixelFormat::R16Unorm:
+  case air::MTLPixelFormat::R16Snorm:
+  case air::MTLPixelFormat::R16Float:
+  case air::MTLPixelFormat::RG8Unorm:
+  case air::MTLPixelFormat::RG8Unorm_sRGB:
+  case air::MTLPixelFormat::RG8Snorm:
+  case air::MTLPixelFormat::B5G6R5Unorm:
+  case air::MTLPixelFormat::A1BGR5Unorm:
+  case air::MTLPixelFormat::ABGR4Unorm:
+  case air::MTLPixelFormat::BGR5A1Unorm:
+  case air::MTLPixelFormat::R32Float:
+  case air::MTLPixelFormat::RG16Unorm:
+  case air::MTLPixelFormat::RG16Snorm:
+  case air::MTLPixelFormat::RG16Float:
+  case air::MTLPixelFormat::RGBA8Unorm:
+  case air::MTLPixelFormat::RGBA8Unorm_sRGB:
+  case air::MTLPixelFormat::RGBA8Snorm:
+  case air::MTLPixelFormat::BGRA8Unorm:
+  case air::MTLPixelFormat::BGRA8Unorm_sRGB:
+  case air::MTLPixelFormat::RGB10A2Unorm:
+  case air::MTLPixelFormat::RG11B10Float:
+  case air::MTLPixelFormat::RGB9E5Float:
+  case air::MTLPixelFormat::BGR10A2Unorm:
+  case air::MTLPixelFormat::BGR10_XR:
+  case air::MTLPixelFormat::BGR10_XR_sRGB:
+  case air::MTLPixelFormat::RG32Float:
+  case air::MTLPixelFormat::RGBA16Unorm:
+  case air::MTLPixelFormat::RGBA16Snorm:
+  case air::MTLPixelFormat::RGBA16Float:
+  case air::MTLPixelFormat::BGRA10_XR:
+  case air::MTLPixelFormat::BGRA10_XR_sRGB:
+  case air::MTLPixelFormat::RGBA32Float:
+  case air::MTLPixelFormat::BC1_RGBA:
+  case air::MTLPixelFormat::BC1_RGBA_sRGB:
+  case air::MTLPixelFormat::BC2_RGBA:
+  case air::MTLPixelFormat::BC2_RGBA_sRGB:
+  case air::MTLPixelFormat::BC3_RGBA:
+  case air::MTLPixelFormat::BC3_RGBA_sRGB:
+  case air::MTLPixelFormat::BC4_RUnorm:
+  case air::MTLPixelFormat::BC4_RSnorm:
+  case air::MTLPixelFormat::BC5_RGUnorm:
+  case air::MTLPixelFormat::BC5_RGSnorm:
+  case air::MTLPixelFormat::BC6H_RGBFloat:
+  case air::MTLPixelFormat::BC6H_RGBUfloat:
+  case air::MTLPixelFormat::BC7_RGBAUnorm:
+  case air::MTLPixelFormat::BC7_RGBAUnorm_sRGB:
+    return RegisterComponentType::Float;
+  default:
+    break;
+  }
+  return RegisterComponentType::Unknown;
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -420,19 +324,20 @@ llvm::Error convert_dxbc_pixel_shader(
   bool pso_dual_source_blending = false;
   bool pso_disable_depth_output = false;
   uint32_t pso_unorm_output_reg_mask = 0;
+  uint32_t *pso_pixel_formats = nullptr;
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
   if (args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pso_data)) {
     pso_dual_source_blending = pso_data->dual_source_blending;
     pso_disable_depth_output = pso_data->disable_depth_output;
     pso_unorm_output_reg_mask = pso_data->unorm_output_reg_mask;
     pso_sample_mask = pso_data->sample_mask;
+    pso_pixel_formats = pso_data->pixel_formats;
   }
 
   /* ml1031: the interpolants the paired vertex stage actually writes.
    *
    * Parsed HERE, from the vertex bytecode, rather than handed to us as strings:
-   * the names must match Signature::fullSemanticString() exactly (lowercased
-   * semantic + index, e.g. "texcoord4"), and the only way to guarantee that is
+   * the names must match the signature attribute names exactly, and the only way to guarantee that is
    * to build them with the same code that builds this shader's own. */
   std::unordered_set<std::string> provided_interpolants;
   bool have_vertex_interface = false;
@@ -447,26 +352,24 @@ llvm::Error convert_dxbc_pixel_shader(
         const D3D11_SIGNATURE_PARAMETER *vs_params;
         vs_out.RastSignature()->GetParameters(&vs_params);
         for (unsigned i = 0; i < vs_out.RastSignature()->GetNumParameters(); i++)
-          provided_interpolants.insert(Signature(vs_params[i]).fullSemanticString());
+          provided_interpolants.insert(Signature(vs_params[i]).consistentAttributeName());
         have_vertex_interface = true;
       }
     }
   }
 
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
   if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
     metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
   }
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+  args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -479,6 +382,9 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (have_vertex_interface)
       sig_ctx.provided_interpolants = &provided_interpolants;
+    sig_ctx.pso_sample_mask = pso_sample_mask;
+    if (pso_pixel_formats)
+      memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
     for (auto &p : pShaderInternal->signature_handlers) {
       p(sig_ctx);
     }
@@ -503,19 +409,16 @@ llvm::Error convert_dxbc_pixel_shader(
   if (pso_sample_mask != 0xffffffff) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
-    epilogue >> [=](pvalue value) -> IRValue {
-      return make_irvalue([=](struct context ctx) {
-        auto &builder = ctx.builder;
-        if (ctx.resource.coverage_mask_reg)
-          return value;
-        return builder.CreateInsertValue(
-          value, builder.getInt32(ctx.pso_sample_mask), {assigned_index}
-        );
-      });
-    };
+    epilogue.Add([=](llvm::Value *value, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+      return io.PopulateDefaultCoverageMask(value, assigned_index, pso_sample_mask);
+    });
   }
 
-  setup_binding_table(shader_info, resource_map, func_signature, module);
+  auto binding_map = rootsig ? setup_binding_rootsig(
+                                   shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
+                                   rootsig->bytecode_length
+                               )
+                             : setup_binding_table2(shader_info, func_signature, module);
 
   auto [function, function_metadata] =
     func_signature.CreateFunction(name, context, module, 0, false);
@@ -524,7 +427,13 @@ llvm::Error convert_dxbc_pixel_shader(
   auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
-  llvm::air::AIRBuilder air(builder, nulldbg);
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
 
   setup_metal_version(module, metal_version);
 
@@ -549,25 +458,35 @@ llvm::Error convert_dxbc_pixel_shader(
     shader_info, resource_map, types, module, builder
   );
 
-  struct context ctx {
-    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
-    .resource = resource_map, .types = types,
-    .pso_sample_mask = pso_sample_mask,
-    .shader_type = pShaderInternal->shader_type,
-    .metal_version = metal_version,
+  struct context ctx{
+      .builder = builder,
+      .air = air,
+      .binding = *binding_map,
+      .llvm = context,
+      .module = module,
+      .function = function,
+      .resource = resource_map,
+      .types = types,
+      .pso_sample_mask = pso_sample_mask,
+      .shader_type = pShaderInternal->shader_type,
+      .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  auto epilogue_result = epilogue.build(ctx);
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
@@ -595,19 +514,17 @@ llvm::Error convert_dxbc_compute_shader(
   auto shader_info = &(pShaderInternal->shader_info);
 
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
   if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
     metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
   }
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+  args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -619,7 +536,11 @@ llvm::Error convert_dxbc_compute_shader(
     }
   }
 
-  setup_binding_table(shader_info, resource_map, func_signature, module);
+  auto binding_map = rootsig ? setup_binding_rootsig(
+                                   shader_info, func_signature, module, D3D11_SB_COMPUTE_SHADER, rootsig->bytecode,
+                                   rootsig->bytecode_length
+                               )
+                             : setup_binding_table2(shader_info, func_signature, module);
   setup_tgsm(shader_info, resource_map, types, module);
 
   auto [function, function_metadata] =
@@ -629,7 +550,13 @@ llvm::Error convert_dxbc_compute_shader(
   auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
-  llvm::air::AIRBuilder air(builder, nulldbg);
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
 
   setup_metal_version(module, metal_version);
   setup_temp_register(shader_info, resource_map, types, module, builder);
@@ -637,17 +564,28 @@ llvm::Error convert_dxbc_compute_shader(
     shader_info, resource_map, types, module, builder
   );
 
-  struct context ctx {
-    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
-    .resource = resource_map, .types = types, .pso_sample_mask = 0xffffffff,
-    .shader_type = pShaderInternal->shader_type,
-    .metal_version = metal_version,
+  struct context ctx{
+      .builder = builder,
+      .air = air,
+      .binding = *binding_map,
+      .llvm = context,
+      .module = module,
+      .function = function,
+      .resource = resource_map,
+      .types = types,
+      .pso_sample_mask = 0xffffffff,
+      .shader_type = pShaderInternal->shader_type,
+      .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -655,7 +593,8 @@ llvm::Error convert_dxbc_compute_shader(
 
   builder.SetInsertPoint(epilogue_bb);
 
-  if (auto err = epilogue.build(ctx).takeError()) {
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
+  if (auto err = epilogue_result.takeError()) {
     return err;
   }
   builder.CreateRetVoid();
@@ -689,19 +628,17 @@ llvm::Error convert_dxbc_vertex_shader(
        gs_passthrough->RasterizationDisabled) ||
       (vertex_so != nullptr);
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
   if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
     metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
   }
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+  args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -717,7 +654,7 @@ llvm::Error convert_dxbc_vertex_shader(
     for (auto& out : pShaderInternal->output_signature) {
       if(out.isSystemValue()) continue;
       func_signature.DefineOutput(air::OutputVertex{
-        .user = out.fullSemanticString(),
+        .user = out.consistentAttributeName(),
         .type = to_msl_type(out.componentType()),
       });
     }
@@ -725,48 +662,18 @@ llvm::Error convert_dxbc_vertex_shader(
   if (vertex_so) {
     auto bv = func_signature.DefineInput(air::InputBaseVertex{});
     auto vid = func_signature.DefineInput(air::InputVertexID{});
-    auto slot_0 = func_signature.DefineInput(air::ArgumentBindingBuffer{
+    auto so_table = func_signature.DefineInput(air::ArgumentBindingBuffer{
       .buffer_size = {},
-      .location_index = 20,
+      .location_index = SM50_BINDING_INDEX_STREAM_OUTPUT0,
       .array_size = 0,
-      .memory_access = air::MemoryAccess::write,
-      .address_space = air::AddressSpace::device,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
       .type = air::MSLUint{},
-      .arg_name = "so_slot0",
+      .arg_name = "stream_outputs",
       .raster_order_group = {}
     });
-    epilogue << make_irvalue([=](struct context ctx) {
-      auto &builder = ctx.builder;
-      auto base_vertex = ctx.function->getArg(bv);
-      auto vertex_id = ctx.function->getArg(vid);
-      auto slot0 = ctx.function->getArg(slot_0);
-      auto adjusted_vertex_id = builder.CreateSub(vertex_id, base_vertex);
-      auto output_regs = builder.CreateBitOrPointerCast(
-        ctx.resource.output.ptr_int4, llvm::PointerType::get(ctx.types._int, 0)
-      );
-      for (unsigned i = 0; i < vertex_so->num_elements; i++) {
-        auto &element = vertex_so->elements[i];
-        if (element.reg_id == 0xffffffff)
-          continue;
-        auto ptr = ctx.builder.CreateConstGEP1_32(
-          ctx.types._int, output_regs,
-          (unsigned)(element.reg_id * 4 + element.component)
-        );
-        auto target_offset = ctx.builder.CreateAdd(
-          ctx.builder.CreateMul(
-            adjusted_vertex_id,
-            ctx.builder.getInt32(vertex_so->strides[element.output_slot])
-          ),
-          ctx.builder.getInt32(element.offset)
-        );
-        auto target_ptr = ctx.builder.CreateGEP(
-          ctx.types._int, slot0, {ctx.builder.CreateLShr(target_offset, 2)}
-        );
-        ctx.builder.CreateStore(
-          ctx.builder.CreateLoad(ctx.types._int, ptr), target_ptr, true
-        );
-      }
-      return nullptr;
+    epilogue.Add([=](llvm::Value *value, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+      return io.PopulateOutputStreamOutput(value, vertex_so, bv, vid, so_table);
     });
   }
 
@@ -783,7 +690,11 @@ llvm::Error convert_dxbc_vertex_shader(
     );
   };
 
-  setup_binding_table(shader_info, resource_map, func_signature, module);
+  auto binding_map = rootsig ? setup_binding_rootsig(
+                                   shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
+                                   rootsig->bytecode_length
+                               )
+                             : setup_binding_table2(shader_info, func_signature, module);
 
   uint32_t rta_idx_out = ~0u;
   if (gs_passthrough && gs_passthrough->Data.RenderTargetArrayIndexReg != 255) {
@@ -804,7 +715,13 @@ llvm::Error convert_dxbc_vertex_shader(
   auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
-  llvm::air::AIRBuilder air(builder, nulldbg);
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+      },
+      builder, nulldbg
+  );
 
   setup_metal_version(module, metal_version);
 
@@ -840,24 +757,35 @@ llvm::Error convert_dxbc_vertex_shader(
     shader_info, resource_map, types, module, builder
   );
 
-  struct context ctx {
-    .builder = builder, .air = air, .llvm = context, .module = module, .function = function,
-    .resource = resource_map, .types = types, .pso_sample_mask = 0xffffffff,
-    .shader_type = pShaderInternal->shader_type,
-    .metal_version = metal_version,
+  struct context ctx{
+      .builder = builder,
+      .air = air,
+      .binding = *binding_map,
+      .llvm = context,
+      .module = module,
+      .function = function,
+      .resource = resource_map,
+      .types = types,
+      .pso_sample_mask = 0xffffffff,
+      .shader_type = pShaderInternal->shader_type,
+      .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  auto epilogue_result = epilogue.build(ctx);
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
@@ -1007,7 +935,7 @@ bool CheckGSSignatureIsPassThrough(
   num_input = input.GetNumParameters();
   num_output = output.Signature(0)->GetNumParameters();
   if (num_output > num_input) {
-    // at least it is a non-trival shader that generates new data
+    // at least it is a non-trivial shader that generates new data
     return false;
   }
   bool has_match_record;
@@ -1054,21 +982,26 @@ static int parse_shader(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
 
   if (ppShader == nullptr) {
     errorOut << "ppShader can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
+
+  UINT32 dxilBlobIdx = DXBCParser.FindNextMatchingBlob(microsoft::DXBC_DXIL, 0);
+  if (dxilBlobIdx != DXBC_BLOB_NOT_FOUND)
+    return dxmt::dxil::initialize(
+      DXBCParser.GetBlob(dxilBlobIdx), DXBCParser.GetBlobSize(dxilBlobIdx), ppShader,
+      pRefl, ppError
+    );
 
   UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
@@ -1076,8 +1009,7 @@ static int parse_shader(
   }
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
     errorOut << "Invalid DXBC bytecode: shader blob not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
   const void *codeBlob = DXBCParser.GetBlob(codeBlobIdx);
 
@@ -1087,17 +1019,15 @@ static int parse_shader(
   CSignatureParser inputParser;
   if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: input signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
   CSignatureParser5 outputParser;
   if (DXBCGetOutputSignature(pBytecode, &outputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: output signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  auto sm50_shader = new SM50ShaderInternal();
+  auto sm50_shader = std::make_unique<SM50ShaderInternal>();
   sm50_shader->shader_type = CodeParser.ShaderType();
   sm50_shader->madeira_sm_major = CodeParser.ShaderMajorVersion(); /* madeira-bcd: vertex fetch bounds */
   auto shader_info = &(sm50_shader->shader_info);
@@ -1110,7 +1040,7 @@ static int parse_shader(
     }
   }
 
-  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader.get(), inputParser, outputParser);
 
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
@@ -1315,20 +1245,18 @@ static int parse_shader(
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
       if (threads_per_patch > 32) {
         errorOut << "Threadgroup size of tessellation pipeline is too large.";
-        *ppError = (sm50_error_t)errorObj;
-        return 1;
+        SM50_RETURN_ERROR(errorObj, ppError, 1);
       }
       auto patch_per_group = 32 / threads_per_patch;
       float max_tesselation_factor = sm50_shader->max_tesselation_factor;
 
-      while (estimate_payload_size(sm50_shader, max_tesselation_factor, patch_per_group) > 16384) {
+      while (estimate_payload_size(sm50_shader.get(), max_tesselation_factor, patch_per_group) > 16384) {
         if (patch_per_group == 1) {
           if (max_tesselation_factor > 1.0f) {
             max_tesselation_factor = std::max(max_tesselation_factor - 2.0f, 1.0f);
           } else {
             errorOut << "Payload size of tessellation pipeline is too large.";
-            *ppError = (sm50_error_t)errorObj;
-            return 1;
+            SM50_RETURN_ERROR(errorObj, ppError, 1);
           }
         } else {
           patch_per_group = patch_per_group >> 1;
@@ -1349,7 +1277,7 @@ static int parse_shader(
       uint32_t max_potential_tess_factor = 1;
 
       for (int tess_factor = 1; tess_factor <= 64; tess_factor++) {
-        auto x = estimate_mesh_size(sm50_shader, tess_factor);
+        auto x = estimate_mesh_size(sm50_shader.get(), tess_factor);
         if (x > 32768)
           break;
         max_potential_tess_factor = tess_factor;
@@ -1358,25 +1286,23 @@ static int parse_shader(
       pRefl->PostTessellator = {.MaxPotentialTessFactor = max_potential_tess_factor};
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
-      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
-          binding_srv_hi_mask || binding_srv_lo_mask ||
-          !CheckGSBBIsPassThrough(sm50_shader->entry())) {
+      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask || binding_srv_hi_mask ||
+          binding_srv_lo_mask ||
+          !(CheckGSBBIsPassThrough(sm50_shader->entry()) &&
+            CheckGSSignatureIsPassThrough(inputParser, outputParser, pRefl->GeometryShader.Data))) {
         pRefl->GeometryShader.GSPassThrough = ~0u;
-      } else {
-        CheckGSSignatureIsPassThrough(
-          inputParser, outputParser, pRefl->GeometryShader.Data
-        );
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PSValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
+      pRefl->PixelShader.ValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
+      pRefl->PixelShader.HasCoverageOutput = sm50_shader->ps_has_coverage_output;
     }
     pRefl->NumOutputElement = sm50_shader->max_output_register;
     pRefl->ArgumentTableQwords = binding_table.Size();
   }
 
-  *ppShader = sm50_shader;
+  *ppShader = (sm50_shader_t)sm50_shader.release();
   return 0;
 };
 
@@ -1509,30 +1435,28 @@ AIRCONV_API int SM50Compile(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pShader;
   pShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pShader, hold_pShader);
   if (!pShader) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
 
@@ -1542,11 +1466,8 @@ AIRCONV_API int SM50Compile(
   if (auto err = dxmt::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1578,16 +1499,16 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
@@ -1596,14 +1517,12 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   pHullShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pHullShader, hold_pHullShader);
   if (!pVertexShader || !pHullShader) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
@@ -1615,11 +1534,8 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
         FunctionName, context, *pModule, pHullShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1652,16 +1568,16 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pHullShader;
@@ -1670,14 +1586,12 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   pDomainShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pDomainShader, hold_pDomainShader);
   if (!pHullShader || !pDomainShader) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
@@ -1690,11 +1604,8 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
         (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule,
         pDomainShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1727,16 +1638,16 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
@@ -1745,14 +1656,12 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   pGeometryShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pGeometryShader, hold_pGeometryShader);
   if (!pVertexShader || !pGeometryShader) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
@@ -1764,11 +1673,8 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
         pVertexShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1800,16 +1706,16 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   std::unique_ptr<dxbc::SM50ShaderInternal> hold_pVertexShader;
@@ -1818,14 +1724,12 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   pGeometryShader = dxbc::with_parsed_program((dxbc::SM50ShaderInternal *)pGeometryShader, hold_pGeometryShader);
   if (!pVertexShader || !pGeometryShader) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
@@ -1838,11 +1742,8 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
         (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule,
         pGeometryShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1881,7 +1782,7 @@ AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode) {
 }
 
 AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize) {
-  auto pInternal = (SM50ErrorInternal *)pError;
+  auto pInternal = (dxmt::dxbc::SM50ErrorInternal *)pError;
   auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
   memcpy(pBuffer, pInternal->buf.data(), str_len);
   pBuffer[str_len] = '\0';
@@ -1891,6 +1792,6 @@ AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_
 AIRCONV_API void SM50FreeError(sm50_error_t pError) {
   if (pError == nullptr)
     return;
-  auto pInternal = (SM50ErrorInternal *)pError;
+  auto pInternal = (dxmt::dxbc::SM50ErrorInternal *)pError;
   delete pInternal;
 }

@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 #include "dxmt_buffer.hpp"
@@ -17,7 +35,6 @@ struct BufferViewInfo {
 
 class D3D11Buffer : public TResourceBase<tag_buffer> {
 private:
-  Rc<Buffer> buffer_;
 #ifdef DXMT_DEBUG
   std::string debug_name;
 #endif
@@ -29,45 +46,37 @@ private:
   using SRVBase = TResourceViewBase<tag_shader_resource_view<D3D11Buffer>>;
 
   class TBufferSRV : public SRVBase {
-    BufferViewInfo info;
 
   public:
     TBufferSRV(
         const tag_shader_resource_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
         BufferViewInfo const &info
     ) :
-        SRVBase(pDesc, pResource, pDevice),
-        info(info) {}
+        SRVBase(pDesc, pResource, pDevice) {
+      buffer_ = pResource->buffer_.ptr();
+      view_id_ = info.viewKey;
+      slice_ = {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };
+      subset_ = ResourceSubsetState(info.byteOffset, info.byteWidth);
+    }
 
     ~TBufferSRV() {}
-
-    Rc<Buffer> buffer() final { return resource->buffer_; };
-    Rc<Texture> texture() final { return {}; };
-    unsigned viewId() final { return info.viewKey;};
-    BufferSlice bufferSlice() final { return {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };}
   };
 
   using UAVBase = TResourceViewBase<tag_unordered_access_view<D3D11Buffer>>;
 
   class UAVWithCounter : public UAVBase {
-  private:
-    BufferViewInfo info;
-    Rc<Buffer> counter_;
-
   public:
     UAVWithCounter(
         const tag_unordered_access_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
-        BufferViewInfo const &info, Rc<Buffer>&& counter
+        BufferViewInfo const &info, Rc<Counter>&& counter
     ) :
-        UAVBase(pDesc, pResource, pDevice),
-        info(info),
-        counter_(std::move(counter)) {}
-
-    Rc<Buffer> buffer() final { return resource->buffer_; };
-    Rc<Texture> texture() final { return {}; };
-    unsigned viewId() final { return info.viewKey;};
-    BufferSlice bufferSlice() final { return {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };}
-    Rc<Buffer> counter() final { return counter_; };
+        UAVBase(pDesc, pResource, pDevice) {
+      buffer_ = pResource->buffer_.ptr();
+      view_id_ = info.viewKey;
+      slice_ = {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };
+      counter_ = std::move(counter);
+      subset_ = ResourceSubsetState(info.byteOffset, info.byteWidth);
+    }
   };
 
 public:
@@ -83,7 +92,7 @@ public:
     if (pDesc->Usage != D3D11_USAGE_DYNAMIC) {
       if (pInitialData)
         flags.set(BufferAllocationFlag::GpuManaged);
-      else if (pDesc->BindFlags & kD3D11OuputBindFlags)
+      else if (pDesc->BindFlags & kD3D11OutputBindFlags)
         flags.set(BufferAllocationFlag::GpuPrivate);
       else
         flags.set(BufferAllocationFlag::GpuManaged);
@@ -104,7 +113,7 @@ public:
     D3D11_ASSERT(_.ptr() == nullptr);
     structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-    if (!(desc.BindFlags & kD3D11OuputBindFlags)) {
+    if (!(desc.BindFlags & kD3D11OutputBindFlags)) {
       dynamic_ = new DynamicBuffer(buffer_.ptr(), flags);
     }
   }
@@ -118,18 +127,6 @@ public:
     return TResourceBase<tag_buffer>::QueryInterface(riid, ppvObject);
   }
 
-  Rc<Buffer>
-  buffer() final {
-    return buffer_;
-  };
-  Rc<Texture>
-  texture() final {
-    return {};
-  };
-  BufferSlice
-  bufferSlice() final {
-    return {0, desc.ByteWidth, 0, 0};
-  }
   Rc<StagingResource>
   staging(UINT Subresource) final {
     return nullptr;
@@ -235,7 +232,7 @@ public:
     }
     WMTPixelFormat view_format = WMTPixelFormatInvalid;
     uint32_t offset, size, viewElementOffset, viewElementWidth;
-    Rc<Buffer> counter = {};
+    Rc<Counter> counter = {};
     if (structured) {
       if (finalDesc.Format != DXGI_FORMAT_UNKNOWN) {
         return E_INVALIDARG;
@@ -250,8 +247,7 @@ public:
       viewElementOffset = finalDesc.Buffer.FirstElement * (desc.StructureByteStride >> 2);
       viewElementWidth = finalDesc.Buffer.NumElements * (desc.StructureByteStride >> 2);
       if (finalDesc.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) {
-        counter = new dxmt::Buffer(sizeof(uint32_t), m_parent->GetMTLDevice());
-        counter->rename(counter->allocate(BufferAllocationFlag::GpuManaged, "d3d11_buffer:counter"));
+        counter = new Counter();
       }
     } else if (finalDesc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
       if (!allow_raw_view)

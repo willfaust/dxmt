@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -10,11 +11,14 @@
 #include <vector>
 
 #include "DXBCParser/DXBCUtils.h"
-#include "air_operations.hpp"
 #include "air_signature.hpp"
+#include "air_type.hpp"
 #include "dxbc_constants.hpp"
 #include "dxbc_instructions.hpp"
+#include "dxil_metadata.hpp"
 #include "nt/air_builder.hpp"
+#include "nt/dxbc_binding_map.hpp"
+#include "nt/dxbc_io_helper.hpp"
 #include "shader_common.hpp"
 
 #include "airconv_public.h"
@@ -36,7 +40,7 @@ struct ShaderResourceViewInfo {
   bool sampled = false;
   bool compared = false; // therefore we use depth texture!
 
-  uint32_t strucure_stride = 0;
+  uint32_t structure_stride = 0;
   uint32_t arg_index;
   uint32_t arg_metadata_index;
 };
@@ -50,7 +54,7 @@ struct UnorderedAccessViewInfo {
   bool rasterizer_order = false;
   bool with_counter = false;
 
-  uint32_t strucure_stride = 0;
+  uint32_t structure_stride = 0;
   uint32_t arg_index;
   uint32_t arg_metadata_index;
   uint32_t arg_counter_index;
@@ -97,7 +101,6 @@ public:
   air::ArgumentBufferBuilder binding_table;
   bool skipOptimization = false;
   bool refactoringAllowed = false;
-  bool use_cmp_exch = false;
   bool no_control_point_phase_passthrough = false;
   bool output_control_point_read = false;
   bool use_msad = false;
@@ -111,15 +114,12 @@ Instruction readInstruction(
   ShaderInfo &shader_info, uint32_t phase
 );
 
-using pvalue = dxmt::air::pvalue;
+using pvalue = llvm::Value *;
 using epvalue = llvm::Expected<pvalue>;
 using dxbc::Swizzle;
 using dxbc::swizzle_identity;
 
 struct context;
-using IRValue = ReaderIO<context, pvalue>;
-using IREffect = ReaderIO<context, std::monostate>;
-using IndexedIRValue = std::function<IRValue(pvalue)>;
 
 struct register_file {
   llvm::Value *ptr_int4 = nullptr;
@@ -137,43 +137,16 @@ struct phase_temp {
   std::unordered_map<uint32_t, indexable_register_file> indexable_temp_map{};
 };
 
-struct sampler_descriptor {
-  IndexedIRValue handle;
-  IndexedIRValue handle_cube;
-  IndexedIRValue bias;
-};
-
-struct texture_descriptor {
-  air::MSLTexture texture_info;
-  IndexedIRValue resource_id;
-  IndexedIRValue metadata;
-  bool global_coherent;
-};
-
-struct buffer_descriptor {
-  uint32_t structure_stride;
-  IndexedIRValue resource_id;
-  IndexedIRValue metadata;
-  bool global_coherent;
-};
-
 struct interpolant_descriptor {
-  IndexedIRValue interpolant;
+  uint32_t arg_index;
   bool perspective;
 };
 
 struct io_binding_map {
   llvm::GlobalVariable *icb = nullptr;
   llvm::Value *icb_float = nullptr;
-  std::unordered_map<uint32_t, IndexedIRValue> cb_range_map{};
-  std::unordered_map<uint32_t, sampler_descriptor> sampler_range_map{};
-  std::unordered_map<uint32_t, texture_descriptor> srv_range_map{};
-  std::unordered_map<uint32_t, buffer_descriptor> srv_buf_range_map{};
-  std::unordered_map<uint32_t, texture_descriptor> uav_range_map{};
-  std::unordered_map<uint32_t, buffer_descriptor> uav_buf_range_map{};
   std::unordered_map<uint32_t, std::pair<uint32_t, llvm::GlobalVariable *>>
     tgsm_map{};
-  std::unordered_map<uint32_t, IndexedIRValue> uav_counter_range_map{};
   std::unordered_map<uint32_t, interpolant_descriptor> interpolant_map{};
 
   register_file input{};
@@ -192,6 +165,9 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
 
+  // only dxil will access it
+  llvm::Value *sample_index_arg = nullptr;
+
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;
 
@@ -203,8 +179,6 @@ struct io_binding_map {
   llvm::AllocaInst *depth_output_reg = nullptr;
   llvm::AllocaInst *stencil_ref_reg = nullptr;
   llvm::AllocaInst *coverage_mask_reg = nullptr;
-
-  llvm::AllocaInst *cmp_exch_temp = nullptr;
 
   // special buffers for tessellation
   llvm::Type *hull_cp_passthrough_type = nullptr;
@@ -223,13 +197,14 @@ struct io_binding_map {
 
   // geometry shader ops
   llvm::Value *mesh = nullptr;
-  std::function<IREffect()> call_emit;
-  std::function<IREffect()> call_cut;
+  std::function<void()> call_emit;
+  std::function<void()> call_cut;
 };
 
 struct context {
   llvm::IRBuilder<> &builder;
   llvm::air::AIRBuilder &air;
+  BindingMap &binding;
   llvm::LLVMContext &llvm;
   llvm::Module &module;
   llvm::Function *function;
@@ -240,72 +215,13 @@ struct context {
   SM50_SHADER_METAL_VERSION metal_version;
 };
 
-template <typename S> IRValue make_irvalue(S &&fs) {
-  return IRValue(std::forward<S>(fs));
-}
-
-template <typename S> IRValue make_irvalue_bind(S &&fs) {
-  return IRValue([fs = std::forward<S>(fs)](auto ctx) {
-    return fs(ctx).build(ctx);
-  });
-}
-
-template <typename S> IREffect make_effect(S &&fs) {
-  return IREffect(std::forward<S>(fs));
-}
-
-template <typename S> IREffect make_effect_bind(S &&fs) {
-  return IREffect([fs = std::forward<S>(fs)](auto ctx) mutable {
-    return fs(ctx).build(ctx);
-  });
-}
-
-/* ml1031: zero an input register the paired vertex stage never writes. */
-IREffect init_input_reg_zero(uint32_t to_reg, uint32_t mask, bool is_int);
-
-IREffect store_at_vec4_array_masked(
-  llvm::Value *array, pvalue index, pvalue maybe_vec4, uint32_t mask
-);
-
-IREffect init_input_reg(
-  uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
-  bool fix_w_component = false
-);
-
-IREffect init_input_reg_with_interpolation(
-  uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
-  air::Interpolation interpolation, uint32_t sampleidx_at
-);
-
-std::function<IRValue(pvalue)>
-pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element);
-
-std::function<IRValue(pvalue)>
-pop_output_reg_fill(uint32_t from_reg, uint32_t mask, uint32_t to_element);
-std::function<IRValue(pvalue)>
-pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
-
-std::function<IRValue(pvalue)>
-pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_element);
-
-IREffect pull_vertex_input(
-  air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask,
-  bool madeira_sm4 = false /* madeira-bcd: vertex fetch bounds */
-);
-
-IREffect pop_mesh_output_render_taget_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id);
-IREffect pop_mesh_output_viewport_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id);
-IREffect pop_mesh_output_position(uint32_t from_reg, uint32_t mask, pvalue vertex_id);
-IREffect
-pop_mesh_output_vertex_data(uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id, air::MSLScalerOrVectorType desired_type);
-
 llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   BasicBlock *entry, context &ctx, llvm::BasicBlock *return_bb
 );
 
 constexpr air::MSLScalerOrVectorType to_msl_type(RegisterComponentType type) {
   switch (type) {
+  default:
   case RegisterComponentType::Unknown: {
     assert(0 && "unknown component type");
     break;
@@ -332,8 +248,8 @@ struct PatchConstantScalarInfo {
 };
 
 struct SignatureContext {
-  IREffect &prologue;
-  IRValue &epilogue;
+  Prologues &prologue;
+  Epilogues &epilogue;
   air::FunctionSignatureBuilder &func_signature;
   io_binding_map &resource;
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout;
@@ -342,22 +258,33 @@ struct SignatureContext {
   bool skip_vertex_output;
   uint32_t pull_mode_reg_mask;
   uint32_t unorm_output_reg_mask;
-  /* ml1031: names the paired vertex stage actually writes. nullptr => do not
-   * filter (pre-ml1031 behaviour). */
-  const std::unordered_set<std::string> *provided_interpolants;
-  /* ml1033: what the filter actually DID, so a misfire is visible. */
-  unsigned ps_inputs_seen;
-  unsigned ps_inputs_zeroed;
+  const std::unordered_set<std::string> *provided_interpolants = nullptr;
+  unsigned ps_inputs_seen = 0;
+  unsigned ps_inputs_zeroed = 0;
   std::string ps_inputs_zeroed_names;
+  uint32_t pso_sample_mask;
+  // it is considered optional (as a hint)
+  air::MTLPixelFormat pixel_formats[8];
 
   SignatureContext(
-    IREffect &prologue, IRValue &epilogue, air::FunctionSignatureBuilder &func_signature, io_binding_map &resource
-  )
-      : prologue(prologue), epilogue(epilogue), func_signature(func_signature), resource(resource), ia_layout(nullptr),
-        dual_source_blending(false), disable_depth_output(false), skip_vertex_output(false), pull_mode_reg_mask(0),
-        unorm_output_reg_mask(0), provided_interpolants(nullptr), ps_inputs_seen(0),
-        ps_inputs_zeroed(0){};
+      Prologues &prologue, Epilogues &epilogue, air::FunctionSignatureBuilder &func_signature, io_binding_map &resource
+  ) :
+      prologue(prologue),
+      epilogue(epilogue),
+      func_signature(func_signature),
+      resource(resource),
+      ia_layout(nullptr),
+      dual_source_blending(false),
+      disable_depth_output(false),
+      skip_vertex_output(false),
+      pull_mode_reg_mask(0),
+      unorm_output_reg_mask(0),
+      pso_sample_mask(0xffffffff) {
+    memset(pixel_formats, 0, sizeof(pixel_formats));
+  };
 };
+
+RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat format);
 
 struct MeshOutputContext {
   llvm::Value *vertex_id;
@@ -393,6 +320,10 @@ public:
     return semantic_name_ + std::to_string(semantic_index_);
   }
 
+  std::string consistentAttributeName() const {
+    return "reg" + std::to_string(register_) + "_" + std::to_string(std::countr_zero(mask_ & 0xFu));
+  }
+
   uint32_t stream() const { return stream_; }
 
   uint32_t mask() const { return mask_; }
@@ -423,6 +354,9 @@ public:
   dxmt::air::FunctionSignatureBuilder func_signature;
   std::vector<Signature> output_signature;
   std::vector<std::unique_ptr<BasicBlock>> bbs;
+  std::unique_ptr<llvm::LLVMContext> dxil_context;
+  std::unique_ptr<llvm::Module> dxil;
+  dxil::EntryPoint dxil_entry;
   std::vector<std::function<void(SignatureContext &)>> signature_handlers;
   /* SM50Initialize drops bbs and signature_handlers and keeps the bytecode;
    * see with_parsed_program */
@@ -446,17 +380,31 @@ public:
   std::vector<PatchConstantScalarInfo> patch_constant_scalars;
   uint32_t hull_maximum_threads_per_patch = 0;
   std::vector<ScalarInfo> clip_distance_scalars;
+  std::vector<ScalarInfo> cull_distance_scalars;
   microsoft::D3D10_SB_PRIMITIVE gs_input_primitive = {};
-  std::vector<std::function<IREffect(MeshOutputContext &)>> mesh_output_handlers;
+  std::vector<std::function<void(MeshOutputContext &, IOHelper &)>> mesh_output_handlers;
   uint32_t num_mesh_vertex_data = 0;
   microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY gs_output_topology = {};
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
+  uint32_t ps_has_coverage_output = 0;
 
   BasicBlock *entry() const {
     return bbs.front().get();
   }
 };
+
+class SM50ErrorInternal {
+public:
+  llvm::SmallVector<char, 0> buf;
+};
+
+#define SM50_RETURN_ERROR(errorObj, ppError, errorCode) \
+  do { \
+    if (ppError) \
+      *(ppError) = (sm50_error_t)(errorObj).release(); \
+    return errorCode; \
+  } while (0)
 
 void handle_signature(
   microsoft::CSignatureParser &inputParser,
@@ -476,17 +424,19 @@ size_t estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint3
 
 size_t estimate_mesh_size(SM50ShaderInternal *pDomainStage, uint32_t max_potential_factor_int);
 
-constexpr uint32_t kConstantBufferBindIndex = 29;
-constexpr uint32_t kArgumentBufferBindIndex = 30;
-
-void setup_binding_table(
-  const ShaderInfo *shader_info, io_binding_map &resource_map,
-  air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
-  uint32_t argbuffer_constant_slot = kConstantBufferBindIndex, 
-  uint32_t argbuffer_slot = kArgumentBufferBindIndex
+std::unique_ptr<BindingMap> setup_binding_table2(
+    const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+    uint32_t argbuffer_constant_slot = SM50_BINDING_INDEX_CONSTANT_BUFFER, uint32_t argbuffer_slot = SM50_BINDING_INDEX_ARGUMENT_TABLE
 );
 
-void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_verison);
+std::unique_ptr<BindingMap> setup_binding_rootsig(
+    const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+    microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, const void *bytecode, size_t bytecode_length,
+    uint32_t root_sig_slot = SM50_BINDING_INDEX_ROOT_ARGUMENTS,
+    uint32_t static_sampler_slot = SM50_BINDING_INDEX_STATIC_SAMPLERS
+);
+
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
 
 void setup_temp_register(
   const ShaderInfo *shader_info, io_binding_map &resource_map,

@@ -18,6 +18,11 @@
 
 namespace dxmt {
 
+const GUID kWineDXGIAdapterUUID = {0x17399d75,
+                                   0x964e,
+                                   0x4c03,
+                                   {0x99, 0xf8, 0x9d, 0x4f, 0xd1, 0x96, 0xdd, 0x62}};
+
 Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, DxgiOptions &options);
 
 /* madeira-bcd: video-memory budget events (tools/patch-dxgi-budget-events.py),
@@ -186,9 +191,9 @@ LUID GetAdapterLuid(WMT::Device device) {
   return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
 }
 
-class MTLDXGIAdatper : public MTLDXGIObject<IMTLDXGIAdapter> {
+class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
-  MTLDXGIAdatper(WMT::Device device, IDXGIFactory *factory, Config &config)
+  MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
       : device_(device), factory_(factory), options_(config) {
     D3DKMT_OPENADAPTERFROMLUID open = {};
     open.AdapterLuid = GetAdapterLuid(device_);
@@ -198,7 +203,7 @@ public:
       local_kmt_ = open.hAdapter;
   };
 
-  ~MTLDXGIAdatper() {
+  ~MTLDXGIAdapter() {
     if (local_kmt_) {
       D3DKMT_CLOSEADAPTER close = {};
       close.hAdapter = local_kmt_;
@@ -221,6 +226,9 @@ public:
       *ppvObject = ref(this);
       return S_OK;
     }
+
+    if (riid == kWineDXGIAdapterUUID)
+      return E_NOINTERFACE;
 
     if (logQueryInterfaceError(__uuidof(IDXGIAdapter), riid)) {
       WARN("DXGIAdapter: Unknown interface query ", str::format(riid));
@@ -578,7 +586,7 @@ private:
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config) {
   return Com<IMTLDXGIAdapter>::transfer(
-      new MTLDXGIAdatper(Device, pFactory, config));
+      new MTLDXGIAdapter(Device, pFactory, config));
 }
 
 } // namespace dxmt

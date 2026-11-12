@@ -5,24 +5,10 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
+#define AIRCONV_VERSION 26
+
 #ifdef __cplusplus
 #include <string>
-enum class ShaderType {
-  Vertex,
-  /* Metal: fragment function */
-  Pixel,
-  /* Metal: kernel function */
-  Compute,
-  /* Not present in Metal */
-  Hull,
-  /* Metal: post-vertex function */
-  Domain,
-  /* Not present in Metal */
-  Geometry,
-  Mesh,
-  /* Metal: object function */
-  Amplification,
-};
 
 enum class SM50BindingType : uint32_t {
   ConstantBuffer,
@@ -31,7 +17,6 @@ enum class SM50BindingType : uint32_t {
   UAV,
 };
 #else
-typedef uint32_t ShaderType;
 typedef uint32_t SM50BindingType;
 #endif
 
@@ -53,6 +38,22 @@ struct MTL_SM50_RANGE_INFO {
   uint32_t StructurePtrOffset; /* 64-bit WORD offset into the argument table */
   uint32_t Flags;              /* MTL_SM50_SHADER_ARGUMENT_FLAG: picks the encoding */
   uint32_t IsConstantBufferTable; /* 1 = belongs to the table at ConstanttBufferTableBindIndex */
+};
+
+enum SM50_BINDING_INDEX: uint32_t {
+  SM50_BINDING_INDEX_CONSTANT_BUFFER = 0,
+  SM50_BINDING_INDEX_ARGUMENT_TABLE = 1,
+  SM50_BINDING_INDEX_VERTEX_BUFFER = 2,
+  SM50_BINDING_INDEX_INDEX_BUFFER = 3,
+  SM50_BINDING_INDEX_DRAW_ARGUMENTS = 4,
+  SM50_BINDING_INDEX_INDIRECT_ARGUMENTS = 4,
+  SM50_BINDING_INDEX_STREAM_OUTPUT0 = 5,
+  /* For multiple stages in the same shader function */
+  SM50_BINDING_INDEX_CONSTANT_BUFFER2 = 6,
+  SM50_BINDING_INDEX_ARGUMENT_TABLE2 = 7,
+
+  SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
+  SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
 };
 
 enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
@@ -113,6 +114,11 @@ struct MTL_POST_TESSELLATOR_REFLECTION {
   uint32_t MaxPotentialTessFactor;
 };
 
+struct MTL_PIXEL_SHADER_REFLECTION {
+  uint32_t ValidRenderTargets;
+  uint32_t HasCoverageOutput;
+};
+
 struct MTL_SHADER_REFLECTION {
   uint32_t ConstanttBufferTableBindIndex;
   uint32_t ArgumentBufferBindIndex;
@@ -123,7 +129,11 @@ struct MTL_SHADER_REFLECTION {
     struct MTL_TESSELLATOR_REFLECTION Tessellator;
     struct MTL_GEOMETRY_SHADER_REFLECTION GeometryShader;
     struct MTL_POST_TESSELLATOR_REFLECTION PostTessellator;
+    /**
+    \deprecated for compatibility, use PixelShader.ValidRenderTargets instead
+     */
     uint32_t PSValidRenderTargets;
+    struct MTL_PIXEL_SHADER_REFLECTION PixelShader;
   };
   uint16_t ConstantBufferSlotMask;
   uint16_t SamplerSlotMask;
@@ -219,8 +229,10 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   SM50_SHADER_GS_PASS_THROUGH = 5,
   SM50_SHADER_PSO_GEOMETRY_SHADER = 6,
   SM50_SHADER_PSO_TESSELLATOR = 7,
+  SM50_SHADER_ROOT_SIGNATURE = 8,
+  SM50_SHADER_ROOT_SIGNATURE2 = 9,
   /* ml1031: the vertex stage this pixel shader will be paired with. */
-  SM50_SHADER_PSO_VERTEX_INTERFACE = 8,
+  SM50_SHADER_PSO_VERTEX_INTERFACE = 10,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -281,10 +293,16 @@ enum SM50_SHADER_METAL_VERSION {
   SM50_SHADER_METAL_MAX = 0xffffffff,
 };
 
+enum SM50_SHADER_FLAG {
+  SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO = 1 << 0,
+  SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
+};
+
 struct SM50_SHADER_COMMON_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   enum SM50_SHADER_METAL_VERSION metal_version;
+  enum SM50_SHADER_FLAG flags;
 };
 
 struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
@@ -294,6 +312,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
+  /** MTLPixelFormat */
+  uint32_t pixel_formats[8];
 };
 
 struct SM50_IA_INPUT_ELEMENT {
@@ -306,16 +326,17 @@ struct SM50_IA_INPUT_ELEMENT {
   uint32_t step_rate: 31;
 };
 
-enum SM50_INDEX_BUFFER_FORAMT {
+enum SM50_INDEX_BUFFER_FORMAT {
   SM50_INDEX_BUFFER_FORMAT_NONE = 0,
   SM50_INDEX_BUFFER_FORMAT_UINT16 = 1,
   SM50_INDEX_BUFFER_FORMAT_UINT32 = 2,
+  SM50_INDEX_BUFFER_FORMAT_DYNAMIC = 3,
 };
 
 struct SM50_SHADER_IA_INPUT_LAYOUT_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
-  enum SM50_INDEX_BUFFER_FORAMT index_buffer_format;
+  enum SM50_INDEX_BUFFER_FORMAT index_buffer_format;
   uint32_t slot_mask;
   uint32_t num_elements;
   struct SM50_IA_INPUT_ELEMENT *elements;
@@ -341,6 +362,13 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   uint32_t max_potential_tess_factor;
+};
+
+struct SM50_SHADER_ROOT_SIGNATURE_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  const void* bytecode;
+  size_t bytecode_length;
 };
 
 AIRCONV_API int SM50Initialize(

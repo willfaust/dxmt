@@ -1,3 +1,22 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ * Copyright 2026 Marc-Aurel Zent for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #pragma once
 
 #include "Metal.hpp"
@@ -6,6 +25,7 @@
 #include "dxmt_command.hpp"
 #include "dxmt_command_list.hpp"
 #include "dxmt_context.hpp"
+#include "dxmt_counter.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_resource_initializer.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
@@ -140,7 +160,7 @@ public:
     list_enc.execute(enc);
     attached_cmdbuf = cmdbuf;
     auto t1 = clock::now();
-    visibility_readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
+    readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
     auto t2 = clock::now();
     statistics.encode_prepare_interval += (t1 - t0);
     statistics.encode_flush_interval += (t2 - t1);
@@ -158,7 +178,7 @@ public:
   uint64_t chunk_event_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
-  std::unique_ptr<VisibilityResultReadback> visibility_readback;
+  QueryReadbacks readback;
   uint64_t resource_initializer_event_id;
   std::vector<std::shared_ptr<GpuCompletionTarget>> completion_targets;
   dxmt::mutex completion_targets_mutex_;
@@ -184,7 +204,7 @@ public:
   void
   reset() noexcept {
     signal_frame_latency_fence_ = ~0ull;
-    visibility_readback = {};
+    readback = {};
     completion_targets.clear();
     list_enc.reset();
     ref_tracker.clear();
@@ -248,6 +268,7 @@ public:
   std::uint64_t current_event_seq_id = 0;
   FrameStatisticsContainer statistics;
   ResourceInitializer initializer;
+  CounterPool counter_pool;
 
   CommandQueue(WMT::Device device);
 
@@ -323,7 +344,7 @@ public:
       auto t0 = clock::now();
       frame_latency_fence_.wait(frame_count - max_latency_);
       auto t1 = clock::now();
-      statistics.at(frame_count).present_lantency_interval += (t1 - t0);
+      statistics.at(frame_count).present_latency_interval += (t1 - t0);
     }
     statistics.at(frame_count).latency = max_latency_;
   }

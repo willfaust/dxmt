@@ -14,7 +14,6 @@ namespace dxmt {
 template <typename tag_texture>
 class TDynamicLinearTexture : public TResourceBase<tag_texture> {
 private:
-  Rc<Texture> texture_;
   Rc<DynamicLinearTexture> dynamic_;
   size_t bytes_per_image_;
   size_t bytes_per_row_;
@@ -22,20 +21,20 @@ private:
   using SRVBase = TResourceViewBase<tag_shader_resource_view<TDynamicLinearTexture>>;
 
   class SRV : public SRVBase {
-    TextureViewKey view_key;
-
   public:
     SRV(const tag_shader_resource_view<>::DESC1 *pDesc, TDynamicLinearTexture *pResource, MTLD3D11Device *pDevice,
-        TextureViewKey view_key) :
-        SRVBase(pDesc, pResource, pDevice),
-        view_key(view_key) {}
+        const TextureViewDescriptor &descriptor) :
+        SRVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength()
+      );
+    }
 
     ~SRV() {}
-
-    Rc<Buffer> buffer() final { return {}; };
-    Rc<Texture> texture() final { return this->resource->texture_; };
-    unsigned viewId() final { return view_key;};
-    BufferSlice bufferSlice() final { return {};}
   };
 
 public:
@@ -46,8 +45,9 @@ TDynamicLinearTexture(
       TResourceBase<tag_texture>(*pDesc, device),
       bytes_per_image_(bytes_per_image),
       bytes_per_row_(bytes_per_row) {
-    texture_ = new Texture(bytes_per_image, bytes_per_row, descriptor, device->GetMTLDevice());
+    this->texture_ = new Texture(bytes_per_image, bytes_per_row, descriptor, device->GetMTLDevice());
     Flags<TextureAllocationFlag> flags;
+    flags.set(TextureAllocationFlag::ShaderReadonly);
     if (!this->m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
       flags.set(TextureAllocationFlag::CpuWriteCombined);
     // if (pDesc->Usage != D3D11_USAGE_DEFAULT)
@@ -55,13 +55,13 @@ TDynamicLinearTexture(
       flags.set(TextureAllocationFlag::GpuReadonly);
     if (pDesc->Usage != D3D11_USAGE_DYNAMIC)
       flags.set(TextureAllocationFlag::GpuManaged);
-    auto allocation = texture_->allocate(flags);
-    auto _ = texture_->rename(Rc(allocation));
+    auto allocation = this->texture_->allocate(flags);
+    auto _ = this->texture_->rename(Rc(allocation));
     D3D11_ASSERT(_.ptr() == nullptr);
 
     if (pInitialData) {
       if (pInitialData->SysMemPitch != bytes_per_row_) {
-        for (unsigned row = 0; row < texture_->height(); row++) {
+        for (unsigned row = 0; row < this->texture_->height(); row++) {
           memcpy(
               ptr_add(allocation->mappedMemory, row * bytes_per_row_),
               ptr_add(pInitialData->pSysMem, row * pInitialData->SysMemPitch),
@@ -71,12 +71,8 @@ TDynamicLinearTexture(
         memcpy(allocation->mappedMemory, pInitialData->pSysMem, bytes_per_image);
       }
     }
-    dynamic_ = new DynamicLinearTexture(texture_.ptr(), flags);
+    dynamic_ = new DynamicLinearTexture(this->texture_.ptr(), flags);
   }
-
-  Rc<Buffer> buffer() final { return {}; };
-  Rc<Texture> texture() final { return this->texture_; };
-  BufferSlice bufferSlice() final { return {};}
   Rc<StagingResource> staging(UINT) final { return nullptr; }
   Rc<DynamicBuffer> dynamicBuffer(UINT*, UINT*) final { return {}; };
   Rc<DynamicLinearTexture> dynamicLinearTexture(UINT* pBytesPerRow, UINT* pBytesPerImage) final {
@@ -89,6 +85,14 @@ TDynamicLinearTexture(
   HRESULT
   STDMETHODCALLTYPE
   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView) override;
+
+  HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) override {
+    if (Index)
+      return E_INVALIDARG;
+    auto surface = Com(new D3D11DXGISurface(this, Index));
+    *ppSurface = surface.ref();
+    return S_OK;
+  }
 };
 
 template<>
@@ -115,16 +119,15 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
     return E_FAIL;
   }
 
-  auto view_key = texture_->createView(
+  auto srv = ref(new SRV(
+      &finalDesc, this, this->m_parent,
       {.format = format.PixelFormat,
        .type = WMTTextureType2D,
        .firstMiplevel = 0,
        .miplevelCount = 1,
        .firstArraySlice = 0,
        .arraySize = 1}
-  );
-
-  auto srv = ref(new SRV(&finalDesc, this, this->m_parent, view_key));
+  ));
 
   *ppView = srv;
   return S_OK;
@@ -154,16 +157,15 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_1d>::CreateShaderRes
     return E_FAIL;
   }
 
-  auto view_key = texture_->createView(
+  auto srv = ref(new SRV(
+      &finalDesc, this, this->m_parent,
       {.format = format.PixelFormat,
        .type = WMTTextureType2D, // since all 1d texture is implemented as 1-row 2d texture
        .firstMiplevel = 0,
        .miplevelCount = 1,
        .firstArraySlice = 0,
        .arraySize = 1}
-  );
-
-  auto srv = ref(new SRV(&finalDesc, this, this->m_parent, view_key));
+  ));
 
   *ppView = srv;
   return S_OK;

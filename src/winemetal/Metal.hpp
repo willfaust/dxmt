@@ -204,7 +204,19 @@ class Fence : public Object {
 public:
 };
 
-class Resource : public Object {
+class CounterSampleBuffer : public Object {
+public:
+  void
+  resolveCounterRange(uint32_t start, uint32_t len, void *data_out, uint64_t data_length) {
+    MTLCounterSampleBuffer_resolveCounterRange(handle, start, len, data_out, data_length);
+  }
+};
+
+class Allocation : public Object {
+public:
+};
+
+class Resource : public Allocation {
 public:
 };
 
@@ -260,6 +272,16 @@ public:
     data.set((void *)pixelBytes);
     return MTLTexture_replaceRegion(handle, origin, size, level, slice, data, bytesPerRow, bytesPerImage);
   }
+
+  void
+  getBytes(
+      WMTOrigin origin, WMTSize size, uint64_t level, uint64_t slice, void *pixelBytes, uint64_t bytesPerRow,
+      uint64_t bytesPerImage
+  ) {
+    WMTMemoryPointer data;
+    data.set((void *)pixelBytes);
+    return MTLTexture_getBytes(handle, origin, size, level, slice, data, bytesPerRow, bytesPerImage);
+  }
 };
 
 class Buffer : public Resource {
@@ -279,6 +301,19 @@ public:
     WMTConstMemoryPointer ptr;
     ptr.set(data);
     MTLBuffer_updateContents(handle, offset, ptr, length);
+  }
+};
+
+class Heap : public Allocation {
+public:
+  Reference<Buffer>
+  newBuffer(WMTBufferInfo &info, uint64_t offset = ~0ull) {
+    return Reference<Buffer>(MTLHeap_newBuffer(handle, &info, offset));
+  }
+
+  Reference<Texture>
+  newTexture(WMTTextureInfo &info, uint64_t offset = ~0ull) {
+    return Reference<Texture>(MTLHeap_newTexture(handle, &info, offset));
   }
 };
 
@@ -504,6 +539,19 @@ public:
     cmd.fence = fence.handle;
     MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
+
+  void
+  resolveCounters(CounterSampleBuffer sample_buffer, uint32_t start, uint32_t len, Buffer dst, uint64_t dst_offset) {
+    struct wmtcmd_blit_resolvecounters cmd;
+    cmd.type = WMTBlitCommandResolveCounters;
+    cmd.next.set(nullptr);
+    cmd.sample_buffer = sample_buffer.handle;
+    cmd.start = start;
+    cmd.len = len;
+    cmd.dst_buffer = dst.handle;
+    cmd.dst_offset = dst_offset;
+    MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
 };
 
 class ComputeCommandEncoder : public CommandEncoder {
@@ -588,6 +636,29 @@ public:
   };
 };
 
+class ResidencySet : public Object {
+public:
+  void
+  addAllocations(const Allocation *allocations, uint64_t count) {
+    MTLResidencySet_addAllocations(handle, reinterpret_cast<const obj_handle_t *>(allocations), count);
+  }
+
+  void
+  removeAllocations(const Allocation *allocations, uint64_t count) {
+    MTLResidencySet_removeAllocations(handle, reinterpret_cast<const obj_handle_t *>(allocations), count);
+  }
+
+  void
+  removeAllAllocations() {
+    MTLResidencySet_removeAllAllocations(handle);
+  }
+
+  void
+  commit() {
+    MTLResidencySet_commit(handle);
+  }
+};
+
 class CommandBuffer : public Object {
 public:
   void
@@ -615,6 +686,11 @@ public:
     return LogContainer{MTLCommandBuffer_logs(handle)};
   }
 
+  uint64_t
+  gpuEndTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUEndTime);
+  }
+
   void
   encodeSignalEvent(Event event, uint64_t value) {
     return MTLCommandBuffer_encodeSignalEvent(handle, event.handle, value);
@@ -633,6 +709,11 @@ public:
   BlitCommandEncoder
   blitCommandEncoder() {
     return BlitCommandEncoder{MTLCommandBuffer_blitCommandEncoder(handle)};
+  }
+
+  BlitCommandEncoder
+  blitCommandEncoderWithSampleBuffers(WMTSampleBufferAttachmentInfo *attachments, uint64_t num_attachments) {
+    return BlitCommandEncoder{MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(handle, attachments, num_attachments)};
   }
 
   ComputeCommandEncoder
@@ -670,6 +751,11 @@ public:
   commandBuffer() {
     return CommandBuffer{MTLCommandQueue_commandBuffer(handle)};
   }
+
+  void
+  addResidencySet(ResidencySet residency_set) {
+    MTLCommandQueue_addResidencySet(handle, residency_set.handle);
+  }
 };
 
 class Function : public Object {};
@@ -697,6 +783,10 @@ public:
   serialize(const char *url, Error &error) {
     MTLBinaryArchive_serialize(handle, url, &error.handle);
   }
+};
+
+class IndirectCommandBuffer : public Resource {
+public:
 };
 
 class Device : public Object {
@@ -777,6 +867,11 @@ public:
     return Reference<Library>(MTLDevice_newLibrary(handle, data, &error.handle));
   }
 
+  Reference<Library>
+  newLibraryWithSource(std::string_view view, Error &error) {
+    return Reference<Library>(MTLDevice_newLibraryWithSource(handle, view.data(), view.length(), &error.handle));
+  }
+
   Reference<ComputePipelineState>
   newComputePipelineState(const Function &compute_function, Error &error) {
     WMTComputePipelineInfo info;
@@ -787,6 +882,7 @@ public:
     info.binary_archives_for_lookup.set(nullptr);
     info.num_binary_archives_for_lookup = 0;
     info.fail_on_binary_archive_miss = false;
+    info.support_indirect_command_buffers = false;
     return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
   }
 
@@ -800,6 +896,7 @@ public:
     info.binary_archives_for_lookup.set(nullptr);
     info.num_binary_archives_for_lookup = 0;
     info.fail_on_binary_archive_miss = false;
+    info.support_indirect_command_buffers = false;
     return Reference<ComputePipelineState>(MTLDevice_newComputePipelineState(handle, &info, &error.handle));
   }
 
@@ -818,6 +915,11 @@ public:
     return Reference<RenderPipelineState>(MTLDevice_newMeshRenderPipelineState(handle, &info, &error.handle));
   }
 
+  Reference<RenderPipelineState>
+  newRenderPipelineState(const WMTTileRenderPipelineInfo &info, Error &error) {
+    return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, &error.handle));
+  }
+
   Reference<Fence>
   newFence() {
     return Reference<Fence>(MTLDevice_newFence(handle));
@@ -826,6 +928,26 @@ public:
   Reference<Event>
   newEvent() {
     return Reference<Event>(MTLDevice_newEvent(handle));
+  }
+
+  Reference<ResidencySet>
+  newResidencySet(uint64_t init_capacity, Error &error) {
+    return Reference<ResidencySet>(MTLDevice_newResidencySet(handle, init_capacity, &error.handle));
+  }
+
+  Reference<Heap>
+  newHeap(const WMTHeapInfo &info) {
+    return Reference<Heap>(MTLDevice_newHeap(handle, &info));
+  }
+
+  WMTSizeAndAlign
+  heapBufferSizeAndAlign(uint64_t length, WMTResourceOptions options) {
+    return MTLDevice_heapBufferSizeAndAlign(handle, length, options);
+  }
+
+  WMTSizeAndAlign
+  heapTextureSizeAndAlign(WMTTextureInfo &info) {
+    return MTLDevice_heapTextureSizeAndAlign(handle, &info);
   }
 
   uint64_t
@@ -886,6 +1008,16 @@ public:
   Reference<Texture>
   newSharedTexture(WMTTextureInfo &info) {
     return Reference<Texture>(MTLDevice_newSharedTexture(handle, &info));
+  }
+
+  Reference<CounterSampleBuffer>
+  newCounterSampleBuffer(uint32_t sample_count, bool shared = true) {
+    return Reference<CounterSampleBuffer>(MTLCounterSampleBuffer_newTimestampBuffer(handle, sample_count, shared));
+  }
+
+  Reference<IndirectCommandBuffer>
+  newIndirectCommandBuffer(WMTIndirectCommandBufferInfo &info, uint64_t max_count, WMTResourceOptions options) {
+    return Reference<IndirectCommandBuffer>(MTLDevice_newIndirectCommandBuffer(handle, &info, max_count, options));
   }
 };
 
@@ -1050,6 +1182,7 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
+  info.support_indirect_command_buffers = false;
 }
 
 inline void
@@ -1061,6 +1194,7 @@ InitializeComputePipelineInfo(WMTComputePipelineInfo &info) {
   info.fail_on_binary_archive_miss = false;
   info.tgsize_is_multiple_of_sgwidth = false;
   info.immutable_buffers = 0;
+  info.support_indirect_command_buffers = false;
 }
 
 inline void
@@ -1093,6 +1227,23 @@ InitializeMeshRenderPipelineInfo(WMTMeshRenderPipelineInfo &info) {
   info.payload_memory_length = 0;
   info.mesh_tgsize_is_multiple_of_sgwidth = 0;
   info.object_tgsize_is_multiple_of_sgwidth = 0;
+  info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
+  info.binary_archives_for_lookup.set(nullptr);
+  info.num_binary_archives_for_lookup = 0;
+  info.fail_on_binary_archive_miss = false;
+  info.support_indirect_command_buffers = false;
+}
+
+inline void
+InitializeTileRenderPipelineInfo(WMTTileRenderPipelineInfo &info) {
+  for (unsigned i = 0; i < 8; i++) {
+    info.color_formats[i] = WMTPixelFormatInvalid;
+  }
+  info.tile_function = NULL_OBJECT_HANDLE;
+  info.immutable_tile_buffers = 0;
+  info.raster_sample_count = 1;
+  info.tgsize_matches_tile_size = 0;
+
   info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;

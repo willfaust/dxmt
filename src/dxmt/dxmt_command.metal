@@ -1,8 +1,29 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ * Copyright 2026 Paweł Kołodziejski
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include <metal_common>
 #include <metal_texture>
 #include <metal_math>
+#include "dxmt_command_constants.hpp"
 
 using namespace metal;
+using namespace dxmt;
 
 [[kernel]] void clear_texture_1d_uint(
     texture1d<uint, access::read_write> tex [[texture(0)]],
@@ -190,19 +211,19 @@ struct clear_data {
 }
 
 [[fragment]] float4 fs_clear_rt_float(
-  constant float4& clear_value [[buffer(0)]]
+  constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   return clear_value;
 }
 
 [[fragment]] uint4 fs_clear_rt_uint(
-  constant float4& clear_value [[buffer(0)]]
+  constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   return (uint4)clear_value;
 }
 
 [[fragment]] int4 fs_clear_rt_sint(
-  constant float4& clear_value [[buffer(0)]]
+  constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   return (int4)clear_value;
 }
@@ -212,7 +233,7 @@ struct depth_out {
 };
 
 [[fragment]] depth_out fs_clear_rt_depth (
-  constant float4& clear_value [[buffer(0)]]
+  constant float4& clear_value [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   return {clear_value.x};
 }
@@ -358,13 +379,6 @@ float EETF(float E, float Lw, float Lb, float Lmax, float Lmin) {
   return E * pqdiff_LwLb + pq_Lb;
 }
 
-constexpr constant uint kPresentFCIndex_BackbufferSizeMatched = 0x100;
-constexpr constant uint kPresentFCIndex_BackbufferIsSRGB = 0x103;
-constexpr constant uint kPresentFCIndex_HDRPQ = 0x101;
-constexpr constant uint kPresentFCIndex_WithHDRMetadata = 0x102;
-constexpr constant uint kPresentFCIndex_BackbufferIsMS = 0x104;
-constexpr constant uint kPresentFCIndex_GammaEnabled = 0x105;
-
 constant bool present_backbuffer_size_matched [[function_constant(kPresentFCIndex_BackbufferSizeMatched)]];
 constant bool present_backbuffer_is_srgb [[function_constant(kPresentFCIndex_BackbufferIsSRGB)]];
 constant bool present_hdr_pq [[function_constant(kPresentFCIndex_HDRPQ)]];
@@ -422,7 +436,7 @@ float3 to_srgb(float3 linear) {
   if (present_with_hdr_metadata) {
     // tone mapping: BT.2408 EETF + maxRGB
     float max_content_luminance = meta.max_content_luminance;
-    float min_content_luminance = 1; // in case of divison by 0
+    float min_content_luminance = 1; // in case of division by 0
     float max_display_luminance = meta.max_display_luminance;
     float min_display_luminance = 0;
     float3 clamped = clamp(output_rgb, float3(min_content_luminance), float3(max_content_luminance));
@@ -448,7 +462,7 @@ struct DXMTDispatchArguments {
 };
 
 struct DXMTTSDispatchMarshal {
-  constant uint2& draw_arguments; // (vertex|index_count, index_count)
+  constant uint2& draw_arguments; // (vertex|index_count, instance_count)
   device DXMTDispatchArguments& dispatch_arguments_out;
   ulong max_object_threadgroups;
   ushort control_point_count;
@@ -457,7 +471,7 @@ struct DXMTTSDispatchMarshal {
 };
 
 [[vertex]] void ts_draw_arguments_marshal(
-    constant DXMTTSDispatchMarshal* tasks [[buffer(0)]]
+    constant DXMTTSDispatchMarshal* tasks [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   uint index = 0;
   for(;;) {
@@ -485,7 +499,7 @@ struct DXMTTSDispatchMarshal {
 }
 
 struct DXMTGSDispatchMarshal {
-  constant uint2& draw_arguments; // (vertex|index_count, index_count)
+  constant uint2& draw_arguments; // (vertex|index_count, instance_count)
   device DXMTDispatchArguments& dispatch_arguments_out;
   ulong max_object_threadgroups;
   uint vertex_count_per_warp;
@@ -493,7 +507,7 @@ struct DXMTGSDispatchMarshal {
 };
 
 [[vertex]] void gs_draw_arguments_marshal(
-    constant DXMTGSDispatchMarshal* tasks [[buffer(0)]]
+    constant DXMTGSDispatchMarshal* tasks [[buffer(kCustomBufferArgumentIndex0)]]
 ) {
   uint index = 0;
   for(;;) {
@@ -537,8 +551,8 @@ struct linear_texture_desc {
 
 [[fragment]] depth_stencil_out fs_copy_from_buffer_d32s8(
   present_data input [[stage_in]],
-  device char* buffer [[buffer(0)]],
-  constant linear_texture_desc& desc [[buffer(1)]]
+  device char* buffer [[buffer(kCustomBufferArgumentIndex0)]],
+  constant linear_texture_desc& desc [[buffer(kCustomBufferArgumentIndex1)]]
 ) {
   depth_stencil_out result;
   uint2 pos = uint2(input.position.xy);
@@ -552,8 +566,8 @@ struct linear_texture_desc {
 
 [[fragment]] depth_stencil_out fs_copy_from_buffer_d24s8(
   present_data input [[stage_in]],
-  device char* buffer [[buffer(0)]],
-  constant linear_texture_desc& desc [[buffer(1)]]
+  device char* buffer [[buffer(kCustomBufferArgumentIndex0)]],
+  constant linear_texture_desc& desc [[buffer(kCustomBufferArgumentIndex1)]]
 ) {
   depth_stencil_out result;
   uint2 pos = uint2(input.position.xy);
@@ -579,7 +593,7 @@ struct linear_texture_desc {
   if (width > pos.x && height > pos.y) {
     auto dst = reinterpret_cast<device packed_d32s8x24 *>(buffer + buffer_offset);
     dst->depth = tex_depth.read(pos).x;
-    dst->stencil = tex_stencil.read(pos).y;
+    dst->stencil = tex_stencil.read(pos).x;
   }
 }
 
@@ -597,7 +611,7 @@ struct linear_texture_desc {
   if (width > pos.x && height > pos.y) {
     auto dst = reinterpret_cast<device uint *>(buffer + buffer_offset);
     float depth = tex_depth.read(pos).x;
-    uint stencil = tex_stencil.read(pos).y;
+    uint stencil = tex_stencil.read(pos).x;
     *dst = (uint(0xffffff * clamp(depth, 0.0, 1.0)) & 0xffffff) | (stencil << 24);
   }
 }
@@ -630,6 +644,18 @@ struct DXMTClearUintMetadata {
   tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
+[[kernel]] void cs_clear_texture3d_float(
+    texture3d<float, access::write> tex [[texture(0)]],
+    constant DXMTClearFloatMetadata& meta [[buffer(1)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+  auto depth = tex.get_depth();
+  for (uint i = 0; i < depth; i++) {
+    uint2 final_pos = meta.offset + pos;
+    tex.write(meta.value, uint3(final_pos.x, final_pos.y, i));
+  }
+}
+
 [[kernel]] void cs_clear_texture2d_uint(
     texture2d<uint, access::write> tex [[texture(0)]],
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
@@ -644,6 +670,18 @@ struct DXMTClearUintMetadata {
     uint3 pos [[thread_position_in_grid]]
 ) {
   tex.write(meta.value, meta.offset + pos.xy, pos.z);
+}
+
+[[kernel]] void cs_clear_texture3d_uint(
+    texture3d<uint, access::write> tex [[texture(0)]],
+    constant DXMTClearUintMetadata& meta [[buffer(1)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+  auto depth = tex.get_depth();
+  for (uint i = 0; i < depth; i++) {
+    uint2 final_pos = meta.offset + pos;
+    tex.write(meta.value, uint3(final_pos.x, final_pos.y, i));
+  }
 }
 
 [[kernel]] void cs_clear_tbuffer_float(
@@ -693,4 +731,8 @@ struct DXMTClearUintMetadata {
   float2 hi_mv_pixel = hi_mv * mv_scale;
   float2 lo_mv_pixel = hi_mv_pixel * scale;
   downscaled.write(lo_mv_pixel.xyxy, pos); 
+}
+
+[[kernel]] void tile_barrier(ushort2 pos [[thread_position_in_threadgroup]]) {
+  // empty
 }

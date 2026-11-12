@@ -1,4 +1,4 @@
-#ifndef DXMT_NATIVE
+#ifdef _WIN32
 #define WINEMETAL_API __declspec(dllexport)
 #else
 #define WINEMETAL_API
@@ -791,7 +791,7 @@ MTLCommandBuffer_logs(obj_handle_t cmdbuf) {
 WINEMETAL_API uint64_t
 MTLLogContainer_enumerate(obj_handle_t logs, uint64_t start, uint64_t buffer_size, obj_handle_t *buffer) {
   struct unixcall_enumerate params;
-  params.enumeratable = logs;
+  params.enumerable = logs;
   params.start = start;
   params.buffer_size = buffer_size;
   WMT_MEMPTR_SET(params.buffer, buffer);
@@ -810,10 +810,10 @@ CGColorSpace_checkColorSpaceSupported(enum WMTColorSpace colorspace) {
 }
 
 WINEMETAL_API bool
-MetalLayer_setColorSpace(obj_handle_t layer, enum WMTColorSpace colorpsace) {
+MetalLayer_setColorSpace(obj_handle_t layer, enum WMTColorSpace colorspace) {
   struct unixcall_generic_obj_uint64_uint64_ret params;
   params.handle = layer;
-  params.arg = colorpsace;
+  params.arg = colorspace;
   params.ret = 0;
   UNIX_CALL(93, &params);
   return params.ret;
@@ -1195,7 +1195,7 @@ MTLDevice_newRenderPipelineStateVD(obj_handle_t device, const struct WMTRenderPi
 
 /* ml880: residency sets, slots 129-132. */
 WINEMETAL_API obj_handle_t
-MTLDevice_newResidencySet(obj_handle_t device, uint64_t initial_capacity) {
+MadeiraMTLDevice_newResidencySet(obj_handle_t device, uint64_t initial_capacity) {
   struct unixcall_generic_obj_uint64_obj_ret params;
   params.handle = device;
   params.arg = initial_capacity;
@@ -1252,7 +1252,7 @@ MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation) {
 }
 
 WINEMETAL_API void
-MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, const struct WMTTextureInfo *info, uint64_t *size, uint64_t *align) {
+MadeiraMTLDevice_heapTextureSizeAndAlign(obj_handle_t device, const struct WMTTextureInfo *info, uint64_t *size, uint64_t *align) {
   struct unixcall_mtldevice_heaptexturesizealign params;
   params.device = device;
   WMT_MEMPTR_SET(params.info, (void *)info);
@@ -1281,7 +1281,7 @@ MTLHeap_newTextureAtOffset(obj_handle_t heap, struct WMTTextureInfo *info, uint6
 
 /* ml1145: slots 139-140, see winemetal.h. */
 WINEMETAL_API void
-MTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTResourceOptions options, uint64_t *size, uint64_t *align) {
+MadeiraMTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTResourceOptions options, uint64_t *size, uint64_t *align) {
   struct unixcall_mtldevice_heapbuffersizealign params;
   params.device = device; params.length = length; params.options = options;
   params.ret_size = 0; params.ret_align = 0;
@@ -1303,4 +1303,202 @@ MTLHeap_newBufferAtOffset(obj_handle_t heap, struct WMTBufferInfo *info, uint64_
 WINEMETAL_API void
 MadeiraCtl(struct madeira_ctl_args *args) {
   UNIX_CALL(138, args);
+}
+
+WINEMETAL_API obj_handle_t
+MTLCounterSampleBuffer_newTimestampBuffer(obj_handle_t device, uint32_t sample_count, bool shared) {
+  struct unixcall_mtlcountersamplebuffer_newtimestampbuffer params;
+  params.device = device;
+  params.sample_count = sample_count;
+  params.shared = shared;
+  params.ret = 0;
+  UNIX_CALL(151, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCounterSampleBuffer_resolveCounterRange(
+    obj_handle_t sample_buffer, uint32_t start, uint32_t len, void *data_out, uint64_t data_length
+) {
+  struct unixcall_mtlcountersamplebuffer_resolvecounterrange params;
+  params.sample_buffer = sample_buffer;
+  params.start = start;
+  params.len = len;
+  params.data_length = data_length;
+  WMT_MEMPTR_SET(params.data_out, data_out);
+  UNIX_CALL(152, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(
+    obj_handle_t cmdbuf, struct WMTSampleBufferAttachmentInfo *sample_buffer_attachments,
+    uint64_t num_sample_buffer_attachments) {
+  struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers params;
+  params.cmdbuf = cmdbuf;
+  WMT_MEMPTR_SET(params.attachments, sample_buffer_attachments);
+  params.num_attachments = num_sample_buffer_attachments;
+  params.ret = 0;
+  UNIX_CALL(153, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLCommandBuffer_property(obj_handle_t cmdbuf, enum WMTCommandBufferProperty prop) {
+  struct unixcall_generic_obj_uint64_uint64_ret params;
+  params.handle = cmdbuf;
+  params.arg = prop;
+  UNIX_CALL(154, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newTileRenderPipelineState(
+    obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newrenderpso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  UNIX_CALL(155, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newResidencySet(obj_handle_t device, uint64_t init_capacity, obj_handle_t *err_out) {
+  struct unixcall_mtldevice_newresidencyset params;
+  params.device = device;
+  params.init_capacity = init_capacity;
+  params.ret_error = 0;
+  params.ret_set = 0;
+  UNIX_CALL(156, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_set;
+}
+
+WINEMETAL_API void
+MTLResidencySet_addAllocations(obj_handle_t residency_set, const obj_handle_t *allocations, uint64_t count) {
+  struct unixcall_mtlresidencyset_addallocations params;
+  params.set = residency_set;
+  WMT_MEMPTR_SET(params.allocations, allocations);
+  params.count = count;
+  UNIX_CALL(157, &params);
+}
+
+WINEMETAL_API void
+MTLResidencySet_removeAllocations(obj_handle_t residency_set, const obj_handle_t *allocations, uint64_t count) {
+  struct unixcall_mtlresidencyset_addallocations params;
+  params.set = residency_set;
+  WMT_MEMPTR_SET(params.allocations, allocations);
+  params.count = count;
+  UNIX_CALL(158, &params);
+}
+
+WINEMETAL_API void
+MTLResidencySet_removeAllAllocations(obj_handle_t residency_set) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = residency_set;
+  UNIX_CALL(159, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
+  struct unixcall_mtldevice_newheap params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  UNIX_CALL(162, &params);
+  return params.ret;
+}
+
+WINEMETAL_API struct WMTSizeAndAlign
+MTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTResourceOptions options) {
+  struct unixcall_mtldevice_heapbuffersizeandalign params;
+  params.device = device;
+  params.length = length;
+  params.options = options;
+  UNIX_CALL(163, &params);
+  struct WMTSizeAndAlign ret;
+  ret.size = params.ret_size;
+  ret.align = params.ret_align;
+  return ret;
+}
+
+WINEMETAL_API struct WMTSizeAndAlign
+MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *info) {
+  struct unixcall_mtldevice_heaptexturesizeandalign params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  UNIX_CALL(164, &params);
+  struct WMTSizeAndAlign ret;
+  ret.size = params.ret_size;
+  ret.align = params.ret_align;
+  return ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newbuffer params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  UNIX_CALL(165, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newtexture params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  UNIX_CALL(166, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newIndirectCommandBuffer(
+    obj_handle_t device, struct WMTIndirectCommandBufferInfo *info, uint64_t max_count, enum WMTResourceOptions options
+) {
+  struct unixcall_mtldevice_newicb params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.max_count = max_count;
+  params.options = options;
+  UNIX_CALL(167, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newLibraryWithSource(obj_handle_t device, const char *source, uint64_t length, obj_handle_t *err_out) {
+  struct unixcall_mtldevice_newlibrarywithsource params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.source, source);
+  params.length = length;
+  params.ret_error = 0;
+  params.ret_library = 0;
+  UNIX_CALL(168, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_library;
+}
+
+WINEMETAL_API void
+MTLTexture_getBytes(
+    obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,
+    struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
+) {
+  // use compatible struct
+  struct unixcall_mtltexture_replaceregion params;
+  params.texture = texture;
+  params.origin = origin;
+  params.size = size;
+  params.level = level;
+  params.slice = slice;
+  params.data = data;
+  params.bytes_per_row = bytes_per_row;
+  params.bytes_per_image = bytes_per_image;
+  UNIX_CALL(169, &params);
 }

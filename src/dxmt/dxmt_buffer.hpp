@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #pragma once
 
 #include "Metal.hpp"
@@ -7,6 +25,7 @@
 #include "rc/util_rc_ptr.hpp"
 #include "thread.hpp"
 #include "util_flags.hpp"
+#include "util_svector.hpp"
 
 namespace dxmt {
 
@@ -21,9 +40,32 @@ enum class BufferAllocationFlag : uint32_t {
   /* will allocate at least one page of memory and try to suballocate from that */
   SuballocateFromOnePage = 5,
   CpuPlaced = 6,
+  AllocatedOnHeap = 7,
 };
 
-typedef unsigned BufferViewKey;
+struct BufferViewKey {
+  union {
+    struct {
+      uint32_t index;
+      uint32_t valid_bits;
+    };
+    uint64_t impl_;
+  };
+
+  BufferViewKey() {
+    impl_ = 0;
+  }
+  BufferViewKey(uint64_t impl) {
+    impl_ = impl;
+  }
+  BufferViewKey(uint32_t index, std::nullopt_t ensure_correct_constructor) {
+    this->index = index;
+    valid_bits = ~0u;
+  }
+  operator uint64_t() const {
+    return impl_;
+  }
+};
 
 struct BufferViewDescriptor {
   WMTPixelFormat format;
@@ -103,6 +145,10 @@ public:
     return current_suballocation_ * stride;
   }
 
+  uint32_t currentSuballocation() {
+    return current_suballocation_;
+  }
+
   void
   updateContents(uint64_t offset, const void *data, uint64_t length, uint32_t suballocation = 0) noexcept {
     if (likely(mappedMemory_ != nullptr && !flags_.test(BufferAllocationFlag::GpuManaged))) {
@@ -113,11 +159,15 @@ public:
   }
 
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
-  EncoderDepKey depkey;
+  small_vector<GenericAccessTracker, 1> fenceTrackers;
 
 private:
   BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
-  ~BufferAllocation();
+  BufferAllocation(
+      WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
+      uint64_t heap_offset
+  );
+  void free();
 
   BufferAllocation(const BufferAllocation &) = delete;
   BufferAllocation(BufferAllocation &&) = delete;
@@ -126,7 +176,7 @@ private:
   WMTBufferInfo info_;
   uint32_t version_ = 0;
   Flags<BufferAllocationFlag> flags_;
-  std::vector<std::unique_ptr<BufferView>> cached_view_;
+  small_vector<std::unique_ptr<BufferView>, 1> cached_view_;
   void *mappedMemory_;
   uint64_t gpuAddress_;
   uint32_t current_suballocation_ = 0;
@@ -153,6 +203,7 @@ public:
    * which makes no sense. An explicit literal at each call site removes the
    * guesswork entirely. */
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, const char *site = "?");
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 
@@ -173,7 +224,7 @@ public:
   };
 
   WMTPixelFormat pixelFormat(BufferViewKey view) const {
-    return viewDescriptors_[view].format;
+    return viewDescriptors_[view.index].format;
   }
 
 private:
@@ -185,7 +236,7 @@ private:
   uint32_t version_ = 0;
   std::atomic<uint32_t> refcount_ = {0u};
 
-  std::vector<BufferViewDescriptor> viewDescriptors_;
+  small_vector<BufferViewDescriptor, 1> viewDescriptors_;
   dxmt::mutex mutex_;
   WMT::Device device_;
 };

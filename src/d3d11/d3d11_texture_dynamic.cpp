@@ -22,37 +22,34 @@ struct Subresource {
 template <typename tag_texture>
 class DynamicTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
-  Rc<Texture> underlying_texture_;
   std::vector<Subresource> subresources_;
   float min_lod = 0.0;
 
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DynamicTexture<tag_texture>>>;
   class TextureSRV : public SRVBase {
-  private:
-    TextureViewKey view_key_;
-
   public:
-    TextureSRV(TextureViewKey view_key,
+    TextureSRV(const TextureViewDescriptor &descriptor,
                const tag_shader_resource_view<>::DESC1 *pDesc,
                DynamicTexture *pResource, MTLD3D11Device *pDevice)
-        : SRVBase(pDesc, pResource, pDevice), view_key_(view_key) {}
+        : SRVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength()
+      );
+    }
 
-    Rc<Buffer> buffer() final { return {}; };
-    Rc<Texture> texture() final { return this->resource->underlying_texture_; };
-    unsigned viewId() final { return view_key_;};
-    BufferSlice bufferSlice() final { return {};}
   };
 
 public:
   DynamicTexture(const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, MTLD3D11Device *pDevice, std::vector<Subresource> && subresources) :
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
-      underlying_texture_(std::move(u_texture)),
-      subresources_(std::move(subresources)) {}
-
-  Rc<Buffer> buffer() final { return {}; };
-  Rc<Texture> texture() final { return this->underlying_texture_; };
-  BufferSlice bufferSlice() final { return {};}
+      subresources_(std::move(subresources)) {
+    this->texture_ = std::move(u_texture);
+  }
   Rc<StagingResource> staging(UINT) final { return nullptr; }
   Rc<DynamicBuffer> dynamicBuffer(UINT*, UINT*) final { return {}; }
   Rc<DynamicLinearTexture> dynamicLinearTexture(UINT*, UINT*) final { return {}; };
@@ -85,7 +82,7 @@ public:
       arraySize = this->desc.ArraySize;
     }
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->underlying_texture_.ptr(), finalDesc, descriptor
+            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
       ERR("DynamicTexture: Failed to create texture SRV");
       return E_FAIL;
@@ -93,14 +90,25 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    TextureViewKey key = underlying_texture_->createView(descriptor);
-    *ppView = ref(new TextureSRV(key, &finalDesc, this, this->m_parent));
+    *ppView = ref(new TextureSRV(descriptor, &finalDesc, this, this->m_parent));
     return S_OK;
   };
 
   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
 
   float GetMinLOD() override { return min_lod; }
+
+  HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) override {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
+      if (this->desc.Depth > 1)
+        return E_INVALIDARG;
+    }
+    if (Index >= subresources_.size())
+      return E_INVALIDARG;
+    auto surface = Com(new D3D11DXGISurface(this, Index));
+    *ppSurface = surface.ref();
+    return S_OK;
+  }
 };
 
 template <typename tag>
@@ -142,6 +150,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
   Flags<TextureAllocationFlag> flags;
   flags.set(TextureAllocationFlag::GpuManaged);
+  flags.set(TextureAllocationFlag::ShaderReadonly);
   if (pInitialData) {
     auto default_allocation = texture->allocate(flags);
     InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);

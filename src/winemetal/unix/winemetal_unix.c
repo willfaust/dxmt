@@ -349,6 +349,10 @@ static uint64_t madeira_ram_cap(void) {
 /* os_proc_available_memory(), lowered so that footprint + the result stays
  * within the cap. 0 when the limit is unknown. */
 static uint64_t madeira_avail_memory(uint64_t foot) {
+#if !TARGET_OS_IOS
+  (void)foot;
+  return 0;
+#else
   uint64_t avail = (uint64_t)os_proc_available_memory(), cap = madeira_ram_cap();
   if (avail && cap && foot + avail > cap) {
     static int said;
@@ -359,15 +363,21 @@ static uint64_t madeira_avail_memory(uint64_t foot) {
     avail = cap > foot ? cap - foot : (1ull << 20);
   }
   return avail;
+#endif
 }
 /* The process limit a budget plans with: min(limit, cap). */
 static uint64_t madeira_mem_limit(uint64_t foot) {
+#if !TARGET_OS_IOS
+  (void)foot;
+  return 0;
+#else
   uint64_t limit = (uint64_t)os_proc_available_memory() + foot, cap = madeira_ram_cap();
   if (cap && limit > cap) {
     madeira_avail_memory(foot);   /* logs the first lowering */
     limit = cap;
   }
   return limit;
+#endif
 }
 static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended);
 /* The swap tier's donor pool (ntdll): memory another task owns, so it is not in
@@ -476,7 +486,11 @@ _MTLDevice_recommendedMaxWorkingSetSize(void *obj) {
     params->ret = (wmtr_call(RM_OP_DEVICE_MAX_WORKING_SET, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.value : 0;
     return STATUS_SUCCESS;
   }
+#if TARGET_OS_IOS
   params->ret = madeira_ml1042_video_budget([(id<MTLDevice>)params->handle recommendedMaxWorkingSetSize]);
+#else
+  params->ret = [(id<MTLDevice>)params->handle recommendedMaxWorkingSetSize];
+#endif
   return STATUS_SUCCESS;
 }
 
@@ -1244,30 +1258,11 @@ _MTLBuffer_newTexture(void *obj) {
 
 static inline MTLTextureSwizzleChannels
 to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat format) {
-  if (format & WMTPixelFormatRGB1Swizzle) {
-    return MTLTextureSwizzleChannelsMake(
-        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.b, MTLTextureSwizzleOne
-    );
-  }
-  if (format & WMTPixelFormatR001Swizzle) {
-    return MTLTextureSwizzleChannelsMake(
-        (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleZero, MTLTextureSwizzleZero, MTLTextureSwizzleOne
-    );
-  }
-  if (format & WMTPixelFormat0R01Swizzle) {
-    return MTLTextureSwizzleChannelsMake(
-        MTLTextureSwizzleOne, (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne, MTLTextureSwizzleOne
-    );
-  }
-  if (format & WMTPixelFormatGBARSwizzle) {
-    return MTLTextureSwizzleChannelsMake(
-        (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.b, (MTLTextureSwizzle)swizzle.a,
-        (MTLTextureSwizzle)swizzle.r
-    );
-  }
   return MTLTextureSwizzleChannelsMake(
-      (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.b,
-      (MTLTextureSwizzle)swizzle.a
+      (MTLTextureSwizzle)DECODE_FORMAT_COMPONENT_SWIZZLE(format, 0, swizzle.r),
+      (MTLTextureSwizzle)DECODE_FORMAT_COMPONENT_SWIZZLE(format, 1, swizzle.g),
+      (MTLTextureSwizzle)DECODE_FORMAT_COMPONENT_SWIZZLE(format, 2, swizzle.b),
+      (MTLTextureSwizzle)DECODE_FORMAT_COMPONENT_SWIZZLE(format, 3, swizzle.a)
   );
 }
 
@@ -1356,7 +1351,7 @@ _MTLDevice_newLibrary(void *obj) {
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSError *err = NULL;
   params->ret_library = (obj_handle_t)[device newLibraryWithData:(dispatch_data_t)params->data error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   return STATUS_SUCCESS;
 }
 
@@ -1795,6 +1790,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
   NSError *err = NULL;
   descriptor.computeFunction = (id<MTLFunction>)info->compute_function;
   descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = info->tgsize_is_multiple_of_sgwidth;
+  descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
   for (unsigned i = 0; i < 31; i++) {
     if (info->immutable_buffers & (1 << i))
       descriptor.buffers[i].mutability = MTLMutabilityImmutable;
@@ -1826,7 +1822,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 1);
   }
   [madeira_arch release];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
                                                                                                       error:&err];
@@ -1965,6 +1961,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
+  if (info->tile_height && info->tile_width) {
+    descriptor.tileWidth = info->tile_width;
+    descriptor.tileHeight = info->tile_height;
+  }
+
   params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
 
   /* Count realized native passes, including clears and the final present.
@@ -2101,6 +2102,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
 
   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
+  descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
 
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
@@ -2132,7 +2134,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
   }
   [madeira_arch release];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
                                                                                                      error:&err];
@@ -2368,6 +2370,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
 
   descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->mesh_tgsize_is_multiple_of_sgwidth;
   descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->object_tgsize_is_multiple_of_sgwidth;
+  descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
 
   MTLPipelineOption options = MTLPipelineOptionNone;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
@@ -2389,7 +2392,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
                                                                                                   options:options
                                                                                                reflection:nil
                                                                                                     error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
     if (!err && info->binary_archive_for_serialization) {
@@ -2689,6 +2692,21 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
                       options:plane];
       break;
     }
+    case WMTBlitCommandCopyFromBufferToTextureWithBlitOption: {
+      struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *body =
+          (struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *)next;
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+            sourceBytesPerRow:body->bytes_per_row
+          sourceBytesPerImage:body->bytes_per_image
+                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                    toTexture:(id<MTLTexture>)body->dst
+             destinationSlice:body->slice
+             destinationLevel:body->level
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                      options:(MTLBlitOption)body->options];
+      break;
+    }
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
       id<MTLTexture> src = (id<MTLTexture>)body->src;
@@ -2709,6 +2727,21 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
             destinationBytesPerRow:body->bytes_per_row
           destinationBytesPerImage:body->bytes_per_image
                            options:(MTLBlitOption)body->options];   /* ml1098 */
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToBufferWithBlitOption: {
+      struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *body =
+          (struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *)next;
+      [encoder copyFromTexture:(id<MTLTexture>)body->src
+                       sourceSlice:body->slice
+                       sourceLevel:body->level
+                      sourceOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                        sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                          toBuffer:(id<MTLBuffer>)body->dst
+                 destinationOffset:body->offset
+            destinationBytesPerRow:body->bytes_per_row
+          destinationBytesPerImage:body->bytes_per_image
+                           options:(MTLBlitOption)body->options];
       break;
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
@@ -2754,6 +2787,25 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
       wmt_stale_check(body->buffer, "blit fill");
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
+      break;
+    }
+    case WMTBlitCommandResolveCounters: {
+      struct wmtcmd_blit_resolvecounters *body = (struct wmtcmd_blit_resolvecounters *)next;
+      [encoder resolveCounters:(id<MTLCounterSampleBuffer>)body->sample_buffer
+                       inRange:NSMakeRange(body->start, body->len)
+             destinationBuffer:(id<MTLBuffer>)body->dst_buffer
+             destinationOffset:body->dst_offset];
+      break;
+    }
+    case WMTBlitCommandResetCommandsInBuffer: {
+      struct wmtcmd_blit_resetcommands *body = (struct wmtcmd_blit_resetcommands *)next;
+      [encoder resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                           withRange:NSMakeRange(body->location, body->length)];
+      break;
+    }
+    case WMTBlitCommandCopyTexture: {
+      struct wmtcmd_blit_copy_texture *body = (struct wmtcmd_blit_copy_texture *)next;
+      [encoder copyFromTexture:(id<MTLTexture>)body->src toTexture:(id<MTLTexture>)body->dst];
       break;
     }
     }
@@ -2900,6 +2952,17 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
       [encoder waitForFence:(id<MTLFence>)body->fence];
+      break;
+    }
+    case WMTComputeCommandMemoryBarrier: {
+      struct wmtcmd_compute_memory_barrier *body = (struct wmtcmd_compute_memory_barrier *)next;
+      [encoder memoryBarrierWithScope:(MTLBarrierScope)body->scope];
+      break;
+    }
+    case WMTComputeCommandExecuteCommandsInBuffer: {
+      struct wmtcmd_compute_executecommands *body = (struct wmtcmd_compute_executecommands *)next;
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                             withRange:NSMakeRange(body->location, body->length)];
       break;
     }
     }
@@ -3117,9 +3180,19 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setStencilReferenceValue:body->stencil_ref];
       break;
     }
+    case WMTRenderCommandSetDepthStencilState: {
+      struct wmtcmd_render_setdepthstencilstate *body = (struct wmtcmd_render_setdepthstencilstate *)next;
+      [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->depth_stencil_state];
+      break;
+    }
     case WMTRenderCommandSetBlendFactorAndStencilRef: {
       struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
       [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
+      [encoder setStencilReferenceValue:body->stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetStencilRef: {
+      struct wmtcmd_render_setstencilref *body = (struct wmtcmd_render_setstencilref *)next;
       [encoder setStencilReferenceValue:body->stencil_ref];
       break;
     }
@@ -3223,7 +3296,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDXMTGeometryDraw: {
       struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -3232,8 +3305,10 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTGeometryDrawIndexed: {
       struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
       wmt_stale_check(body->index_buffer, "gs index buffer");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+                        offset:body->index_buffer_offset
+                       atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
+      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -3242,41 +3317,54 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
       wmt_stale_check(body->indirect_args_buffer, "gs indirect args");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                        offset:body->indirect_args_offset
+                       atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
+                        offset:0
+                       atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
     case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
       wmt_stale_check(body->index_buffer, "gs index buffer");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
       wmt_stale_check(body->indirect_args_buffer, "gs indirect args");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+                        offset:body->index_buffer_offset
+                       atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                        offset:body->indirect_args_offset
+                       atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
+                        offset:0
+                       atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
     case WMTRenderCommandDXMTTessellationMeshDraw: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
       break;
     }
     case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
+      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body =
+          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
       wmt_stale_check(body->index_buffer, "gs index buffer");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+                        offset:body->index_buffer_offset
+                       atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
+      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -3286,26 +3374,36 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
       wmt_stale_check(body->indirect_args_buffer, "gs indirect args");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                        offset:body->indirect_args_offset
+                       atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
+                        offset:0
+                       atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
     case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
       wmt_stale_check(body->index_buffer, "gs index buffer");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
       wmt_stale_check(body->indirect_args_buffer, "gs indirect args");
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
+                        offset:body->index_buffer_offset
+                       atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                        offset:body->indirect_args_offset
+                       atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
                                  indirectBufferOffset:body->dispatch_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
+                        offset:0
+                       atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
     case WMTRenderCommandUpdateFence: {
@@ -3334,6 +3432,17 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
         MTLScissorRect dst;
       } u = {.src = body->scissor_rect};
       [encoder setScissorRect:u.dst];
+      break;
+    }
+    case WMTRenderCommandDispatchThreadsPerTile: {
+      struct wmtcmd_render_dispatch_threads_per_tile *body = (struct wmtcmd_render_dispatch_threads_per_tile *)next;
+      [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
+      break;
+    }
+    case WMTRenderCommandExecuteCommandsInBuffer: {
+      struct wmtcmd_render_executecommands *body = (struct wmtcmd_render_executecommands *)next;
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                             withRange:NSMakeRange(body->location, body->length)];
       break;
     }
     }
@@ -4314,19 +4423,51 @@ _NSString_alloc_init(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static bool
+developer_hud_uses_metric_service(void) {
+  NSOperatingSystemVersion version = [NSProcessInfo processInfo].operatingSystemVersion;
+  return version.majorVersion >= 27;
+}
+
 static NTSTATUS
 _DeveloperHUDProperties_instance(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
+  Class cls = objc_lookUpClass(
+      developer_hud_uses_metric_service()
+          ? "MTLHUDService"
+          : "_CADeveloperHUDProperties"
+  );
   params->ret =
-      (obj_handle_t)((id(*)(id, SEL))objc_msgSend)(objc_lookUpClass("_CADeveloperHUDProperties"), @selector(instance));
+      (obj_handle_t)((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(instance));
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _DeveloperHUDProperties_addLabel(void *obj) {
   struct unixcall_generic_obj_obj_obj_uint64_ret *params = obj;
-  params->ret = ((bool (*)(id, SEL, id, id)
-  )objc_msgSend)((id)params->handle, @selector(addLabel:after:), (id)params->arg0, (id)params->arg1);
+  if (developer_hud_uses_metric_service()) {
+    params->ret =
+        ((bool (*)(id, SEL, id, id, id, id, uint32_t, uint32_t, uint32_t, uint64_t))objc_msgSend)(
+            (id)params->handle,
+            @selector(insertMetric:after:name:unit:nameColor:valueColor:visualType:options:),
+            (id)params->arg0,
+            (id)params->arg1,
+            @"",
+            @"",
+            UINT32_MAX,
+            UINT32_MAX,
+            1u,
+            0u
+        );
+  } else {
+    params->ret =
+        ((bool (*)(id, SEL, id, id))objc_msgSend)(
+            (id)params->handle,
+            @selector(addLabel:after:),
+            (id)params->arg0,
+            (id)params->arg1
+        );
+  }
   return STATUS_SUCCESS;
 }
 
@@ -4913,6 +5054,7 @@ struct SM50_SHADER_COMMON_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   enum SM50_SHADER_METAL_VERSION metal_version;
+  enum SM50_SHADER_FLAG flag;
 };
 
 struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
@@ -4923,7 +5065,7 @@ struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
 struct SM50_SHADER_IA_INPUT_LAYOUT_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
-  enum SM50_INDEX_BUFFER_FORAMT index_buffer_format;
+  enum SM50_INDEX_BUFFER_FORMAT index_buffer_format;
   uint32_t slot_mask;
   uint32_t num_elements;
   uint32_t elements;
@@ -4936,6 +5078,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
+  /** MTLPixelFormat */
+  uint32_t pixel_formats[8];
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -4958,6 +5102,20 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   uint32_t max_potential_tess_factor;
+};
+
+struct SM50_SHADER_PSO_VERTEX_INTERFACE_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t vertex_bytecode;
+  uint32_t vertex_bytecode_size;
+};
+
+struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t bytecode;
+  uint32_t bytecode_length;
 };
 
 void
@@ -4996,6 +5154,7 @@ sm50_compilation_argument32_convert(
       last_arg->next = NULL;
       data->type = src->type;
       data->metal_version = src->metal_version;
+      data->flags = src->flag;
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
@@ -5009,6 +5168,7 @@ sm50_compilation_argument32_convert(
       data->disable_depth_output = src->disable_depth_output;
       data->sample_mask = src->sample_mask;
       data->dual_source_blending = src->dual_source_blending;
+      memcpy(data->pixel_formats, src->pixel_formats, sizeof(data->pixel_formats));
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -5053,6 +5213,29 @@ sm50_compilation_argument32_convert(
       last_arg->next = NULL;
       data->type = src->type;
       data->max_potential_tess_factor = src->max_potential_tess_factor;
+      break;
+    }
+    case SM50_SHADER_PSO_VERTEX_INTERFACE: {
+      struct SM50_SHADER_PSO_VERTEX_INTERFACE_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_PSO_VERTEX_INTERFACE_DATA *data = malloc(sizeof(*data));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->vertex_bytecode = UInt32ToPtr(src->vertex_bytecode);
+      data->vertex_bytecode_size = src->vertex_bytecode_size;
+      break;
+    }
+    case SM50_SHADER_ROOT_SIGNATURE:
+    case SM50_SHADER_ROOT_SIGNATURE2: {
+      struct SM50_SHADER_ROOT_SIGNATURE_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_ROOT_SIGNATURE_DATA *data = malloc(sizeof(struct SM50_SHADER_ROOT_SIGNATURE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->bytecode = UInt32ToPtr(src->bytecode);
+      data->bytecode_length = src->bytecode_length;
       break;
     }
     case SM50_SHADER_ARGUMENT_TYPE_MAX:
@@ -5473,7 +5656,7 @@ _MTLLogContainer_enumerate(void *obj) {
   uint64_t count = 0;
   uint64_t read = 0;
   id *buffer = params->buffer.ptr;
-  for (id _ in (id<MTLLogContainer>)params->enumeratable) {
+  for (id _ in (id<MTLLogContainer>)params->enumerable) {
     if (count >= params->start) {
       if (count < params->start + params->buffer_size) {
         buffer[count - params->start] = _;
@@ -5592,8 +5775,10 @@ GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, f
   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
   if (!tag_data)
     return false;
-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
+  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t)) {
+    CFRelease(tag_data);
     return false;
+  }
   icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
   if (data->sig != 0x205a5958)
     return false;
@@ -5602,6 +5787,7 @@ GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, f
   double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
   *out_x = X / (X + Y + Z);
   *out_y = Y / (X + Y + Z);
+  CFRelease(tag_data);
   return true;
 }
 
@@ -5647,8 +5833,13 @@ _WMTGetDisplayDescription(void *obj) {
 #else
   CGDirectDisplayID display_id = params->handle;
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+  ColorSyncProfileRef fallback = NULL;
+  if (!profile || !GetDisplayColorGamut(profile, desc_out)) {
+    fallback = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
+    if (fallback)
+      GetDisplayColorGamut(fallback, desc_out);
+  }
+  @autoreleasepool {
   NSScreen *screen = GetNSScreenForDisplayID(display_id);
   if (screen) {
     desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
@@ -5661,6 +5852,11 @@ _WMTGetDisplayDescription(void *obj) {
     desc_out->maximum_reference_edr_color_component_value = 0.0;
     desc_out->maximum_potential_edr_color_component_value = 1.0;
   }
+  }
+  if (profile)
+    CFRelease(profile);
+  if (fallback)
+    CFRelease(fallback);
 #endif
   return STATUS_SUCCESS;
 }
@@ -5743,7 +5939,7 @@ _MTLLibrary_newFunctionWithConstants(void *obj) {
     [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
 
   params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [name release];
   [values release];
   return STATUS_SUCCESS;
@@ -5803,6 +5999,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   (void)layer;
   return STATUS_SUCCESS;
 #else
+  @autoreleasepool {
   if (![layer.delegate isKindOfClass:NSView.class])
     return STATUS_SUCCESS;
 
@@ -5824,6 +6021,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
       layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
   params->edr_value.maximum_potential_edr_color_component_value =
       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  }
 
   return STATUS_SUCCESS;
 #endif
@@ -6060,7 +6258,7 @@ _MTLDevice_newBinaryArchive(void *obj) {
   }
   NSError *err = NULL;
   params->ret_archive = (obj_handle_t)[(id<MTLDevice>)params->device newBinaryArchiveWithDescriptor:desc error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [desc release];
   if (url)
     [url release];
@@ -6076,7 +6274,7 @@ _MTLBinaryArchive_serialize(void *obj) {
   NSURL *url = [[NSURL alloc] initFileURLWithPath:path_str];
   NSError *err = NULL;
   [(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [url release];
   [path_str release];
   return STATUS_SUCCESS;
@@ -6235,6 +6433,346 @@ _MTLSharedEvent_waitUntilSignaledValue(void *obj) {
   struct unixcall_mtlsharedevent_waituntilsignaledvalue *params = obj;
   bool timeout = [(id<MTLSharedEvent>)params->event waitUntilSignaledValue:params->value timeoutMS:params->timeout_ms];
   params->ret_timeout = timeout;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCounterSampleBuffer_newTimestampBuffer(void *obj) {
+  struct unixcall_mtlcountersamplebuffer_newtimestampbuffer *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+
+  MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+  NSArray<id<MTLCounterSet>> *counter_sets = [device counterSets];
+  id<MTLCounterSet> timestamp_counter_set = nil;
+  for (id<MTLCounterSet> counterSet in counter_sets) {
+    if ([counterSet.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+      timestamp_counter_set = counterSet;
+      break;
+    }
+  }
+  desc.counterSet = timestamp_counter_set;
+  desc.sampleCount = params->sample_count;
+  desc.storageMode = params->shared ? MTLStorageModeShared : MTLStorageModePrivate;
+
+  NSError *error = nil;
+  params->ret = (obj_handle_t)[device newCounterSampleBufferWithDescriptor:desc error:&error];
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCounterSampleBuffer_resolveCounterRange(void *obj) {
+  struct unixcall_mtlcountersamplebuffer_resolvecounterrange *params = obj;
+  id<MTLCounterSampleBuffer> sample_buffer = (id<MTLCounterSampleBuffer>)params->sample_buffer;
+
+  NSData *data = [sample_buffer resolveCounterRange:NSMakeRange(params->start, params->len)];
+  if (data && params->data_out.ptr) {
+    [data getBytes:params->data_out.ptr length:params->data_length];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
+  struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
+  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
+  struct WMTSampleBufferAttachmentInfo *attachments = params->attachments.ptr;
+
+  MTLBlitPassDescriptor *blit_desc = [[MTLBlitPassDescriptor alloc] init];
+  for (uint64_t i = 0; i < params->num_attachments; i++) {
+    MTLBlitPassSampleBufferAttachmentDescriptor *desc = blit_desc.sampleBufferAttachments[i];
+    desc.sampleBuffer = (id<MTLCounterSampleBuffer>)attachments[i].sample_buffer;
+    desc.startOfEncoderSampleIndex = attachments[i].start_of_encoder_sample_index;
+    desc.endOfEncoderSampleIndex = attachments[i].end_of_encoder_sample_index;
+  }
+
+  params->ret = (obj_handle_t)[cmdbuf blitCommandEncoderWithDescriptor:blit_desc];
+
+  [blit_desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_property(void *obj) {
+  struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->handle;
+  double ns = 1000000000;
+  switch (params->arg) {
+  case WMTCommandBufferPropertyKernelStartTime:
+    params->ret = (uint64_t)([cmdbuf kernelStartTime] * ns);
+    break;
+  case WMTCommandBufferPropertyKernelEndTime:
+    params->ret = (uint64_t)([cmdbuf kernelEndTime] * ns);
+    break;
+  case WMTCommandBufferPropertyGPUStartTime:
+    params->ret = (uint64_t)([cmdbuf GPUStartTime] * ns);
+    break;
+  case WMTCommandBufferPropertyGPUEndTime:
+    params->ret = (uint64_t)([cmdbuf GPUEndTime] * ns);
+    break;
+  default:
+    params->ret = 0;
+    break;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newTileRenderPipelineState(void *obj) {
+  struct unixcall_mtldevice_newrenderpso *params = obj;
+  const struct WMTTileRenderPipelineInfo *info = params->info.ptr;
+  MTLTileRenderPipelineDescriptor *descriptor = [[MTLTileRenderPipelineDescriptor alloc] init];
+
+  for (unsigned i = 0; i < 8; i++) {
+    descriptor.colorAttachments[i].pixelFormat = to_metal_pixel_format(info->color_formats[i]);
+  }
+
+  for (unsigned i = 0; i < 31; i++) {
+    if (info->immutable_tile_buffers & (1 << i))
+      descriptor.tileBuffers[i].mutability = MTLMutabilityImmutable;
+  }
+
+  descriptor.rasterSampleCount = info->raster_sample_count;
+  descriptor.threadgroupSizeMatchesTileSize = info->tgsize_matches_tile_size;
+
+
+  descriptor.tileFunction = (id<MTLFunction>)info->tile_function;
+
+  MTLPipelineOption options = MTLPipelineOptionNone;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+  if (@available(macOS 15, *)) {
+    if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
+      descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
+                                                      count:info->num_binary_archives_for_lookup];
+    options = info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  }
+#endif
+  NSError *err = NULL;
+  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithTileDescriptor:descriptor
+                                                                                                  options:options
+                                                                                               reflection:nil
+                                                                                                    error:&err];
+  params->ret_error = (obj_handle_t)[err retain];
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+  if (@available(macOS 15, *)) {
+    if (!err && info->binary_archive_for_serialization) {
+      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
+          addTileRenderPipelineFunctionsWithDescriptor:descriptor
+                                                 error:&err];
+    }
+  }
+#endif
+  [descriptor release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newResidencySet(void *obj) {
+  struct unixcall_mtldevice_newresidencyset *params = obj;
+  NSError *err = NULL;
+  MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
+  descriptor.initialCapacity = params->init_capacity;
+  params->ret_set = (obj_handle_t)[(id<MTLDevice>)params->device newResidencySetWithDescriptor:descriptor error:&err];
+  params->ret_error = (obj_handle_t)[err retain];
+  [descriptor release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_addAllocations(void *obj) {
+  struct unixcall_mtlresidencyset_addallocations *params = obj;
+  id<MTLResidencySet> set = (id<MTLResidencySet>)params->set;
+  [set addAllocations:(id<MTLAllocation> const *)params->allocations.ptr count:params->count];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_removeAllocations(void *obj) {
+  struct unixcall_mtlresidencyset_addallocations *params = obj;
+  id<MTLResidencySet> set = (id<MTLResidencySet>)params->set;
+  [set removeAllocations:(id<MTLAllocation> const *)params->allocations.ptr count:params->count];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_removeAllAllocations(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  id<MTLResidencySet> set = (id<MTLResidencySet>)params->handle;
+  [set removeAllAllocations];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_commit(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  id<MTLResidencySet> set = (id<MTLResidencySet>)params->handle;
+  [set commit];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandQueue_addResidencySet(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  id<MTLCommandQueue> queue = (id<MTLCommandQueue>)params->handle;
+  id<MTLResidencySet> set = (id<MTLResidencySet>)params->arg;
+  [queue addResidencySet:set];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newHeap(void *obj) {
+  struct unixcall_mtldevice_newheap *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTHeapInfo const *info = params->info.ptr;
+  MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+  desc.resourceOptions = (MTLResourceOptions)info->options;
+  desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
+  desc.type = (MTLHeapType)info->type;
+  desc.size = info->size;
+
+  params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_heapBufferSizeAndAlign(void *obj) {
+  struct unixcall_mtldevice_heapbuffersizeandalign *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  MTLSizeAndAlign ret =
+      [device heapBufferSizeAndAlignWithLength:params->length options:(MTLResourceOptions)params->options];
+  params->ret_size = ret.size;
+  params->ret_align = ret.align;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+  struct unixcall_mtldevice_heaptexturesizeandalign *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTTextureInfo *info = params->info.ptr;
+  MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+  fill_texture_descriptor(desc, info);
+  MTLSizeAndAlign ret = [device heapTextureSizeAndAlignWithDescriptor:desc];
+  params->ret_size = ret.size;
+  params->ret_align = ret.align;
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLHeap_newBuffer(void *obj) {
+  struct unixcall_mtlheap_newbuffer *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTBufferInfo *info = params->info.ptr;
+  id<MTLBuffer> buffer;
+  if (~params->offset == 0)
+    buffer = [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
+  else
+    buffer =
+        [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options offset:params->offset];
+  info->memory.ptr = [heap storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
+
+  params->ret = (obj_handle_t)buffer;
+  info->gpu_address = [buffer gpuAddress];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLHeap_newTexture(void *obj) {
+  struct unixcall_mtlheap_newtexture *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTTextureInfo *info = params->info.ptr;
+  MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+  fill_texture_descriptor(desc, info);
+
+  id<MTLTexture> ret;
+  if (~params->offset == 0)
+    ret = [heap newTextureWithDescriptor:desc];
+  else
+    ret = [heap newTextureWithDescriptor:desc offset:params->offset];
+  params->ret = (obj_handle_t)ret;
+  info->gpu_resource_id = [ret gpuResourceID]._impl;
+  info->mach_port = 0;
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newIndirectCommandBuffer(void *obj) {
+  struct unixcall_mtldevice_newicb *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+
+  struct WMTIndirectCommandBufferInfo *info = params->info.ptr;
+
+  MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+
+  desc.commandTypes = (MTLIndirectCommandType)info->type;
+
+  desc.maxFragmentBufferBindCount = info->max_fragment_buffer_binding;
+  desc.maxKernelBufferBindCount = info->max_kernel_buffer_binding;
+  desc.maxKernelThreadgroupMemoryBindCount = info->max_kernel_threadgroup_memory_binding;
+  desc.maxMeshBufferBindCount = info->max_mesh_buffer_binding;
+  desc.maxObjectBufferBindCount = info->max_object_buffer_binding;
+  desc.maxObjectThreadgroupMemoryBindCount = info->max_object_threadgroup_memory_binding;
+  desc.maxVertexBufferBindCount = info->max_vertex_buffer_binding;
+
+  desc.inheritBuffers = info->inherit_buffers;
+  desc.inheritPipelineState = info->inherit_pso;
+  desc.supportDynamicAttributeStride = info->support_dynamic_attribute_stride;
+  desc.supportRayTracing = info->support_ray_tracing;
+
+#if 0 // needs macOS 26 SDK, and we don't really use it at the moment
+  desc.inheritCullMode = info->inherit_cull_mode;
+  desc.inheritDepthBias = info->inherit_depth_bias;
+  desc.inheritDepthClipMode = info->inherit_depth_clip_mode;
+  desc.inheritDepthStencilState = info->inherit_depth_stencil_state;
+  desc.inheritFrontFacingWinding = info->inherit_front_facing;
+  desc.inheritTriangleFillMode = info->inherit_fill_mode;
+  desc.supportColorAttachmentMapping = info->support_color_attachment_mapping;
+#endif
+
+  id<MTLIndirectCommandBuffer> icb =
+      [device newIndirectCommandBufferWithDescriptor:desc
+                                     maxCommandCount:params->max_count
+                                             options:(MTLResourceOptions)params->options];
+  params->ret = (obj_handle_t)icb;
+  info->gpu_resource_id = [icb gpuResourceID]._impl;
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newLibraryWithSource(void *obj) {
+  struct unixcall_mtldevice_newlibrarywithsource *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  NSString *source =
+      [[NSString alloc] initWithBytes:params->source.ptr length:params->length encoding:NSASCIIStringEncoding];
+  NSError *err = NULL;
+  MTLCompileOptions * options = [[MTLCompileOptions alloc] init];
+  options.languageVersion = MTLLanguageVersion3_1;
+  params->ret_library = (obj_handle_t)[device newLibraryWithSource:source options:options error:&err];
+  params->ret_error = (obj_handle_t)[err retain];
+  [source release];
+  [options release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTexture_getBytes(void *obj) {
+  struct unixcall_mtltexture_replaceregion *params = obj;
+  [(id<MTLTexture>)params->texture getBytes:params->data.ptr
+                                bytesPerRow:params->bytes_per_row
+                              bytesPerImage:params->bytes_per_image
+                                 fromRegion:MTLRegionMake3D(
+                                                params->origin.x, params->origin.y, params->origin.z,
+                                                params->size.width, params->size.height, params->size.depth
+                                            )
+                                mipmapLevel:params->level
+                                      slice:params->slice];
   return STATUS_SUCCESS;
 }
 
@@ -7008,13 +7546,13 @@ static NTSTATUS _madeira_ir_convert(void *args) { return (NTSTATUS)madeira_ir_co
  * gets a named refusal instead of silent corruption. */
 static NTSTATUS _madeira_ir_convert_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLDevice_newRenderPipelineStateVD_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_newResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+static NTSTATUS _MadeiraMTLDevice_newResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLResidencySet_addAllocation_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLResidencySet_commit_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLCommandQueue_addResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+static NTSTATUS _MadeiraMTLResidencySet_commit_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+static NTSTATUS _MadeiraMTLCommandQueue_addResidencySet_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLDevice_newGeometryEmulationPipelineState_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLResidencySet_removeAllocation_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
-static NTSTATUS _MTLDevice_heapTextureSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+static NTSTATUS _MadeiraMTLDevice_heapTextureSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLDevice_newPlacementHeap_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLHeap_newTextureAtOffset_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 
@@ -7546,7 +8084,7 @@ static NTSTATUS _madeira_ctl_wow64(void *args) {
  * on anything older the calls are no-ops and the runtime falls back to its
  * per-draw useResource lists. */
 static NTSTATUS
-_MTLDevice_newResidencySet(void *obj) {
+_MadeiraMTLDevice_newResidencySet(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   if (wmtr_enabled()) {
     struct rm_arg_handle_u64 a = { params->handle, params->arg };
@@ -7595,7 +8133,7 @@ _MTLResidencySet_removeAllocation(void *obj) {
 
 /* ml1072: placement heaps for the D3D12 runtime's small-texture sub-allocator. */
 static NTSTATUS
-_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+_MadeiraMTLDevice_heapTextureSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heaptexturesizealign *params = obj;
   params->ret_size = 0; params->ret_align = 0;
   if (wmtr_enabled()) return STATUS_SUCCESS;
@@ -7644,7 +8182,7 @@ _MTLHeap_newTextureAtOffset(void *obj) {
 
 /* ml1145: buffers placed in a placement heap (D3D12 placed resources in DEFAULT heaps). */
 static NTSTATUS
-_MTLDevice_heapBufferSizeAndAlign(void *obj) {
+_MadeiraMTLDevice_heapBufferSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heapbuffersizealign *params = obj;
   params->ret_size = 0; params->ret_align = 0;
   if (wmtr_enabled()) return STATUS_SUCCESS;
@@ -7672,11 +8210,11 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   }
   return STATUS_SUCCESS;
 }
-static NTSTATUS _MTLDevice_heapBufferSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
+static NTSTATUS _MadeiraMTLDevice_heapBufferSizeAndAlign_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 static NTSTATUS _MTLHeap_newBufferAtOffset_wow64(void *args) { (void)args; return STATUS_NOT_IMPLEMENTED; }
 
 static NTSTATUS
-_MTLResidencySet_commit(void *obj) {
+_MadeiraMTLResidencySet_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   if (wmtr_enabled()) {
     struct rm_arg_handle a = { params->handle };
@@ -7691,7 +8229,7 @@ _MTLResidencySet_commit(void *obj) {
 }
 
 static NTSTATUS
-_MTLCommandQueue_addResidencySet(void *obj) {
+_MadeiraMTLCommandQueue_addResidencySet(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
   if (wmtr_enabled()) {
     struct rm_arg_handle_u64 a = { params->handle, params->arg };
@@ -7886,7 +8424,103 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
   return STATUS_SUCCESS;
 }
 
+#ifndef DXMT_NATIVE
+/* The outer argument block is already translated; its pointer fields are not. */
+#define WMT_WOW64_POINTER_WRAPPER(name, type, field) \
+static NTSTATUS name##_wow64(void *obj) { \
+  struct type *original = obj; \
+  struct type translated = *original; \
+  translated.field.ptr = UInt32ToPtr((uint32_t)(uintptr_t)translated.field.ptr); \
+  NTSTATUS status = name(&translated); \
+  translated.field = original->field; \
+  *original = translated; \
+  return status; \
+}
+
+WMT_WOW64_POINTER_WRAPPER(_MTLCounterSampleBuffer_resolveCounterRange,
+                          unixcall_mtlcountersamplebuffer_resolvecounterrange, data_out)
+WMT_WOW64_POINTER_WRAPPER(_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+                          unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers, attachments)
+WMT_WOW64_POINTER_WRAPPER(_MTLResidencySet_addAllocations, unixcall_mtlresidencyset_addallocations, allocations)
+WMT_WOW64_POINTER_WRAPPER(_MTLResidencySet_removeAllocations, unixcall_mtlresidencyset_addallocations, allocations)
+WMT_WOW64_POINTER_WRAPPER(_MTLDevice_newHeap, unixcall_mtldevice_newheap, info)
+WMT_WOW64_POINTER_WRAPPER(_MTLDevice_heapTextureSizeAndAlign, unixcall_mtldevice_heaptexturesizeandalign, info)
+WMT_WOW64_POINTER_WRAPPER(_MTLHeap_newTexture, unixcall_mtlheap_newtexture, info)
+WMT_WOW64_POINTER_WRAPPER(_MTLDevice_newIndirectCommandBuffer, unixcall_mtldevice_newicb, info)
+WMT_WOW64_POINTER_WRAPPER(_MTLDevice_newLibraryWithSource, unixcall_mtldevice_newlibrarywithsource, source)
+WMT_WOW64_POINTER_WRAPPER(_MTLTexture_getBytes, unixcall_mtltexture_replaceregion, data)
+#undef WMT_WOW64_POINTER_WRAPPER
+
+static NTSTATUS _MTLDevice_newTileRenderPipelineState_wow64(void *obj) {
+  struct unixcall_mtldevice_newrenderpso *original = obj;
+  struct unixcall_mtldevice_newrenderpso translated = *original;
+  const struct WMTTileRenderPipelineInfo *input = UInt32ToPtr((uint32_t)(uintptr_t)original->info.ptr);
+  if (!input) return STATUS_INVALID_PARAMETER;
+  struct WMTTileRenderPipelineInfo info = *input;
+  info.binary_archives_for_lookup.ptr = UInt32ToPtr((uint32_t)(uintptr_t)info.binary_archives_for_lookup.ptr);
+  translated.info.ptr = &info;
+  NTSTATUS status = _MTLDevice_newTileRenderPipelineState(&translated);
+  original->ret_error = translated.ret_error;
+  original->ret_pso = translated.ret_pso;
+  return status;
+}
+
+static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
+  struct unixcall_mtlheap_newbuffer *original = obj;
+  struct unixcall_mtlheap_newbuffer translated = *original;
+  translated.info.ptr = UInt32ToPtr((uint32_t)(uintptr_t)original->info.ptr);
+  if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;
+  /* shortcut: shared heap memory is not guest-addressable, add guest-backed heaps before enabling it. */
+  if (wmtr_enabled() || [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate)
+    return STATUS_NOT_IMPLEMENTED;
+  NTSTATUS status = _MTLHeap_newBuffer(&translated);
+  original->ret = translated.ret;
+  return status;
+}
+#endif
+
 #include "wmt_remote_guard.h"
+
+/* shortcut: new upstream Metal calls are unavailable in remote mode until the remote protocol supports them. */
+#define WMT_REMOTE_UPSTREAM_GUARD(name) \
+static NTSTATUS _rmg_upstream_##name(void *obj) { \
+  if (wmtr_enabled()) return wmtr_unimplemented(#name); \
+  return _##name(obj); \
+}
+WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_newTimestampBuffer)
+WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
+WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
+WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_property)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newResidencySet)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_addAllocations)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllocations)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllAllocations)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_commit)
+WMT_REMOTE_UPSTREAM_GUARD(MTLCommandQueue_addResidencySet)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapBufferSizeAndAlign)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign)
+WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer)
+WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource)
+WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
+#ifndef DXMT_NATIVE
+WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_addAllocations_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLResidencySet_removeAllocations_wow64)
+WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
+#endif
+#undef WMT_REMOTE_UPSTREAM_GUARD
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -8026,20 +8660,20 @@ const void *__wine_unix_call_funcs[] = {
      * TARGET, and that is chosen by the caller and passed in. */
     &_madeira_ir_convert,
     &_MTLDevice_newRenderPipelineStateVD,
-    &_MTLDevice_newResidencySet,
+    &_MadeiraMTLDevice_newResidencySet,
     &_MTLResidencySet_addAllocation,
-    &_MTLResidencySet_commit,
-    &_MTLCommandQueue_addResidencySet,
+    &_MadeiraMTLResidencySet_commit,
+    &_MadeiraMTLCommandQueue_addResidencySet,
     &_MTLDevice_newGeometryEmulationPipelineState,
     &_rmg_MTLResidencySet_removeAllocation,
-    &_rmg_MTLDevice_heapTextureSizeAndAlign,
+    &_rmg_MadeiraMTLDevice_heapTextureSizeAndAlign,
     &_rmg_MTLDevice_newPlacementHeap,
     &_rmg_MTLHeap_newTextureAtOffset,
     &_madeira_ctl,   /* ml1098 */
     /* 127-138 are madeira-d3d12 (above); 139-140 are the placement-heap buffers; 141-144 stay NULL;
      * 145-149 are the DXSO (D3D9 shader) compiler; 150 is the unix-call benchmark nop.
      * The slot number is the ABI: never insert, never reuse. */
-    &_MTLDevice_heapBufferSizeAndAlign,   /* ml1145: 139 */
+    &_MadeiraMTLDevice_heapBufferSizeAndAlign,   /* ml1145: 139 */
     &_MTLHeap_newBufferAtOffset,          /* ml1145: 140 */
     NULL, /* 141 */
     NULL, /* 142 */
@@ -8054,6 +8688,26 @@ const void *__wine_unix_call_funcs[] = {
      * END of both tables, which is the only place a slot may be added --
      * rules 3 and 4 of section 7.4. 150 in both. */
     &_d3d9_nop,                         /* 150 */
+    /* Upstream calls 127-145 are mapped to 151-169. */
+    &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange,
+    &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+    &_rmg_upstream_MTLCommandBuffer_property,
+    &_rmg_upstream_MTLDevice_newTileRenderPipelineState,
+    &_rmg_upstream_MTLDevice_newResidencySet,
+    &_rmg_upstream_MTLResidencySet_addAllocations,
+    &_rmg_upstream_MTLResidencySet_removeAllocations,
+    &_rmg_upstream_MTLResidencySet_removeAllAllocations,
+    &_rmg_upstream_MTLResidencySet_commit,
+    &_rmg_upstream_MTLCommandQueue_addResidencySet,
+    &_rmg_upstream_MTLDevice_newHeap,
+    &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
+    &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign,
+    &_rmg_upstream_MTLHeap_newBuffer,
+    &_rmg_upstream_MTLHeap_newTexture,
+    &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
+    &_rmg_upstream_MTLDevice_newLibraryWithSource,
+    &_rmg_upstream_MTLTexture_getBytes,
 };
 
 #ifndef DXMT_NATIVE
@@ -8187,20 +8841,20 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_MTLSharedEvent_waitUntilSignaledValue,
     &_madeira_ir_convert_wow64,
     &_MTLDevice_newRenderPipelineStateVD_wow64,
-    &_MTLDevice_newResidencySet_wow64,
+    &_MadeiraMTLDevice_newResidencySet_wow64,
     &_MTLResidencySet_addAllocation_wow64,
-    &_MTLResidencySet_commit_wow64,
-    &_MTLCommandQueue_addResidencySet_wow64,
+    &_MadeiraMTLResidencySet_commit_wow64,
+    &_MadeiraMTLCommandQueue_addResidencySet_wow64,
     &_MTLDevice_newGeometryEmulationPipelineState_wow64,
     &_MTLResidencySet_removeAllocation_wow64,
-    &_MTLDevice_heapTextureSizeAndAlign_wow64,
+    &_MadeiraMTLDevice_heapTextureSizeAndAlign_wow64,
     &_MTLDevice_newPlacementHeap_wow64,
     &_MTLHeap_newTextureAtOffset_wow64,
     &_madeira_ctl_wow64,
     /* 127-138 are madeira-d3d12 (above); 139-140 are the placement-heap buffers; 141-144 stay NULL;
      * 145-149 are the DXSO (D3D9 shader) compiler; 150 is the unix-call benchmark nop.
      * The slot number is the ABI: never insert, never reuse. */
-    &_MTLDevice_heapBufferSizeAndAlign_wow64,   /* 139 */
+    &_MadeiraMTLDevice_heapBufferSizeAndAlign_wow64,   /* 139 */
     &_MTLHeap_newBufferAtOffset_wow64,   /* 140 */
     NULL, /* 141 */
     NULL, /* 142 */
@@ -8216,5 +8870,25 @@ const void *__wine_unix_call_wow64_funcs[] = {
      * sharing the 64-bit handler is correct, not a gap (section 7.11 says the
      * same about slots 47, 66, 67 and 72). */
     &_d3d9_nop,                         /* 150 */
+    /* Upstream calls 127-145 are mapped to 151-169. */
+    &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange_wow64,
+    &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
+    &_rmg_upstream_MTLCommandBuffer_property,
+    &_rmg_upstream_MTLDevice_newTileRenderPipelineState_wow64,
+    &_rmg_upstream_MTLDevice_newResidencySet,
+    &_rmg_upstream_MTLResidencySet_addAllocations_wow64,
+    &_rmg_upstream_MTLResidencySet_removeAllocations_wow64,
+    &_rmg_upstream_MTLResidencySet_removeAllAllocations,
+    &_rmg_upstream_MTLResidencySet_commit,
+    &_rmg_upstream_MTLCommandQueue_addResidencySet,
+    &_rmg_upstream_MTLDevice_newHeap_wow64,
+    &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
+    &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign_wow64,
+    &_rmg_upstream_MTLHeap_newBuffer_wow64,
+    &_rmg_upstream_MTLHeap_newTexture_wow64,
+    &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,
+    &_rmg_upstream_MTLDevice_newLibraryWithSource_wow64,
+    &_rmg_upstream_MTLTexture_getBytes_wow64,
 };
 #endif

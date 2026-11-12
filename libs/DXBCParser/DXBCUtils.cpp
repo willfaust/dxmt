@@ -185,6 +185,32 @@ HRESULT DXBCGetPatchConstantSignature( const void* pBlobContainer, CSignaturePar
     return E_FAIL;
 }
 
+HRESULT DXBCGetRootSignature( const void *pBlobContainer, const void **ppBlob, UINT *pByteSize) {
+    CDXBCParser DXBCParser;
+    HRESULT hr = S_OK;
+    if( FAILED(hr = DXBCParser.ReadDXBCAssumingValidSize(pBlobContainer) ) )
+    {
+        assert(pBlobContainer);
+        return hr;
+    }
+
+    UINT BlobIndex = DXBCParser.FindNextMatchingBlob( DXBC_RootSignature, 0 );
+    if( BlobIndex != DXBC_BLOB_NOT_FOUND )
+    {
+        const void* pBlob = DXBCParser.GetBlob(BlobIndex);
+        UINT BlobSize = DXBCParser.GetBlobSize(BlobIndex);
+        if( !BlobSize )
+        {
+            return E_FAIL;
+        }
+        *ppBlob = pBlob;
+        *pByteSize = BlobSize;
+        return S_OK;
+    }
+
+    return E_FAIL;
+}
+
 //=================================================================================================================================
 // CSignatureParser
 

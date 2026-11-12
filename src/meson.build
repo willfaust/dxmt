@@ -1,7 +1,7 @@
 subdir('util')
 subdir('airconv')
 
-if dxmt_native
+if not dxmt_crossbuild
 subdir('nativemetal')
 else
 subdir('winemetal')
@@ -36,6 +36,10 @@ endif
 # as d3d9-emulated.dll, which is the A/B pair madeira-d3d9.txt selects between.
 if not dxmt_native
 subdir('d3d9shim')
+endif
+
+if get_option('enable_d3d12')
+subdir('d3d12')
 endif
 
 if get_option('enable_nvapi')

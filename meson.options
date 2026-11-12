@@ -11,7 +11,7 @@ option('dxmt_native', type : 'boolean', value : false)
 option('dxmt_madeira_native', type : 'boolean', value : false)
 option('wine_build_path', type : 'string')
 option('wine_install_path', type : 'string')
-option('wine_builtin_dll', type : 'boolean', value : false)
+option('wine_builtin_dll', type : 'boolean', value : true)
 option('enable_tests', type : 'boolean', value : false)
 option('enable_nvapi', type : 'boolean', value : false)
 option('enable_nvngx', type : 'boolean', value : false)
@@ -19,3 +19,4 @@ option('enable_nvngx', type : 'boolean', value : false)
 # meson.build). Raise it only when the shaders need a newer standard: a device
 # refuses a library written for a version its OS does not know.
 option('metal_std', type : 'string', value : 'metal3.1')
+option('enable_d3d12', type : 'boolean', value : false)

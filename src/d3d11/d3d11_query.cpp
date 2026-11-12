@@ -3,13 +3,13 @@
 
 namespace dxmt {
 
-class OcculusionQuery : public MTLD3DQueryBase<IMTLD3DOcclusionQuery> {
-  using MTLD3DQueryBase<IMTLD3DOcclusionQuery>::MTLD3DQueryBase;
+class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
+  using MTLD3DQueryBase<MTLD3D11OcclusionQuery>::MTLD3DQueryBase;
 
-  QueryState state = QueryState::Signaled;
+  QueryState state_ = QueryState::Signaled;
 
-  Rc<VisibilityResultQuery> query = new VisibilityResultQuery();
-  uint64_t accumulated_value = 0;
+  Rc<VisibilityResultQuery> query_ = new VisibilityResultQuery();
+  uint64_t accumulated_value_ = 0;
 
   virtual UINT STDMETHODCALLTYPE
   GetDataSize() override {
@@ -18,68 +18,108 @@ class OcculusionQuery : public MTLD3DQueryBase<IMTLD3DOcclusionQuery> {
 
   virtual HRESULT
   GetData(void *data) override {
-    if (state == QueryState::Building) {
+    if (state_ == QueryState::Building) {
       return DXGI_ERROR_INVALID_CALL;
     }
-    if (state == QueryState::Signaled || query->getValue(&accumulated_value)) {
+    if (state_ == QueryState::Signaled || query_->getValue(&accumulated_value_)) {
       if (desc_.Query == D3D11_QUERY_OCCLUSION_PREDICATE) {
-        *((BOOL *)data) = accumulated_value != 0;
+        *((BOOL *)data) = accumulated_value_ != 0;
       } else {
-        *((uint64_t *)data) = accumulated_value;
+        *((uint64_t *)data) = accumulated_value_;
       }
-      query = new VisibilityResultQuery();
-      state = QueryState::Signaled;
+      query_ = new VisibilityResultQuery();
+      state_ = QueryState::Signaled;
       return S_OK;
     }
     return S_FALSE;
   }
 
-  virtual bool
+  virtual VisibilityResultQuery *
   Begin() override {
-    if (state == QueryState::Signaled) {
-      state = QueryState::Building;
-      return true;
+    if (state_ == QueryState::Signaled) {
+      state_ = QueryState::Building;
+      return query_.ptr();
     }
-    if (state == QueryState::Issued) {
+    if (state_ == QueryState::Issued) {
       // discard previous issued query
-      state = QueryState::Building;
-      query = new VisibilityResultQuery();
-      return true;
+      state_ = QueryState::Building;
+      query_ = new VisibilityResultQuery();
+      return query_.ptr();
     }
     // FIXME: it's effectively ignoring  Begin() after Begin()
-    return false;
+    return nullptr;
   };
 
-  virtual bool
+  virtual VisibilityResultQuery *
   End() override {
-    if (state == QueryState::Signaled) {
+    if (state_ == QueryState::Signaled) {
       // ignore  a single End()
-      accumulated_value = 0;
-      return false;
+      accumulated_value_ = 0;
+      return nullptr;
     }
-    if (state == QueryState::Issued) {
+    if (state_ == QueryState::Issued) {
       // FIXME: it's effectively ignoring End() after End()
-      return false;
+      return nullptr;
     }
-    state = QueryState::Issued;
-    return true;
+    state_ = QueryState::Issued;
+    return query_.ptr();
   };
 
-  virtual void DoDeferredQuery(dxmt::Rc<dxmt::VisibilityResultQuery> &deferred_query) override{
-    accumulated_value = 0;
-    state = QueryState::Issued;
-    query = deferred_query;
+  virtual void DoDeferredQuery(VisibilityResultQuery *deferred_query) override{
+    accumulated_value_ = 0;
+    state_ = QueryState::Issued;
+    query_ = deferred_query;
   };
-
-  virtual Rc<VisibilityResultQuery> __query() override {
-    return query;
-  }
 };
 
 HRESULT
-CreateOcculusionQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC *pDesc, ID3D11Query **ppQuery) {
+CreateOcclusionQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC1 *pDesc, ID3D11Query1 **ppQuery) {
   if (ppQuery) {
-    *ppQuery = ref(new OcculusionQuery(pDevice, pDesc));
+    *ppQuery = ref(new OcclusionQuery(pDevice, pDesc));
+    return S_OK;
+  }
+  return S_FALSE;
+}
+
+class MTLD3D11TimestampQueryImpl : public MTLD3DQueryBase<MTLD3D11TimestampQuery> {
+  using MTLD3DQueryBase<MTLD3D11TimestampQuery>::MTLD3DQueryBase;
+
+  QueryState state_ = QueryState::Signaled;
+
+  Rc<TimestampQuery> query_ = new TimestampQuery();
+  uint64_t latest_value_ = 0;
+
+  virtual UINT STDMETHODCALLTYPE
+  GetDataSize() override {
+    return sizeof(UINT64);
+  };
+
+  virtual HRESULT
+  GetData(void *data) override {
+    if (state_ == QueryState::Signaled || query_->getValue(&latest_value_)) {
+      *((uint64_t *)data) = latest_value_;
+      query_ = new TimestampQuery();
+      state_ = QueryState::Signaled;
+      return S_OK;
+    }
+    return S_FALSE;
+  }
+
+  virtual TimestampQuery *
+  End() override {
+    if (state_ == QueryState::Issued) {
+      // discard previous query
+      query_ = new TimestampQuery();
+    }
+    state_ = QueryState::Issued;
+    return query_.ptr();
+  };
+};
+
+HRESULT
+CreateTimestampQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC1 *pDesc, ID3D11Query1 **ppQuery) {
+  if (ppQuery) {
+    *ppQuery = ref(new MTLD3D11TimestampQueryImpl(pDevice, pDesc));
     return S_OK;
   }
   return S_FALSE;

@@ -1,3 +1,22 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ * Copyright 2026 Marc-Aurel Zent for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "dxmt_command_queue.hpp"
 #include "Metal.hpp"
 #include "dxmt_statistics.hpp"
@@ -37,7 +56,8 @@ CommandQueue::CommandQueue(WMT::Device device) :
     reftracker_storage_allocator({}),
     cmd_library(device),
     argument_encoding_ctx(*this, device, cmd_library),
-    initializer(device) {
+    initializer(device),
+    counter_pool(device) {
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.queue = this;
@@ -265,11 +285,11 @@ CommandQueue::AccountGpuTime(obj_handle_t cmdbuf, uint64_t frame) {
   perf_.cmdbufs = 0;
 }
 
-void CommandQueue::Retain(uint64_t seq, Allocation* allocaiton) {
+void CommandQueue::Retain(uint64_t seq, Allocation* allocation) {
   auto &chunk = chunks[seq % kCommandChunkCount];
   auto &tracker = chunk.ref_tracker;
   constexpr size_t block_size = decltype(reftracker_storage_allocator)::block_size;
-  while (unlikely(!tracker.track(allocaiton))) {
+  while (unlikely(!tracker.track(allocation))) {
     auto [temp_buffer, _] = reftracker_storage_allocator.allocate(seq, cpu_coherent.signaledValue(), block_size, 1);
     tracker.addStorage(temp_buffer.ptr, block_size);
   }

@@ -18,7 +18,6 @@ d3d11_src = [
   'd3d11_texture_linear.cpp',
   'd3d11_texture_dynamic.cpp',
   'd3d11_resource_staging.cpp',
-  'dxmt_resource_binding.cpp',
   'd3d11_pipeline.cpp',
   'd3d11_pipeline_gs.cpp',
   'd3d11_pipeline_ts.cpp',
@@ -28,6 +27,7 @@ d3d11_src = [
   'd3d11_context_def.cpp',
   'd3d11_multithread.cpp',
   'd3d11_fence.cpp',
+  'd3d11_surface.cpp',
 ]
 
 d3d10_src = [

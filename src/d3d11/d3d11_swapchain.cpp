@@ -17,6 +17,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
+#include "util_hotpatch.h"
 #include "wsi_monitor.hpp"
 #include "wsi_platform_win32.hpp"
 #include "wsi_window.hpp"
@@ -179,6 +180,8 @@ public:
                            (double)current_mode.refreshRate.denominator;
     }
 
+    handle_alt_tab_ = Config::getInstance().getOption<bool>("dxgi.handleAltTab", false);
+
     hud.initialize(GetVersionDescriptionText(device_->GetDirectXVersion(), device_->GetFeatureLevel()));
 
     backbuffer_desc_ = D3D11_TEXTURE2D_DESC1 {
@@ -244,6 +247,7 @@ public:
     return factory_->QueryInterface(riid, parent);
   };
 
+  DXMT_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present(UINT sync_interval, UINT flags) final {
@@ -261,6 +265,7 @@ public:
     }
   };
 
+  DXMT_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
@@ -440,7 +445,7 @@ public:
   GetFullscreenState(BOOL *pFullscreen, IDXGIOutput **ppTarget) final {
     HRESULT hr = S_OK;
 
-    if (!fullscreen_desc_.Windowed && !wsi::isForeground(hWnd))
+    if (handle_alt_tab_ && !fullscreen_desc_.Windowed && !wsi::isForeground(hWnd))
       SetFullscreenState(FALSE, nullptr);
 
     if (pFullscreen != nullptr)
@@ -474,6 +479,7 @@ public:
     return S_OK;
   };
 
+  DXMT_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,
@@ -529,13 +535,14 @@ public:
       info.output_width = desc_.Width * scale_factor;
       info.color_format = backbuffer_->texture()->pixelFormat();
       info.output_format =upscaled_backbuffer_->texture()->pixelFormat();
-      metalfx_scaler = device_->GetMTLDevice().newSpatialScaler(info);
+      metalfx_scaler = new SpatialScaler(device_->GetMTLDevice(), info);
       D3D11_ASSERT(metalfx_scaler && "otherwise metalfx failed to initialize");
     }
 
     return S_OK;
   };
 
+  DXMT_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
@@ -564,6 +571,7 @@ public:
     fullscreen_desc_.Scaling = newDisplayMode.Scaling;
 
     if (fullscreen_desc_.Windowed) {
+      lock = {};
       wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width,
                         newDisplayMode.Height);
     } else {
@@ -729,6 +737,7 @@ public:
     return SyncFrameState();
   };
 
+  DXMT_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
@@ -781,7 +790,7 @@ public:
 #ifdef DXMT_IOS
     bool should_exit_fs = false;
 #else
-    bool should_exit_fs = !fullscreen_desc_.Windowed && !window_minimized && !wsi::isForeground(hWnd);
+    bool should_exit_fs = handle_alt_tab_ && !fullscreen_desc_.Windowed && !window_minimized && !wsi::isForeground(hWnd);
 #endif
     if (hr == S_OK && should_exit_fs)
       hr = DXGI_STATUS_OCCLUDED;
@@ -918,7 +927,7 @@ public:
     hud.printLine(std::format(
         "Sync:   {:2} {:4.1f}  {:2} {:4.1f} {:2}", std::min(frame.sync_count, 99u),
         std::min(average.sync_interval.count() / 1000000.0, 99.9), std::min(statistics.max().event_stall, 99u),
-        std::min(average.present_lantency_interval.count() / 1000000.0, 99.9), frame.latency
+        std::min(average.present_latency_interval.count() / 1000000.0, 99.9), frame.latency
     ));
     hud.printLine(std::format(
         "Encode: {:4.1f}+{:4.1f}+{:4.1f}={:4.1f}", std::min(average.encode_prepare_interval.count() / 1000000.0, 99.9),
@@ -985,31 +994,57 @@ public:
 
   HRESULT
   STDMETHODCALLTYPE
-  GetRestrictToOutput(IDXGIOutput **ppRestrictToOutput) final { IMPLEMENT_ME; };
+  GetRestrictToOutput(IDXGIOutput **ppRestrictToOutput) final {
+    InitReturnPtr(ppRestrictToOutput);
+    ERR("DXGISwapChain1::GetRestrictToOutput: not implemented");
+    return E_NOTIMPL;
+  };
 
   HRESULT
   STDMETHODCALLTYPE
-  SetBackgroundColor(const DXGI_RGBA *pColor) final { IMPLEMENT_ME; };
+  SetBackgroundColor(const DXGI_RGBA *pColor) final {
+    ERR("DXGISwapChain1::SetBackgroundColor: not implemented");
+    return E_NOTIMPL;
+  };
 
   HRESULT
   STDMETHODCALLTYPE
-  GetBackgroundColor(DXGI_RGBA *pColor) final { IMPLEMENT_ME; };
-
-  HRESULT
-  STDMETHODCALLTYPE
-  SetRotation(DXGI_MODE_ROTATION Rotation) final { IMPLEMENT_ME; };
-
-  HRESULT
-  STDMETHODCALLTYPE
-  GetRotation(DXGI_MODE_ROTATION *pRotation) final { IMPLEMENT_ME; };
-
-  HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
-    IMPLEMENT_ME
+  GetBackgroundColor(DXGI_RGBA *pColor) final {
+    if (!pColor)
+      return E_INVALIDARG;
+    // TODO(swapchain): check if native returns transparent or opaque black
+    *pColor = {0, 0, 0, 0};
     return S_OK;
   };
 
-  HRESULT STDMETHODCALLTYPE GetSourceSize(UINT *width, UINT *height) override {
-    IMPLEMENT_ME
+  HRESULT
+  STDMETHODCALLTYPE
+  SetRotation(DXGI_MODE_ROTATION Rotation) final {
+    ERR("DXGISwapChain1::SetRotation: not implemented");
+    return E_NOTIMPL;
+  };
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetRotation(DXGI_MODE_ROTATION *pRotation) final {
+    if (!pRotation)
+      return E_INVALIDARG;
+    *pRotation = DXGI_MODE_ROTATION_IDENTITY;
+    return S_OK;
+  };
+
+  HRESULT STDMETHODCALLTYPE
+  SetSourceSize(UINT Width, UINT Height) override {
+    ERR("DXGISwapChain2::SetSourceSize: not implemented");
+    return E_NOTIMPL;
+  };
+
+  HRESULT STDMETHODCALLTYPE
+  GetSourceSize(UINT *pWidth, UINT *pHeight) override {
+    if (pWidth)
+      *pWidth = desc_.Width;
+    if (pHeight)
+      *pHeight = desc_.Height;
     return S_OK;
   };
 
@@ -1051,12 +1086,14 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
-    return DXGI_ERROR_INVALID_CALL;
+    ERR("DXGISwapChain2::SetMatrixTransform: not implemented");
+    return E_NOTIMPL;
   };
 
   HRESULT STDMETHODCALLTYPE
   GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
-    return DXGI_ERROR_INVALID_CALL;
+    ERR("DXGISwapChain2::GetMatrixTransform: not implemented");
+    return E_NOTIMPL;
   };
 
   HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(
@@ -1070,10 +1107,11 @@ public:
   };
 
   UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
-    // should always 0?
+    // TODO(swapchain): can be non-zero once sequential swapchain is implemented
     return 0;
   }
 
+  DXMT_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
                          DXGI_FORMAT Format, UINT SwapChainFlags,
                          const UINT *pCreationNodeMask,
@@ -1149,7 +1187,9 @@ private:
   ModeSetGuard modeset_guard_;
   dxmt::mutex mutex_;
 
-  std::conditional<EnableMetalFX, WMT::Reference<WMT::FXSpatialScaler>, std::monostate>::type metalfx_scaler;
+  bool handle_alt_tab_;
+
+  std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
   float scale_factor = 1.0;
 };
@@ -1178,6 +1218,9 @@ CreateSwapChain(
        pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD) &&
       pDesc->BufferCount != 1) {
     WARN("CreateSwapChain: unsupported swap effect ", pDesc->SwapEffect, " with backbuffer size ", pDesc->BufferCount);
+  }
+  if (ConvertSwapChainFormat(pDesc->Format) == WMTPixelFormatInvalid) {
+    return E_INVALIDARG;
   }
   if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {

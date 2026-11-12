@@ -132,13 +132,13 @@ read_control_flow(
     }
 
     case D3D10_SB_OPCODE_LOOP: {
-      auto loop_entrace = fresh_bb("loop_entrace");
+      auto loop_entrance = fresh_bb("loop_entrance");
       auto end_loop = fresh_bb("end_loop");
-      bb_continue_target.push(loop_entrace);
+      bb_continue_target.push(loop_entrance);
       bb_break_target.push(end_loop);
 
-      bb_current->target = BasicBlockUnconditionalBranch{loop_entrace};
-      bb_current = loop_entrace;
+      bb_current->target = BasicBlockUnconditionalBranch{loop_entrance};
+      bb_current = loop_entrance;
       break;
     }
     case D3D10_SB_OPCODE_ENDLOOP: {
@@ -403,7 +403,7 @@ read_control_flow(
         srv.range.space = (Inst.m_ResourceDecl.Space);
         srv.resource_type = to_shader_resource_type(Inst.m_ResourceDecl.Dimension);
         srv.scaler_type = to_shader_scaler_type(Inst.m_ResourceDecl.ReturnType[0]);
-        srv.strucure_stride = -1;
+        srv.structure_stride = -1;
         // Inst.m_ResourceDecl.SampleCount
         break;
       }
@@ -411,14 +411,14 @@ read_control_flow(
         srv.resource_type = ResourceType::NonApplicable;
         srv.range.space = Inst.m_RawSRVDecl.Space;
         srv.scaler_type = ScalerDataType::Uint;
-        srv.strucure_stride = 0;
+        srv.structure_stride = 0;
         break;
       }
       case D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED: {
         srv.resource_type = ResourceType::NonApplicable;
         srv.range.space = (Inst.m_StructuredSRVDecl.Space);
         srv.scaler_type = ScalerDataType::Uint;
-        srv.strucure_stride = Inst.m_StructuredSRVDecl.ByteStride;
+        srv.structure_stride = Inst.m_StructuredSRVDecl.ByteStride;
         break;
       }
       default:;
@@ -458,7 +458,7 @@ read_control_flow(
         Flags = Inst.m_TypedUAVDecl.Flags;
         uav.resource_type = to_shader_resource_type(Inst.m_TypedUAVDecl.Dimension);
         uav.scaler_type = to_shader_scaler_type(Inst.m_TypedUAVDecl.ReturnType[0]);
-        uav.strucure_stride = -1;
+        uav.structure_stride = -1;
         break;
       }
       case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW: {
@@ -466,7 +466,7 @@ read_control_flow(
         uav.resource_type = ResourceType::NonApplicable;
         Flags = Inst.m_RawUAVDecl.Flags;
         uav.scaler_type = ScalerDataType::Uint;
-        uav.strucure_stride = 0;
+        uav.structure_stride = 0;
         break;
       }
       case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED: {
@@ -474,7 +474,7 @@ read_control_flow(
         uav.resource_type = ResourceType::NonApplicable;
         Flags = Inst.m_StructuredUAVDecl.Flags;
         uav.scaler_type = ScalerDataType::Uint;
-        uav.strucure_stride = Inst.m_StructuredUAVDecl.ByteStride;
+        uav.structure_stride = Inst.m_StructuredUAVDecl.ByteStride;
         break;
       }
       default:;
@@ -658,15 +658,7 @@ read_control_flow(
   }
 
   if (bb_current != bb_return) {
-    // if fork/join phase reads control point phase output, or control point phase is absent
-    // then we need to perform a memcpy from threadgroup memory to payload memory
-    // otherwise output is written to payload memory directly
-    if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&
-        (shader_info.output_control_point_read || !shader_info.no_control_point_phase_passthrough)) {
-      bb_current->target = BasicBlockHullShaderWriteOutput{sm50_shader->output_control_point_count, bb_return};
-    } else {
-      bb_current->target = BasicBlockUnconditionalBranch{bb_return};
-    }
+    bb_current->target = BasicBlockUnconditionalBranch{bb_return};
     bb_current = bb_return;
   }
 
@@ -690,6 +682,7 @@ read_control_flow(
         return cloned;
       };
 
+      auto call_return_point = call->return_point;
       bb->target = BasicBlockUnconditionalBranch{clone(func_entries.at(call->func_id))};
 
       while (!block_to_redirect.empty()) {
@@ -699,8 +692,8 @@ read_control_flow(
         cloned->target = std::visit(
             patterns{
                 [](BasicBlockUndefined) -> BasicBlockTarget { return BasicBlockUndefined{}; },
-                [&](BasicBlockReturn ret) -> BasicBlockTarget {
-                  return BasicBlockUnconditionalBranch{call->return_point};
+                [=](BasicBlockReturn ret) -> BasicBlockTarget {
+                  return BasicBlockUnconditionalBranch{call_return_point};
                 },
                 [&](BasicBlockUnconditionalBranch uncond) -> BasicBlockTarget {
                   return BasicBlockUnconditionalBranch{clone(uncond.target)};
@@ -721,9 +714,6 @@ read_control_flow(
                   return BasicBlockInstanceBarrier{
                       instance.instance_count, clone(instance.active), clone(instance.sync)
                   };
-                },
-                [&](BasicBlockHullShaderWriteOutput hull_end) -> BasicBlockTarget {
-                  return BasicBlockHullShaderWriteOutput{hull_end.instance_count, clone(hull_end.epilogue)};
                 },
                 [&](BasicBlockCall call) -> BasicBlockTarget {
                   if (stack_depth == 1)

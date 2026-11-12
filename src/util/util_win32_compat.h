@@ -11,7 +11,7 @@
 
 #include "util_madeira_compat.h"
 
-#elif defined(DXMT_NATIVE)
+#elif !defined(_WIN32)
 
 #include <windows.h>
 

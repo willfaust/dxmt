@@ -3,7 +3,7 @@
 #ifndef WMT_API_NAMES_H
 #define WMT_API_NAMES_H
 
-#define WMT_API_COUNT 151
+#define WMT_API_COUNT 170
 
 static const char *const wmt_api_names[WMT_API_COUNT] = {
     "NSObject_retain",
@@ -135,17 +135,17 @@ static const char *const wmt_api_names[WMT_API_COUNT] = {
     "MTLSharedEvent_waitUntilSignaledValue",
     "madeira_ir_convert",
     "MTLDevice_newRenderPipelineStateVD",
-    "MTLDevice_newResidencySet",
+    "MadeiraMTLDevice_newResidencySet",
     "MTLResidencySet_addAllocation",
-    "MTLResidencySet_commit",
-    "MTLCommandQueue_addResidencySet",
+    "MadeiraMTLResidencySet_commit",
+    "MadeiraMTLCommandQueue_addResidencySet",
     "MTLDevice_newGeometryEmulationPipelineState",
     "MTLResidencySet_removeAllocation",
-    "MTLDevice_heapTextureSizeAndAlign",
+    "MadeiraMTLDevice_heapTextureSizeAndAlign",
     "MTLDevice_newPlacementHeap",
     "MTLHeap_newTextureAtOffset",
     "madeira_ctl",
-    "MTLDevice_heapBufferSizeAndAlign",
+    "MadeiraMTLDevice_heapBufferSizeAndAlign",
     "MTLHeap_newBufferAtOffset",
     "<null slot>",
     "<null slot>",
@@ -157,6 +157,25 @@ static const char *const wmt_api_names[WMT_API_COUNT] = {
     "thunk_DXSOGetCompiledBitcode",
     "thunk_DXSODestroyBitcode",
     "d3d9_nop",
+    "MTLCounterSampleBuffer_newTimestampBuffer",
+    "MTLCounterSampleBuffer_resolveCounterRange",
+    "MTLCommandBuffer_blitCommandEncoderWithSampleBuffers",
+    "MTLCommandBuffer_property",
+    "MTLDevice_newTileRenderPipelineState",
+    "MTLDevice_newResidencySet",
+    "MTLResidencySet_addAllocations",
+    "MTLResidencySet_removeAllocations",
+    "MTLResidencySet_removeAllAllocations",
+    "MTLResidencySet_commit",
+    "MTLCommandQueue_addResidencySet",
+    "MTLDevice_newHeap",
+    "MTLDevice_heapBufferSizeAndAlign",
+    "MTLDevice_heapTextureSizeAndAlign",
+    "MTLHeap_newBuffer",
+    "MTLHeap_newTexture",
+    "MTLDevice_newIndirectCommandBuffer",
+    "MTLDevice_newLibraryWithSource",
+    "MTLTexture_getBytes",
 };
 
 #endif

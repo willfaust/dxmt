@@ -60,6 +60,15 @@ AirType::AirType(LLVMContext &context) : context(context) {
     "dxmt_vertex_buffer_entry"
   );
 
+  _dxmt_stream_output_buffer_entry = StructType::create(
+    context,
+    {
+      _int->getPointerTo((uint32_t)AddressSpace::device),
+      _int->getPointerTo((uint32_t)AddressSpace::device),
+    },
+    "dxmt_stream_output_buffer_entry"
+  );
+
   _dxmt_draw_arguments = StructType::create(
     context,
     {
@@ -81,6 +90,20 @@ AirType::AirType(LLVMContext &context) : context(context) {
       _int, // base instance
     },
     "dxmt_draw_indexed_arguments"
+  );
+
+  _dxmt_draw_dyn_ib_arguments = StructType::create(
+    context,
+    {
+      _int, // index/vertex count
+      _int, // instance count
+      _int, // start index/vertex
+      _int, // base vertex
+      _int, // base instance
+      _int, // index format
+      _byte->getPointerTo((uint32_t)AddressSpace::device), // index buffer
+    },
+    "dxmt_draw_dyn_ib_arguments"
   );
 
   auto tyOpaque = get_or_create_struct(context, "opaque");

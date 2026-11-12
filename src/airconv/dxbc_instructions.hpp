@@ -1,8 +1,27 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #pragma once
 #include "DXBCParser/ShaderBinary.h"
 #include "shader_common.hpp"
 #include <array>
 #include <map>
+#include <string>
 #include <string_view>
 #include <variant>
 #include "packed_variant_list.hpp"
@@ -61,6 +80,10 @@ struct IndexByTempComponent {
   uint32_t offset;
 };
 
+struct IndexByControlPointId {
+  uint32_t offset;
+};
+
 struct IndexByIndexableTempComponent {
   uint32_t regfile;
   uint32_t regid;
@@ -69,8 +92,8 @@ struct IndexByIndexableTempComponent {
   uint32_t offset;
 };
 
-using OperandIndex =
-  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent>;
+using OperandIndex = std::variant<uint32_t, IndexByIndexableTempComponent,
+                                  IndexByTempComponent, IndexByControlPointId>;
 #pragma endregion
 
 enum class OperandDataType {
@@ -123,14 +146,14 @@ struct SrcOperandInputOCP {
   static constexpr std::string_view debug_name = "input_vocp";
   SrcOperandCommon _;
   OperandIndex cpid;
-  uint32_t regid;
+  OperandIndex regid;
 };
 
 struct SrcOperandInputICP {
   static constexpr std::string_view debug_name = "input_vicp";
   SrcOperandCommon _;
   OperandIndex cpid;
-  uint32_t regid;
+  OperandIndex regid;
 };
 
 struct SrcOperandInputPC {
@@ -223,6 +246,11 @@ struct DstOperandOutputCoverageMask {
   DstOperandCommon _;
 };
 
+struct DstOperandOutputStencilRef {
+  static constexpr std::string_view debug_name = "ostencil";
+  DstOperandCommon _;
+};
+
 #pragma endregion
 
 #pragma region instructions
@@ -288,7 +316,7 @@ struct AtomicOperandTGSM {
 using DstOperand = std::variant<
   DstOperandNull, DstOperandSideEffect, DstOperandTemp, DstOperandIndexableTemp,
   DstOperandOutput, DstOperandOutputDepth, DstOperandOutputCoverageMask,
-  DstOperandIndexableOutput>;
+  DstOperandOutputStencilRef, DstOperandIndexableOutput>;
 
 #pragma mark mov instructions
 
@@ -436,7 +464,7 @@ struct InstLoadStructured {
   SrcOperand src_address;
   SrcOperand src_byte_offset;
   std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> src;
-  // 2nd condtion: stride is also vec4 aligned
+  // 2nd condition: stride is also vec4 aligned
   bool opt_flag_offset_is_vec4_aligned = false;
 };
 
@@ -783,11 +811,6 @@ struct BasicBlockUnconditionalBranch {
   BasicBlock *target;
 };
 
-struct BasicBlockHullShaderWriteOutput {
-  uint32_t instance_count;
-  BasicBlock *epilogue;
-};
-
 struct BasicBlockSwitch {
   SrcOperand value;
   std::map<uint32_t, BasicBlock *> cases;
@@ -811,7 +834,7 @@ struct BasicBlockCall {
 
 using BasicBlockTarget = std::variant<
   BasicBlockConditionalBranch, BasicBlockUnconditionalBranch, BasicBlockSwitch,
-  BasicBlockReturn, BasicBlockInstanceBarrier, BasicBlockHullShaderWriteOutput,
+  BasicBlockReturn, BasicBlockInstanceBarrier,
   BasicBlockCall, BasicBlockUndefined>;
 
 class BasicBlock {
