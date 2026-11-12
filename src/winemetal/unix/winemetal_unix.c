@@ -8768,6 +8768,7 @@ static NTSTATUS _MTLDevice_newTileRenderPipelineState_wow64(void *obj) {
 
 static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
   struct unixcall_mtlheap_newbuffer *original = obj;
+  original->ret = 0;
   struct unixcall_mtlheap_newbuffer translated = *original;
   translated.info.ptr = UInt32ToPtr((uint32_t)(uintptr_t)original->info.ptr);
   if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;

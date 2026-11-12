@@ -1344,7 +1344,7 @@ MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(
 
 WINEMETAL_API uint64_t
 MTLCommandBuffer_property(obj_handle_t cmdbuf, enum WMTCommandBufferProperty prop) {
-  struct unixcall_generic_obj_uint64_uint64_ret params;
+  struct unixcall_generic_obj_uint64_uint64_ret params = {0};
   params.handle = cmdbuf;
   params.arg = prop;
   UNIX_CALL(154, &params);
@@ -1406,7 +1406,7 @@ MTLResidencySet_removeAllAllocations(obj_handle_t residency_set) {
 
 WINEMETAL_API obj_handle_t
 MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
-  struct unixcall_mtldevice_newheap params;
+  struct unixcall_mtldevice_newheap params = {0};
   params.device = device;
   WMT_MEMPTR_SET(params.info, info);
   UNIX_CALL(162, &params);
@@ -1415,7 +1415,7 @@ MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
 
 WINEMETAL_API struct WMTSizeAndAlign
 MTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTResourceOptions options) {
-  struct unixcall_mtldevice_heapbuffersizeandalign params;
+  struct unixcall_mtldevice_heapbuffersizeandalign params = {0};
   params.device = device;
   params.length = length;
   params.options = options;
@@ -1428,7 +1428,7 @@ MTLDevice_heapBufferSizeAndAlign(obj_handle_t device, uint64_t length, enum WMTR
 
 WINEMETAL_API struct WMTSizeAndAlign
 MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *info) {
-  struct unixcall_mtldevice_heaptexturesizeandalign params;
+  struct unixcall_mtldevice_heaptexturesizeandalign params = {0};
   params.device = device;
   WMT_MEMPTR_SET(params.info, info);
   UNIX_CALL(164, &params);
@@ -1440,7 +1440,7 @@ MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *in
 
 WINEMETAL_API obj_handle_t
 MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
-  struct unixcall_mtlheap_newbuffer params;
+  struct unixcall_mtlheap_newbuffer params = {0};
   params.heap = heap;
   WMT_MEMPTR_SET(params.info, info);
   params.offset = offset;
@@ -1450,7 +1450,7 @@ MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset
 
 WINEMETAL_API obj_handle_t
 MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset) {
-  struct unixcall_mtlheap_newtexture params;
+  struct unixcall_mtlheap_newtexture params = {0};
   params.heap = heap;
   WMT_MEMPTR_SET(params.info, info);
   params.offset = offset;
@@ -1462,7 +1462,7 @@ WINEMETAL_API obj_handle_t
 MTLDevice_newIndirectCommandBuffer(
     obj_handle_t device, struct WMTIndirectCommandBufferInfo *info, uint64_t max_count, enum WMTResourceOptions options
 ) {
-  struct unixcall_mtldevice_newicb params;
+  struct unixcall_mtldevice_newicb params = {0};
   params.device = device;
   WMT_MEMPTR_SET(params.info, info);
   params.max_count = max_count;
