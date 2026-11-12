@@ -6686,9 +6686,28 @@ _MTLDevice_newHeap(void *obj) {
 static NTSTATUS
 _MTLDevice_heapBufferSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heapbuffersizeandalign *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_heap_buffer_size arg = { params->device, params->length, params->options };
+    struct rm_size_and_align result = {0};
+    if (wmtr_call(RM_OP_HEAP_BUFFER_SIZE, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK) {
+      params->ret_size = params->ret_align = 0;
+      return STATUS_UNSUCCESSFUL;
+    }
+    if (result.size > UINT32_MAX || result.align > UINT32_MAX) {
+      params->ret_size = params->ret_align = 0;
+      return STATUS_INVALID_PARAMETER;
+    }
+    params->ret_size = result.size;
+    params->ret_align = result.align;
+    return STATUS_SUCCESS;
+  }
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   MTLSizeAndAlign ret =
       [device heapBufferSizeAndAlignWithLength:params->length options:(MTLResourceOptions)params->options];
+  if (ret.size > UINT32_MAX || ret.align > UINT32_MAX) {
+    params->ret_size = params->ret_align = 0;
+    return STATUS_INVALID_PARAMETER;
+  }
   params->ret_size = ret.size;
   params->ret_align = ret.align;
   return STATUS_SUCCESS;
@@ -8538,7 +8557,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapBufferSizeAndAlign)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture)
@@ -8738,7 +8756,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLResidencySet_commit,
     &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap,
-    &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
+    &_MTLDevice_heapBufferSizeAndAlign,
     &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign,
     &_rmg_upstream_MTLHeap_newBuffer,
     &_rmg_upstream_MTLHeap_newTexture,
@@ -8920,7 +8938,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLResidencySet_commit,
     &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap_wow64,
-    &_rmg_upstream_MTLDevice_heapBufferSizeAndAlign,
+    &_MTLDevice_heapBufferSizeAndAlign,
     &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign_wow64,
     &_rmg_upstream_MTLHeap_newBuffer_wow64,
     &_rmg_upstream_MTLHeap_newTexture_wow64,
