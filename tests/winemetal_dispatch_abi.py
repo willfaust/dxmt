@@ -2,6 +2,9 @@
 """Check that legacy and upstream Metal calls have stable dispatch slots."""
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 
 root = Path(__file__).resolve().parents[1]
 unix = (root / 'src/winemetal/unix/winemetal_unix.c').read_text()
@@ -44,4 +47,13 @@ for slot, name in wrappers.items():
     assert native[slot] == '&_rmg_upstream_' + name, (slot, name, native[slot])
     expected = '&_rmg_upstream_' + name + ('_wow64' if name in pointer_calls else '')
     assert wow64[slot] == expected, (slot, name, wow64[slot])
-print('Metal dispatch slot mappings pass')
+with tempfile.TemporaryDirectory(prefix='madeira-guard-test-') as tmp:
+    src = root / 'src/winemetal'
+    dest = Path(tmp) / 'src/winemetal'
+    (dest / 'unix').mkdir(parents=True)
+    for rel in ('gen_remote_guard.py', 'winemetal_thunks.h', 'unix/winemetal_unix.c', 'unix/wmt_remote_guard.h'):
+        shutil.copyfile(src / rel, dest / rel)
+    subprocess.run(['python3', str(dest / 'gen_remote_guard.py')], check=True, capture_output=True)
+    for rel in ('unix/winemetal_unix.c', 'unix/wmt_remote_guard.h'):
+        assert (dest / rel).read_bytes() == (src / rel).read_bytes(), rel
+print('Metal dispatch slot mappings and guard regeneration pass')
