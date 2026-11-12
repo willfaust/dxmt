@@ -6716,14 +6716,40 @@ _MTLDevice_heapBufferSizeAndAlign(void *obj) {
 static NTSTATUS
 _MTLDevice_heapTextureSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heaptexturesizeandalign *params = obj;
-  id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTTextureInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    if (!info) {
+      params->ret_size = params->ret_align = 0;
+      return STATUS_INVALID_PARAMETER;
+    }
+    struct { struct rm_wmt_info header; struct WMTTextureInfo info; } payload = {
+      { params->device, sizeof(*info), 0 }, *info
+    };
+    _Static_assert(sizeof(payload) == sizeof(struct rm_wmt_info) + sizeof(struct WMTTextureInfo), "wire layout");
+    struct rm_size_and_align result = {0};
+    if (wmtr_call(RM_OP_HEAP_TEXTURE_SIZE, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK) {
+      params->ret_size = params->ret_align = 0;
+      return STATUS_UNSUCCESSFUL;
+    }
+    if (result.size > UINT32_MAX || result.align > UINT32_MAX) {
+      params->ret_size = params->ret_align = 0;
+      return STATUS_INVALID_PARAMETER;
+    }
+    params->ret_size = result.size;
+    params->ret_align = result.align;
+    return STATUS_SUCCESS;
+  }
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
   MTLSizeAndAlign ret = [device heapTextureSizeAndAlignWithDescriptor:desc];
+  [desc release];
+  if (ret.size > UINT32_MAX || ret.align > UINT32_MAX) {
+    params->ret_size = params->ret_align = 0;
+    return STATUS_INVALID_PARAMETER;
+  }
   params->ret_size = ret.size;
   params->ret_align = ret.align;
-  [desc release];
   return STATUS_SUCCESS;
 }
 
@@ -8557,7 +8583,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLHeap_newTexture)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
@@ -8566,7 +8591,6 @@ WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapTextureSizeAndAlign_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
@@ -8757,7 +8781,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap,
     &_MTLDevice_heapBufferSizeAndAlign,
-    &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLDevice_heapTextureSizeAndAlign,
     &_rmg_upstream_MTLHeap_newBuffer,
     &_rmg_upstream_MTLHeap_newTexture,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
@@ -8939,7 +8963,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandQueue_addResidencySet,
     &_rmg_upstream_MTLDevice_newHeap_wow64,
     &_MTLDevice_heapBufferSizeAndAlign,
-    &_rmg_upstream_MTLDevice_heapTextureSizeAndAlign_wow64,
+    &_MTLDevice_heapTextureSizeAndAlign_wow64,
     &_rmg_upstream_MTLHeap_newBuffer_wow64,
     &_rmg_upstream_MTLHeap_newTexture_wow64,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,

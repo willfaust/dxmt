@@ -43,7 +43,7 @@ pointer_calls = {
     'MTLHeap_newBuffer', 'MTLHeap_newTexture', 'MTLDevice_newIndirectCommandBuffer',
     'MTLDevice_newLibraryWithSource', 'MTLTexture_getBytes',
 }
-routed = {'MTLCommandBuffer_property', 'MTLDevice_heapBufferSizeAndAlign', 'MTLDevice_newResidencySet', 'MTLResidencySet_addAllocations',
+routed = {'MTLCommandBuffer_property', 'MTLDevice_heapBufferSizeAndAlign', 'MTLDevice_heapTextureSizeAndAlign', 'MTLDevice_newResidencySet', 'MTLResidencySet_addAllocations',
           'MTLResidencySet_removeAllocations', 'MTLResidencySet_removeAllAllocations'}
 for slot, name in wrappers.items():
     prefix = '&_' if name in routed else '&_rmg_upstream_'

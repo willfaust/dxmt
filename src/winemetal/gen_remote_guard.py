@@ -57,6 +57,7 @@ ROUTED = {
     '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
     '_MTLCommandBuffer_property',
     '_MTLDevice_heapBufferSizeAndAlign',
+    '_MTLDevice_heapTextureSizeAndAlign',
     '_MTLDevice_newResidencySet', '_MTLResidencySet_addAllocations', '_MTLResidencySet_removeAllocations',
     '_MTLResidencySet_removeAllAllocations', '_MTLResidencySet_commit', '_MTLCommandQueue_addResidencySet',
     # presentation seam: the HWND stays guest-local, the host layer crosses
