@@ -6569,6 +6569,35 @@ static NTSTATUS
 _MTLDevice_newTileRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
   const struct WMTTileRenderPipelineInfo *info = params->info.ptr;
+  if (wmtr_enabled()) {
+    params->ret_pso = params->ret_error = 0;
+    if (!info || (info->num_binary_archives_for_lookup && !info->binary_archives_for_lookup.ptr)) return STATUS_INVALID_PARAMETER;
+    size_t size = sizeof(struct rm_wmt_info) + sizeof(*info) + (size_t)info->num_binary_archives_for_lookup * sizeof(uint64_t);
+    struct rm_wmt_info *payload = malloc(size);
+    if (!payload) return STATUS_UNSUCCESSFUL;
+    *payload = (struct rm_wmt_info){params->device, sizeof(*info), info->num_binary_archives_for_lookup};
+    struct WMTTileRenderPipelineInfo *wire = (void *)(payload + 1);
+    *wire = *info;
+    wire->binary_archives_for_lookup.ptr = NULL;
+    if (info->num_binary_archives_for_lookup)
+      memcpy(wire + 1, info->binary_archives_for_lookup.ptr, (size_t)info->num_binary_archives_for_lookup * sizeof(uint64_t));
+    struct { struct rm_library_source_result header; uint8_t text[RM_LIBRARY_ERROR_MAX]; } result = {0};
+    uint32_t received = 0;
+    uint32_t status = wmtr_call(RM_OP_NEW_TILE_PIPELINE, payload, (uint32_t)size, &result, sizeof(result), &received);
+    free(payload);
+    if (status != RM_OK || received < sizeof(result.header) || result.header.reserved ||
+        result.header.error_length > RM_LIBRARY_ERROR_MAX ||
+        received != sizeof(result.header) + result.header.error_length) return STATUS_UNSUCCESSFUL;
+    params->ret_pso = result.header.library;
+    if (result.header.error_length || !result.header.library) {
+      NSString *message = [[NSString alloc] initWithBytes:result.text length:result.header.error_length encoding:NSUTF8StringEncoding];
+      NSError *error = [NSError errorWithDomain:@"RemoteMetal" code:1
+                                      userInfo:@{NSLocalizedDescriptionKey: message ?: @"Remote tile pipeline compilation failed"}];
+      params->ret_error = (obj_handle_t)[error retain];
+      [message release];
+    }
+    return STATUS_SUCCESS;
+  }
   MTLTileRenderPipelineDescriptor *descriptor = [[MTLTileRenderPipelineDescriptor alloc] init];
 
   for (unsigned i = 0; i < 8; i++) {
@@ -8700,10 +8729,8 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
   if (wmtr_enabled()) return wmtr_unimplemented(#name); \
   return _##name(obj); \
 }
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
 #undef WMT_REMOTE_UPSTREAM_GUARD
@@ -8879,7 +8906,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCounterSampleBuffer_resolveCounterRange,
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
-    &_rmg_upstream_MTLDevice_newTileRenderPipelineState,
+    &_MTLDevice_newTileRenderPipelineState,
     &_MTLDevice_newResidencySet,
     &_MTLResidencySet_addAllocations,
     &_MTLResidencySet_removeAllocations,
@@ -9061,7 +9088,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCounterSampleBuffer_resolveCounterRange_wow64,
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
     &_MTLCommandBuffer_property,
-    &_rmg_upstream_MTLDevice_newTileRenderPipelineState_wow64,
+    &_MTLDevice_newTileRenderPipelineState_wow64,
     &_MTLDevice_newResidencySet,
     &_MTLResidencySet_addAllocations_wow64,
     &_MTLResidencySet_removeAllocations_wow64,

@@ -43,7 +43,7 @@ pointer_calls = {
     'MTLHeap_newBuffer', 'MTLHeap_newTexture', 'MTLDevice_newIndirectCommandBuffer',
     'MTLDevice_newLibraryWithSource', 'MTLTexture_getBytes',
 }
-routed = {'MTLDevice_newIndirectCommandBuffer', 'MTLDevice_newLibraryWithSource', 'MTLCounterSampleBuffer_newTimestampBuffer', 'MTLCounterSampleBuffer_resolveCounterRange', 'MTLCommandBuffer_blitCommandEncoderWithSampleBuffers', 'MTLCommandBuffer_property', 'MTLDevice_heapBufferSizeAndAlign', 'MTLDevice_heapTextureSizeAndAlign', 'MTLDevice_newHeap', 'MTLHeap_newBuffer', 'MTLHeap_newTexture', 'MTLDevice_newResidencySet', 'MTLResidencySet_addAllocations',
+routed = {'MTLDevice_newTileRenderPipelineState', 'MTLDevice_newIndirectCommandBuffer', 'MTLDevice_newLibraryWithSource', 'MTLCounterSampleBuffer_newTimestampBuffer', 'MTLCounterSampleBuffer_resolveCounterRange', 'MTLCommandBuffer_blitCommandEncoderWithSampleBuffers', 'MTLCommandBuffer_property', 'MTLDevice_heapBufferSizeAndAlign', 'MTLDevice_heapTextureSizeAndAlign', 'MTLDevice_newHeap', 'MTLHeap_newBuffer', 'MTLHeap_newTexture', 'MTLDevice_newResidencySet', 'MTLResidencySet_addAllocations',
           'MTLResidencySet_removeAllocations', 'MTLResidencySet_removeAllAllocations'}
 for slot, name in wrappers.items():
     prefix = '&_' if name in routed else '&_rmg_upstream_'
