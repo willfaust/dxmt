@@ -58,6 +58,6 @@ custom_target('postprocess_lib',
   build_by_default : true
 )
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
+if get_option('build_macos_bridge') and (cpu_family == 'x86_64' or cpu_family == 'aarch64')
   subdir('unix')
 endif

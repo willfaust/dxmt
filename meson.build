@@ -9,6 +9,9 @@ fs = import('fs')
 
 dxmt_crossbuild = meson.is_cross_build()
 dxmt_native = get_option('dxmt_native') or not dxmt_crossbuild
+if not get_option('build_macos_bridge') and not dxmt_crossbuild
+  error('build_macos_bridge can only be disabled for cross builds')
+endif
 
 # MADEIRA (WOW64_DESIGN.md section 8): the native ARM64 D3D9 frontend behind a
 # 32-bit shim. A strict superset of dxmt_native -- same unixlib shape, same

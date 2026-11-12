@@ -114,6 +114,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
+if get_option('build_macos_bridge') and (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild)
   subdir('darwin')
 endif
