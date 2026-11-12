@@ -2,14 +2,6 @@
  * Regenerate whenever __wine_unix_call_funcs[] or the routed set changes.
  * Do not hand-edit. */
 
-static NTSTATUS _rmg_NSObject_description(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_obj_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("NSObject_description");
-  }
-  return _NSObject_description(obj);
-}
 static NTSTATUS _rmg_MTLTexture_pixelFormat(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_generic_obj_uint64_ret *p = obj;

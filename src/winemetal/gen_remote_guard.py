@@ -56,6 +56,7 @@ ROUTED = {
     # resources and sync
     '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
     '_MTLCommandBuffer_property',
+    '_MTLDevice_newLibraryWithSource', '_NSObject_description',
     '_MTLCounterSampleBuffer_newTimestampBuffer', '_MTLCounterSampleBuffer_resolveCounterRange',
     '_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers',
     '_MTLDevice_heapBufferSizeAndAlign',

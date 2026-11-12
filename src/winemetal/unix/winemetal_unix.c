@@ -1393,6 +1393,10 @@ _NSString_lengthOfBytesUsingEncoding(void *obj) {
 static NTSTATUS
 _NSObject_description(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
+  if (wmtr_enabled() && RM_IS_REMOTE(params->handle)) {
+    params->ret = 0;
+    return wmtr_unimplemented("NSObject_description");
+  }
   params->ret = (obj_handle_t)[(NSObject *)params->handle description];
   return STATUS_SUCCESS;
 }
@@ -6918,6 +6922,31 @@ _MTLDevice_newIndirectCommandBuffer(void *obj) {
 static NTSTATUS
 _MTLDevice_newLibraryWithSource(void *obj) {
   struct unixcall_mtldevice_newlibrarywithsource *params = obj;
+  if (wmtr_enabled()) {
+    params->ret_library = params->ret_error = 0;
+    if (params->length > RM_CHUNK_BYTES || (params->length && !params->source.ptr)) return STATUS_INVALID_PARAMETER;
+    size_t size = sizeof(struct rm_library_source) + (size_t)params->length;
+    struct rm_library_source *payload = malloc(size);
+    if (!payload) return STATUS_UNSUCCESSFUL;
+    *payload = (struct rm_library_source){params->device, params->length};
+    if (params->length) memcpy(payload + 1, params->source.ptr, (size_t)params->length);
+    struct { struct rm_library_source_result header; uint8_t text[RM_LIBRARY_ERROR_MAX]; } result = {0};
+    uint32_t received = 0;
+    uint32_t status = wmtr_call(RM_OP_LIBRARY_SOURCE, payload, (uint32_t)size, &result, sizeof(result), &received);
+    free(payload);
+    if (status != RM_OK || received < sizeof(result.header) || result.header.reserved ||
+        result.header.error_length > RM_LIBRARY_ERROR_MAX ||
+        received != sizeof(result.header) + result.header.error_length) return STATUS_UNSUCCESSFUL;
+    params->ret_library = result.header.library;
+    if (result.header.error_length || !result.header.library) {
+      NSString *message = [[NSString alloc] initWithBytes:result.text length:result.header.error_length encoding:NSUTF8StringEncoding];
+      NSError *error = [NSError errorWithDomain:@"RemoteMetal" code:1
+                                      userInfo:@{NSLocalizedDescriptionKey: message ?: @"Remote shader compilation failed"}];
+      params->ret_error = (obj_handle_t)[error retain];
+      [message release];
+    }
+    return STATUS_SUCCESS;
+  }
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSString *source =
       [[NSString alloc] initWithBytes:params->source.ptr length:params->length encoding:NSASCIIStringEncoding];
@@ -8659,11 +8688,9 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
 }
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes)
 #ifndef DXMT_NATIVE
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newIndirectCommandBuffer_wow64)
-WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newLibraryWithSource_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState_wow64)
 WMT_REMOTE_UPSTREAM_GUARD(MTLTexture_getBytes_wow64)
 #endif
@@ -8698,7 +8725,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newLibrary,
     &_MTLLibrary_newFunction,
     &_NSString_lengthOfBytesUsingEncoding,
-    &_rmg_NSObject_description,
+    &_NSObject_description,
     &_MTLDevice_newComputePipelineState,
     &_MTLCommandBuffer_blitCommandEncoder,
     &_MTLCommandBuffer_computeCommandEncoder,
@@ -8853,7 +8880,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer,
-    &_rmg_upstream_MTLDevice_newLibraryWithSource,
+    &_MTLDevice_newLibraryWithSource,
     &_rmg_upstream_MTLTexture_getBytes,
 };
 
@@ -8887,7 +8914,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newLibrary,
     &_MTLLibrary_newFunction32,
     &_NSString_lengthOfBytesUsingEncoding,
-    &_rmg_NSObject_description,
+    &_NSObject_description,
     &_MTLDevice_newComputePipelineState32,
     &_MTLCommandBuffer_blitCommandEncoder,
     &_MTLCommandBuffer_computeCommandEncoder,
@@ -9035,7 +9062,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newBuffer_wow64,
     &_MTLHeap_newTexture_wow64,
     &_rmg_upstream_MTLDevice_newIndirectCommandBuffer_wow64,
-    &_rmg_upstream_MTLDevice_newLibraryWithSource_wow64,
+    &_MTLDevice_newLibraryWithSource_wow64,
     &_rmg_upstream_MTLTexture_getBytes_wow64,
 };
 #endif
