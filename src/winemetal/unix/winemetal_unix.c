@@ -6496,6 +6496,13 @@ _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_property(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  if (wmtr_enabled()) {
+    struct rm_arg_handle_u64 request = {params->handle, params->arg};
+    struct rm_ret_u64 result = {0};
+    uint32_t status = wmtr_call(RM_OP_COMMAND_BUFFER_PROPERTY, &request, sizeof(request), &result, sizeof(result), NULL);
+    params->ret = result.value;
+    return status == RM_OK ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+  }
   id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->handle;
   double ns = 1000000000;
   switch (params->arg) {
@@ -8529,7 +8536,6 @@ static NTSTATUS _rmg_upstream_##name(void *obj) { \
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_newTimestampBuffer)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCounterSampleBuffer_resolveCounterRange)
 WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_blitCommandEncoderWithSampleBuffers)
-WMT_REMOTE_UPSTREAM_GUARD(MTLCommandBuffer_property)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newTileRenderPipelineState)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_newHeap)
 WMT_REMOTE_UPSTREAM_GUARD(MTLDevice_heapBufferSizeAndAlign)
@@ -8723,7 +8729,7 @@ const void *__wine_unix_call_funcs[] = {
     &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
     &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange,
     &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
-    &_rmg_upstream_MTLCommandBuffer_property,
+    &_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState,
     &_MTLDevice_newResidencySet,
     &_MTLResidencySet_addAllocations,
@@ -8905,7 +8911,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_rmg_upstream_MTLCounterSampleBuffer_newTimestampBuffer,
     &_rmg_upstream_MTLCounterSampleBuffer_resolveCounterRange_wow64,
     &_rmg_upstream_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers_wow64,
-    &_rmg_upstream_MTLCommandBuffer_property,
+    &_MTLCommandBuffer_property,
     &_rmg_upstream_MTLDevice_newTileRenderPipelineState_wow64,
     &_MTLDevice_newResidencySet,
     &_MTLResidencySet_addAllocations_wow64,
