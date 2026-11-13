@@ -20,18 +20,6 @@ public:
   void OnSetDebugObjectName(LPCSTR Name) override {
   }
 
-  Rc<Buffer>
-  buffer() final {
-    return {};
-  };
-  Rc<Texture>
-  texture() final {
-    return {};
-  };
-  BufferSlice
-  bufferSlice() final {
-    return {};
-  }
   Rc<StagingResource>
   staging(UINT Subresource) final {
     assert(Subresource == 0);
@@ -49,6 +37,14 @@ public:
   dynamicTexture(UINT , UINT *, UINT *) final {
     return {};
   };
+
+  HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) override {
+    if (Index != 0)
+      return E_INVALIDARG;
+    auto surface = Com(new D3D11DXGISurface(this, Index));
+    *ppSurface = surface.ref();
+    return S_OK;
+  }
 };
 
 HRESULT
@@ -87,18 +83,6 @@ public:
     }
   }
 
-  Rc<Buffer>
-  buffer() final {
-    return {};
-  };
-  Rc<Texture>
-  texture() final {
-    return {};
-  };
-  BufferSlice
-  bufferSlice() final {
-    return {};
-  }
   Rc<StagingResource>
   staging(UINT Subresource) final {
     return subresources.at(Subresource);
@@ -115,6 +99,18 @@ public:
   dynamicTexture(UINT , UINT *, UINT *) final {
     return {};
   };
+
+  HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) override {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
+      if (this->desc.Depth > 1)
+        return E_INVALIDARG;
+    }
+    if (Index >= subresources.size())
+      return E_INVALIDARG;
+    auto surface = Com(new D3D11DXGISurface(this, Index));
+    *ppSurface = surface.ref();
+    return S_OK;
+  }
 };
 
 #pragma endregion
@@ -127,12 +123,12 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
   auto metal = pDevice->GetMTLDevice();
   typename tag::DESC1 finalDesc;
   WMTTextureInfo texDesc; // unused
-  // clang-format, why do you piss me off
-  // is this really expected to be read by human?
   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDesc, &finalDesc, &texDesc))) {
     return E_INVALIDARG;
   }
   std::vector<Rc<StagingResource>> subresources;
+  bool is_1d_tex = tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D;
+  bool is_3d_tex = tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D;
   for (auto &sub : EnumerateSubresources(finalDesc)) {
     uint32_t w, h, d;
     GetMipmapSize(&finalDesc, sub.MipLevel, &w, &h, &d);
@@ -143,8 +139,16 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
     D3D11_ASSERT(subresources.size() == sub.SubresourceId);
     auto buffer = new StagingResource(metal, buf_len, bpr, bpi);
     if (pInitialData) {
-      // FIXME: SysMemPitch and SysMemSlicePitch should be respected!
-      memcpy(buffer->mappedImmediateMemory(), pInitialData[sub.SubresourceId].pSysMem, buf_len);
+      auto mapped = buffer->mappedImmediateMemory();
+      auto bpi_read = is_3d_tex ? pInitialData[sub.SubresourceId].SysMemSlicePitch : 0;
+      auto bpr_read = is_1d_tex ? 0 : pInitialData[sub.SubresourceId].SysMemPitch;
+      for (auto image = 0u; image < d; image++) {
+        for (auto row = 0u; row < (bpi / bpr); row++) {
+          auto dst_data = ptr_add(mapped, image * bpi + row * bpr);
+          auto src_data = ptr_add(pInitialData[sub.SubresourceId].pSysMem, image * bpi_read + row * bpr_read);
+          memcpy(dst_data, src_data, std::min(bpr, bpr_read));
+        }
+      }
     }
     subresources.push_back(buffer);
   }

@@ -27,7 +27,9 @@ for e in raw:
         # A slot whose handler is a generated remote-mode guard still IS that
         # API: strip the wrapper prefix so the census reports the real name.
         # Without this every guarded slot logged as `rmg_MTLTexture_depth`.
-        if n.startswith('_rmg_'):
+        if n.startswith('_rmg_upstream_'):
+            n = n[len('_rmg_upstream_'):]
+        elif n.startswith('_rmg_'):
             n = n[len('_rmg_'):]
         names.append(n.lstrip('_'))
 

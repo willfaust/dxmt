@@ -23,6 +23,8 @@ HRESULT DXBCGetOutputSignature(const void *pBlobContainer,
 HRESULT DXBCGetPatchConstantSignature(const void *pBlobContainer,
                                       CSignatureParser *pParserToUse,
                                       bool bForceStringReference = false);
+HRESULT DXBCGetRootSignature(const void *pBlobContainer,
+                                      const void **ppBlob, UINT *pByteSize);
 
 //=================================================================================================================================
 //

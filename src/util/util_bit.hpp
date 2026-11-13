@@ -21,7 +21,7 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #define DXMT_ARCH_X86_64
 #endif
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #define DXMT_ARCH_ARM64
 #else
 #error "Unknown CPU Architecture"
@@ -246,6 +246,16 @@ template <typename T> bool bcmpeq(const T *a, const T *b) {
 #endif
 }
 
+/** Extracts bit range from bit field */
+template<typename T>
+T bextract(T op, uint32_t first, uint32_t count) {
+  if (!count)
+    return 0;
+
+  T mask = (T(2) << (count - 1)) - T(1);
+  return (op >> first) & mask;
+}
+
 template <size_t Bits> class bitset {
   static constexpr size_t Qwords = align(Bits, 64) / 64;
 
@@ -331,6 +341,8 @@ public:
   }
 
   constexpr uint64_t &qword(uint64_t idx) { return m_qwords[idx]; }
+
+  constexpr uint64_t qword(uint64_t idx) const { return m_qwords[idx]; }
 
   constexpr size_t bitCount() { return Bits; }
 

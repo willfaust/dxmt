@@ -7,22 +7,8 @@
 
 namespace dxmt {
 
-template <typename T>
-concept DXGIResourceAggregateContext =
-    std::is_base_of< IUnknown, T>::value &&
-    requires(T t, REFGUID guid, UINT data_size, const void *data) {
-      { t.GetEvictionPriority() } -> std::same_as<UINT>;
-      { t.SetPrivateData(guid, data_size, data) } -> std::same_as<HRESULT>;
-      // TODO: complete the constraints
-    };
-
-/* this is awkward */
-struct IDXGIResourceVD: public IDXGIResource1 {
-    virtual ~IDXGIResourceVD() {};
-};
-
 /* designed to be used as an aggregated object*/
-template <DXGIResourceAggregateContext IResource> class MTLDXGIResource : public IDXGIResourceVD {
+template <typename IResource> class MTLDXGIResource : public IDXGIResource1 {
 public:
   MTLDXGIResource(IResource *pResource) : resource_(pResource) {}
   ~MTLDXGIResource() {}
@@ -95,8 +81,7 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   CreateSubresourceSurface(UINT index, IDXGISurface2 **surface) final {
-    ERR_ONCE("DXGIResource::CreateSubresourceSurface: stub");
-    return E_NOTIMPL;
+    return resource_->CreateSubresourceSurface(index, surface);
   }
 
   HRESULT
@@ -108,6 +93,65 @@ public:
 
 private:
   IResource *resource_; // since it's aggregated, no extra reference is needed
+};
+
+template <typename IResource, typename IDeviceContext>
+class MTLDXGIKeyedMutex : public IDXGIKeyedMutex {
+public:
+  MTLDXGIKeyedMutex(IResource *pResource, IDeviceContext *pContext)
+      : resource_(pResource), context_(pContext) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void **ppvObject) final {
+    return resource_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() final { return resource_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() final { return resource_->Release(); }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  SetPrivateData(REFGUID guid, UINT data_size, const void *data) final {
+    return resource_->SetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  SetPrivateDataInterface(REFGUID guid, const IUnknown *object) final {
+    return resource_->SetPrivateDataInterface(guid, object);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetPrivateData(REFGUID guid, UINT *data_size, void *data) final {
+    return resource_->GetPrivateData(guid, data_size, data);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetParent(REFIID riid, void **parent) final {
+    return GetDevice(riid, parent);
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
+  GetDevice(REFIID riid, void **ppDevice) final {
+    return resource_->GetDeviceInterface(riid, ppDevice);
+  }
+
+  HRESULT STDMETHODCALLTYPE AcquireSync(UINT64 Key,
+                                        DWORD dwMilliseconds) final {
+    return context_->AcquireSync(resource_, Key, dwMilliseconds);
+  }
+
+  HRESULT STDMETHODCALLTYPE ReleaseSync(UINT64 Key) final {
+    return context_->ReleaseSync(resource_, Key);
+  }
+
+private:
+  IResource *resource_;
+  IDeviceContext *context_;
 };
 
 } // namespace dxmt

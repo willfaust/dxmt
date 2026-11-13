@@ -148,6 +148,14 @@ struct unixcall_mtldevice_newlibrary {
   obj_handle_t ret_library;
 };
 
+struct unixcall_mtldevice_newlibrarywithsource {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer source;
+  uint64_t length;
+  obj_handle_t ret_error;
+  obj_handle_t ret_library;
+};
+
 struct unixcall_mtldevice_newcomputepso {
   obj_handle_t device;
   struct WMTConstMemoryPointer info;
@@ -277,7 +285,7 @@ struct unixcall_create_metal_view_from_hwnd {
 };
 
 struct unixcall_enumerate {
-  obj_handle_t enumeratable;
+  obj_handle_t enumerable;
   uint64_t start;
   uint64_t buffer_size;
   struct WMTMemoryPointer buffer;
@@ -405,6 +413,84 @@ struct unixcall_mtlsharedevent_waituntilsignaledvalue {
 struct unixcall_d3d9_nop {
   uint64_t arg0;
   uint64_t arg1;
+};
+
+struct unixcall_mtlcountersamplebuffer_newtimestampbuffer {
+  obj_handle_t device;
+  uint32_t sample_count;
+  uint32_t shared;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlcountersamplebuffer_resolvecounterrange {
+  obj_handle_t sample_buffer;
+  uint32_t start;
+  uint32_t len;
+  struct WMTMemoryPointer data_out;
+  uint64_t data_length;
+};
+
+struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers {
+  obj_handle_t cmdbuf;
+  struct WMTMemoryPointer attachments;
+  uint64_t num_attachments;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_newresidencyset {
+  obj_handle_t device;
+  uint64_t init_capacity;
+  obj_handle_t ret_error;
+  obj_handle_t ret_set;
+};
+
+struct unixcall_mtlresidencyset_addallocations {
+  obj_handle_t set;
+  struct WMTConstMemoryPointer allocations;
+  uint64_t count;
+};
+
+struct unixcall_mtldevice_newheap {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_heapbuffersizeandalign {
+  obj_handle_t device;
+  uint64_t length;
+  enum WMTResourceOptions options;
+  uint32_t ret_size;
+  uint32_t ret_align;
+};
+
+struct unixcall_mtldevice_heaptexturesizeandalign {
+  obj_handle_t device;
+  struct WMTMemoryPointer info;
+  uint32_t ret_size;
+  uint32_t ret_align;
+};
+
+struct unixcall_mtlheap_newbuffer {
+  obj_handle_t heap;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlheap_newtexture {
+  obj_handle_t heap;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_newicb {
+  obj_handle_t device;
+  struct WMTMemoryPointer info;
+  uint64_t max_count;
+  uint64_t options;
+  obj_handle_t ret;
 };
 
 #pragma pack(pop)

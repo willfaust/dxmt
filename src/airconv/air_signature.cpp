@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "air_signature.hpp"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
@@ -402,10 +420,10 @@ auto ArgumentBufferBuilder::Build(
     struct_metadata.integer(member_offset)
       ->integer(
         layout.getTypeSizeInBits(field_type) / 8
-      )            // CAVEATS: the bool is represented as i8 in arugment
+      )            // CAVEATS: the bool is represented as i8 in argument
                    // buffer (but i1 in function argument)
       ->integer(0) // TODO: array_size (0 for non-array, like
-                   // MTLArguementDescriptor)
+                   // MTLArgumentDescriptor)
       ->string(cast<MDString>(
                  cast<MDTuple>(indirect_argument_metadata)->operands().end()[-3]
       )
@@ -512,31 +530,6 @@ auto FunctionSignatureBuilder::CreateFunction(
   std::vector<Metadata *> metadata_mesh_vertex_output;
   std::vector<Metadata *> metadata_mesh_primitive_output;
 
-  auto get_input_attribute_type = [](
-                                    InputAttributeComponentType type,
-                                    uint32_t attribute, uint64_t sign_mask
-                                  ) -> MSLScalerOrVectorType {
-    switch (type) {
-    case InputAttributeComponentType::Unknown:
-    case InputAttributeComponentType::Uint: {
-      if (sign_mask & (1 << attribute)) {
-        return msl_int4;
-      } else {
-        return msl_uint4;
-      }
-    }
-    case InputAttributeComponentType::Int: {
-      if (sign_mask & (1 << attribute)) {
-        return msl_uint4;
-      } else {
-        return msl_int4;
-      }
-    }
-    case InputAttributeComponentType::Float:
-      return msl_float4;
-    }
-  };
-
   for (auto &item : enumerate(mesh_vertex_outputs)) {
     auto output = item.value();
     StreamMDHelper md;
@@ -609,6 +602,13 @@ auto FunctionSignatureBuilder::CreateFunction(
                   ->string("air.arg_name")
                   ->string("mtl_viewport_array_index");
             },
+            [&](const OutputPrimitiveID) {
+              md.string("air.primitive_id")
+                  ->string("air.arg_type_name")
+                  ->string("uint")
+                  ->string("air.arg_name")
+                  ->string("mtl_primitive_id");
+            },
         },
         output
     );
@@ -623,18 +623,15 @@ auto FunctionSignatureBuilder::CreateFunction(
     llvm::Type *field_type = std::visit(
       patterns{
         [&](const InputVertexStageIn &vertex_in) {
-          auto type = get_input_attribute_type(
-            vertex_in.type, vertex_in.attribute, sign_mask
-          );
           metadata_field.string("air.vertex_input")
             ->string("air.location_index")
             ->integer(vertex_in.attribute)
             ->integer(1)
             ->string("air.arg_type_name")
-            ->string(get_name(type))
+            ->string(get_name(vertex_in.type))
             ->string("air.arg_name")
             ->string(vertex_in.name);
-          return get_llvm_type(type, context);
+          return get_llvm_type(vertex_in.type, context);
         },
         [&](const InputFragmentStageIn &frag_in) -> llvm::Type * {
           metadata_field.string("air.fragment_input")
@@ -932,6 +929,14 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("uint")
             ->string("air.arg_name")
             ->string("mtl_coverage_mask");
+          return (llvm::Type *)Type::getInt32Ty(context);
+        },
+        [&](const OutputStencilRef) {
+          md.string("air.stencil")
+            ->string("air.arg_type_name")
+            ->string("uint")
+            ->string("air.arg_name")
+            ->string("mtl_stencil_ref");
           return (llvm::Type *)Type::getInt32Ty(context);
         },
         [&](const OutputClipDistance clip_distance) {

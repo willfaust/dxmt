@@ -13,6 +13,7 @@ util_src = files([
   # dxmt::atomic_wait / atomic_notify_*, and the one line that says which
   # backend a session is on.
   'util_futex.cpp',
+  'util_md5.cpp',
 
   'thread.cpp',
 
@@ -38,7 +39,7 @@ if dxmt_madeira
     'wsi_window_madeira.cpp',
     'wsi_platform_madeira.cpp',
   ])
-elif dxmt_native
+elif not dxmt_crossbuild
   util_src += files([
     'wsi_monitor_headless.cpp',
     'wsi_window_headless.cpp',

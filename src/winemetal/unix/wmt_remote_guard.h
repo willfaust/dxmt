@@ -2,14 +2,6 @@
  * Regenerate whenever __wine_unix_call_funcs[] or the routed set changes.
  * Do not hand-edit. */
 
-static NTSTATUS _rmg_NSObject_description(void *obj) {
-  if (wmtr_enabled()) {
-    struct unixcall_generic_obj_obj_ret *p = obj;
-    p->ret = 0;   /* never hand back uninitialised stack */
-    return wmtr_unimplemented("NSObject_description");
-  }
-  return _NSObject_description(obj);
-}
 static NTSTATUS _rmg_MTLTexture_pixelFormat(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_generic_obj_uint64_ret *p = obj;
@@ -263,14 +255,14 @@ static NTSTATUS _rmg_MTLResidencySet_removeAllocation(void *obj) {
   }
   return _MTLResidencySet_removeAllocation(obj);
 }
-static NTSTATUS _rmg_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+static NTSTATUS _rmg_MadeiraMTLDevice_heapTextureSizeAndAlign(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_mtldevice_heaptexturesizealign *p = obj;
     p->ret_size = 0;   /* never hand back uninitialised stack */
     p->ret_align = 0;   /* never hand back uninitialised stack */
     return wmtr_unimplemented("MTLDevice_heapTextureSizeAndAlign");
   }
-  return _MTLDevice_heapTextureSizeAndAlign(obj);
+  return _MadeiraMTLDevice_heapTextureSizeAndAlign(obj);
 }
 static NTSTATUS _rmg_MTLDevice_newPlacementHeap(void *obj) {
   if (wmtr_enabled()) {
@@ -294,14 +286,14 @@ static NTSTATUS _rmg_madeira_ctl(void *obj) {
   }
   return _madeira_ctl(obj);
 }
-static NTSTATUS _rmg_MTLDevice_heapBufferSizeAndAlign(void *obj) {
+static NTSTATUS _rmg_MadeiraMTLDevice_heapBufferSizeAndAlign(void *obj) {
   if (wmtr_enabled()) {
     struct unixcall_mtldevice_heapbuffersizealign *p = obj;
     p->ret_size = 0;   /* never hand back uninitialised stack */
     p->ret_align = 0;   /* never hand back uninitialised stack */
     return wmtr_unimplemented("MTLDevice_heapBufferSizeAndAlign");
   }
-  return _MTLDevice_heapBufferSizeAndAlign(obj);
+  return _MadeiraMTLDevice_heapBufferSizeAndAlign(obj);
 }
 static NTSTATUS _rmg_MTLHeap_newBufferAtOffset(void *obj) {
   if (wmtr_enabled()) {

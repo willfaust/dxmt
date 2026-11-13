@@ -1,4 +1,5 @@
 #include "config/config.hpp"
+#include "d3d11_context_state.hpp"
 #include "d3d11_fence.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
@@ -96,6 +97,11 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(ID3D11VideoContext)) {
+      WARN("QueryInterface: ID3D11VideoContext requested, not implemented");
+      return E_NOINTERFACE;
+    }
+
     return ImmediateContextBase::QueryInterface(riid, ppvObject);
   }
 
@@ -142,13 +148,15 @@ public:
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
-    if (unlikely(!pResource || !pMappedResource))
+    if (unlikely(!pResource))
       return E_INVALIDARG;
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     auto current_seq_id = cmd_queue.CurrentSeqId();
     auto coherent_seq_id = cmd_queue.CoherentSeqId();
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -184,6 +192,8 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -204,6 +214,8 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicLinearTexture(pResource, &row_pitch, &depth_pitch)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -235,8 +247,11 @@ public:
       return S_OK;
     }
     if (auto staging = GetStagingResource(pResource, Subresource)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
+
       if (MapType > 3 || MapType == 0)
-          return E_INVALIDARG;
+        return E_INVALIDARG;
 
       if (ignore_map_flag_no_wait_)
         MapFlags &= ~D3D11_MAP_FLAG_DO_NOT_WAIT;
@@ -317,7 +332,7 @@ public:
       };
     };
     if (pMappedResource == nullptr) {
-      UNIMPLEMENTED("unimplemented USAGE_DEFAULT resource mapping");
+      UNIMPLEMENTED("map-on-default: map");
     }
     return E_INVALIDARG;
   }
@@ -344,6 +359,9 @@ public:
   void
   STDMETHODCALLTYPE
   Begin(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     // in theory pAsync could be any of them: { Query, Predicate, Counter }.
@@ -357,10 +375,9 @@ public:
       break;
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
-      auto query = static_cast<IMTLD3DOcclusionQuery *>(pAsync);
-      if (query->Begin())
-        EmitST([query_ = query->__query()](ArgumentEncodingContext &enc) mutable {
-          enc.beginVisibilityResultQuery(std::move(query_));
+      if (auto query = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->Begin())
+        EmitST([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.beginVisibilityResultQuery(std::move(query));
         });
       break;
     }
@@ -378,12 +395,14 @@ public:
   void
   STDMETHODCALLTYPE
   End(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
-    case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_EVENT: {
       if (ctx_state.has_dirty_op_since_last_event) {
@@ -400,12 +419,21 @@ public:
       }
       break;
     }
+    case D3D11_QUERY_TIMESTAMP: {
+      if (auto query = static_cast<MTLD3D11TimestampQuery *>(pAsync)->End()) {
+        InvalidateCurrentPass(true);
+        EmitOP([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.sampleTimestamp(std::move(query));
+        });
+        promote_flush = true;
+      }
+      break;
+    }
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
-      auto query = static_cast<IMTLD3DOcclusionQuery *>(pAsync);
-      if (query->End())
-        EmitST([qeury_ = query->__query()](ArgumentEncodingContext &enc) mutable {
-          enc.endVisibilityResultQuery(std::move(qeury_));
+      if (auto query = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->End())
+        EmitST([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.endVisibilityResultQuery(std::move(query));
         });
       promote_flush = true;
       break;
@@ -436,7 +464,6 @@ public:
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
-    case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
@@ -464,18 +491,19 @@ public:
     case D3D11_QUERY_OCCLUSION: {
       uint64_t null_data;
       uint64_t *data_ptr = pData ? (uint64_t *)pData : &null_data;
-      hr = ((IMTLD3DOcclusionQuery *)pAsync)->GetData(data_ptr);
+      hr = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
       BOOL null_data;
       BOOL *data_ptr = pData ? (BOOL *)pData : &null_data;
-      hr = ((IMTLD3DOcclusionQuery *)pAsync)->GetData(data_ptr);
+      hr = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_TIMESTAMP: {
-      if (pData)
-        *static_cast<UINT64 *>(pData) = 0;
+      uint64_t null_data;
+      uint64_t *data_ptr = pData ? (uint64_t *)pData : &null_data;
+      hr = static_cast<MTLD3D11TimestampQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
@@ -510,13 +538,24 @@ public:
   void
   STDMETHODCALLTYPE
   Flush() override {
+    Flush1(D3D11_CONTEXT_TYPE_ALL, NULL);
+  }
+
+  void
+  STDMETHODCALLTYPE
+  Flush1(D3D11_CONTEXT_TYPE Type, HANDLE hEvent) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
-    if (!ctx_state.has_dirty_op_since_last_event && !promote_flush) {
-      return;
+    if (ctx_state.has_dirty_op_since_last_event || promote_flush) {
+      InvalidateCurrentPass(true);
+      Commit();
     }
-    promote_flush = true;
-    InvalidateCurrentPass();
+    if (hEvent) {
+      auto shared_event_listener = cmd_queue.GetSharedEventListener();
+      MTLSharedEvent_setWin32EventAtValue(
+          cmd_queue.event, shared_event_listener, hEvent, cmd_queue.GetCurrentEventSeqId()
+      );
+    }
   }
 
   void PrepareFlush() override {
@@ -539,10 +578,14 @@ public:
     auto query_list = AllocateCommandData<Rc<VisibilityResultQuery>>(cmdlist->visibility_query_count);
     for (const auto &[query, index] : cmdlist->issued_visibility_query) {
       query_list[index] = new VisibilityResultQuery();
-      query->DoDeferredQuery(query_list[index]);
+      query->DoDeferredQuery(query_list[index].ptr());
     }
 
     for (const auto &query : cmdlist->issued_event_query) {
+      End(query.ptr());
+    }
+
+    for (const auto &query : cmdlist->issued_timestamp_query) {
       End(query.ptr());
     }
 
@@ -568,9 +611,9 @@ public:
 
     EmitOP([cmdlist = std::move(cmdlist), query_list = std::move(query_list)](ArgumentEncodingContext &enc) {
       // Finished command list should clean up the encoding context
-      enc.pushDeferredVisibilityQuerys(query_list.data());
+      enc.pushDeferredVisibilityQueries(query_list.data());
       cmdlist->Execute(enc);
-      enc.popDeferredVisibilityQuerys();
+      enc.popDeferredVisibilityQueries();
     });
 
     if (RestoreContextState)
@@ -595,6 +638,7 @@ public:
 
   virtual void
   WaitUntilGPUIdle() override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     uint64_t seq = cmd_queue.CurrentSeqId();
     if(!InvalidateCurrentPass())
       Commit();
@@ -610,6 +654,7 @@ public:
   };
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
     InvalidateCurrentPass();
@@ -622,6 +667,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
     Flush();
@@ -638,8 +684,69 @@ public:
     return 0;
   }
 
+  void
+  STDMETHODCALLTYPE
+  SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
+    InitReturnPtr(ppPreviousState);
+
+    if (!pState)
+      return;
+
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    ResetEncodingContextState();
+
+    if (!state_object_)
+      state_object_ = new MTLD3D11DeviceContextState(device);
+
+    state_object_->state = std::move(state_);
+
+    if (ppPreviousState)
+      *ppPreviousState = state_object_.ref();
+
+    state_object_ = static_cast<MTLD3D11DeviceContextState *>(pState);
+    state_ = std::move(state_object_->state);
+
+    RestoreEncodingContextState();
+  }
+
+  HRESULT
+  AcquireSync(ID3D11Resource *pResource, UINT64 Key, DWORD dwMilliseconds) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    auto resource = GetResourceCommon(pResource);
+    if (!resource->keyedMutex())
+      return DXGI_ERROR_INVALID_CALL;
+    return resource->keyedMutex()->acquire(
+        [&](uint64_t fence) {
+          InvalidateCurrentPass(true);
+          EmitOP([event = resource->keyedMutex()->sharedEvent(), fence](ArgumentEncodingContext &enc) mutable {
+            enc.waitEvent(std::move(event), fence);
+          });
+          Flush();
+        },
+        Key, dwMilliseconds
+    );
+  }
+  HRESULT
+  ReleaseSync(ID3D11Resource *pResource, UINT64 Key) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    auto resource = GetResourceCommon(pResource);
+    if (!resource->keyedMutex())
+      return DXGI_ERROR_INVALID_CALL;
+    return resource->keyedMutex()->release(
+        [&](uint64_t fence) {
+          InvalidateCurrentPass(true);
+          EmitOP([event = resource->keyedMutex()->sharedEvent(), fence](ArgumentEncodingContext &enc) mutable {
+            enc.signalEvent(std::move(event), fence);
+          });
+          Flush();
+        },
+        Key
+    );
+  }
+
 private:
-  std::vector<Com<IMTLD3DOcclusionQuery>> pending_occlusion_queries;
+  std::vector<Com<MTLD3D11OcclusionQuery>> pending_occlusion_queries;
   CommandQueue &cmd_queue;
   ContextInternalState ctx_state;
   std::atomic<uint32_t> refcount = 0;
@@ -647,6 +754,7 @@ private:
   bool ignore_map_flag_no_wait_;
   uint64_t staging_rename_budget_;
   uint64_t staging_rename_refusals_ = 0;
+  Com<MTLD3D11DeviceContextState, false> state_object_;
 };
 
 std::unique_ptr<MTLD3D11DeviceContextBase>

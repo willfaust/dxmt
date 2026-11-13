@@ -1,10 +1,26 @@
 #include "d3d11_shader.hpp"
 #include "Metal.hpp"
 #include "airconv_public.h"
+#include "config/config.hpp"
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
+#include <mutex>
 
 namespace dxmt {
+
+SM50_SHADER_FLAG
+getGlobalShaderFlag() {
+  static SM50_SHADER_FLAG shader_flag;
+  static std::once_flag get_shader_flag_once;
+  std::call_once(get_shader_flag_once, []() {
+    shader_flag = {};
+    if (Config::getInstance().getOption<bool>("d3d11.sampleNaNToZero", false))
+      shader_flag |= SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
+    if (Config::getInstance().getOption<bool>("d3d11.defuseFma", false))
+      shader_flag |= SM50_SHADER_FLAG_DEFUSE_FMA;
+  });
+  return shader_flag;
+};
 
 template <typename Proc>
 class GeneralShaderCompileTask : public CompiledShader {
@@ -15,6 +31,7 @@ public:
         shader_(shader), variant_digest_(variant_digest) {
     sm50_common.type = SM50_SHADER_COMMON;
     sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetDXMTDevice().metalVersion();
+    sm50_common.flags = getGlobalShaderFlag();
     sm50_common.next = nullptr;
   }
 
@@ -104,6 +121,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantVertex variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.gs_passthrough);
   h.update(variant.rasterization_disabled);
   if (variant.input_layout_handle)
@@ -149,6 +167,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantPixel variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.sample_mask);
   h.update(variant.unorm_output_reg_mask);
   h.update(variant.dual_source_blending);
@@ -164,6 +183,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.dual_source_blending = variant.dual_source_blending;
     data.disable_depth_output = variant.disable_depth_output;
     data.unorm_output_reg_mask = variant.unorm_output_reg_mask;
+    memset(data.pixel_formats, 0, sizeof(data.pixel_formats));
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;
@@ -184,7 +204,10 @@ template <>
 std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantDefault) {
-  std::string func_name = "shader_" + shader->sha1().string().substr(0, 8);
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag());
+  auto variant_digest = h.final();
+  std::string func_name = "cs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
   auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;
@@ -197,7 +220,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     return compile_result;
   };
   return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
-      pDevice, shader, std::move(proc), func_name, shader->sha1());
+      pDevice, shader, std::move(proc), func_name, variant_digest);
 };
 
 template <>
@@ -205,6 +228,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantTessellationVertexHull variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.vertex_shader_handle->sha1());
   h.update(variant.index_buffer_format);
   h.update(variant.max_potential_tess_factor);
@@ -252,6 +276,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantTessellationDomain variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.hull_shader_handle->sha1());
   h.update(variant.gs_passthrough);
   h.update(variant.rasterization_disabled);
@@ -261,6 +286,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
     SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough;
     SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess;
+    gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
     gs_passthrough.DataEncoded = variant.gs_passthrough;
     gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
     gs_passthrough.next = &pso_tess;
@@ -289,6 +315,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantVertexStreamOutput variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(((IMTLD3D11StreamOutputLayout *)variant.stream_output_layout_handle)->Digest());
   if (variant.input_layout_handle)
     h.update(variant.input_layout_handle->sha1());
@@ -338,6 +365,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantGeometryVertex variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.geometry_shader_handle->sha1());
   h.update(variant.index_buffer_format);
   h.update(variant.strip_topology);
@@ -387,6 +415,7 @@ std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
                     ShaderVariantGeometry variant) {
   Sha1HashState h;
+  h.update(getGlobalShaderFlag());
   h.update(variant.vertex_shader_handle->sha1());
   h.update(variant.strip_topology);
   auto variant_digest = h.final();

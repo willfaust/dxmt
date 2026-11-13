@@ -105,156 +105,6 @@ EmulatedCommandContext::setComputeBytes(const void *buf, uint64_t length, uint8_
   cmd.index = index;
 }
 
-ClearRenderTargetContext::ClearRenderTargetContext(
-    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
-) :
-    ctx_(ctx),
-    device_(device) {
-  auto library = lib.getLibrary();
-  vs_clear_ = library.newFunction("vs_clear_rt");
-  fs_clear_depth_ = library.newFunction("fs_clear_rt_depth");
-  fs_clear_float_ = library.newFunction("fs_clear_rt_float");
-  fs_clear_sint_ = library.newFunction("fs_clear_rt_sint");
-  fs_clear_uint_ = library.newFunction("fs_clear_rt_uint");
-
-  WMTDepthStencilInfo ds_info;
-  ds_info.front_stencil.enabled = false;
-  ds_info.back_stencil.enabled = false;
-  ds_info.depth_compare_function = WMTCompareFunctionAlways;
-  ds_info.depth_write_enabled = false;
-
-  depth_readonly_state_ = device.newDepthStencilState(ds_info);
-
-  ds_info.depth_write_enabled = true;
-
-  depth_write_state_ = device.newDepthStencilState(ds_info);
-}
-
-void
-ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
-  assert(!clearing_texture_);
-
-  WMT::Reference<WMT::Error> err;
-
-  auto format = texture->pixelFormat(view);
-  auto dsv_flag = DepthStencilPlanarFlags(format);
-
-  if (dsv_flag & ~1u)
-    return; // stencil clear is not supported
-
-  // enforce array render target for now
-  view = texture->checkViewUseArray(view, true);
-
-  if (!pso_cache_.contains(format)) {
-    WMTRenderPipelineInfo pipeline_info;
-    WMT::InitializeRenderPipelineInfo(pipeline_info);
-    pipeline_info.raster_sample_count = texture->sampleCount();
-    pipeline_info.vertex_function = vs_clear_;
-    if (dsv_flag) {
-      pipeline_info.fragment_function = fs_clear_depth_;
-      pipeline_info.depth_pixel_format = format;
-    } else if (IsIntegerFormat(format)) {
-      pipeline_info.colors[0].pixel_format = format;
-      if (MTLGetUnsignedIntegerFormat(format) == format) {
-        pipeline_info.fragment_function = fs_clear_uint_;
-      } else {
-        pipeline_info.fragment_function = fs_clear_sint_;
-      }
-    } else {
-      pipeline_info.colors[0].pixel_format = format;
-      pipeline_info.fragment_function = fs_clear_float_;
-    }
-    pipeline_info.rasterization_enabled = true;
-    pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-    auto pso = device_.newRenderPipelineState(pipeline_info, err);
-    if (pso == nullptr) {
-      ERR("Failed to create ClearRenderTarget PSO of format ", format, ": ", err.description().getUTF8String());
-    }
-    pso_cache_.emplace(format, std::move(pso));
-  }
-
-  WMT::RenderPipelineState pso = pso_cache_.at(format);
-
-  if (!pso)
-    return;
-
-  auto width = texture->width(view);
-  auto height = texture->height(view);
-  auto array_length = texture->arrayLength(view);
-  auto &pass_info = *ctx_.startRenderPass(dsv_flag, 0, 1, 0);
-
-  if (dsv_flag) {
-    auto &depth = pass_info.depth;
-    depth.attachment = ctx_.access(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-    depth.depth_plane = 0;
-    depth.load_action = WMTLoadActionLoad;
-    depth.store_action = WMTStoreActionStore;
-  } else {
-    auto &color = pass_info.colors[0];
-    color.attachment = ctx_.access(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-    color.depth_plane = 0;
-    color.load_action = WMTLoadActionLoad;
-    color.store_action = WMTStoreActionStore;
-  }
-
-  pass_info.render_target_width = width;
-  pass_info.render_target_height = height;
-  pass_info.render_target_array_length = array_length;
-  pass_info.default_raster_sample_count = texture->sampleCount();
-
-  auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
-  setpso.type = WMTRenderCommandSetPSO;
-  setpso.pso = pso;
-
-  auto &setvp = ctx_.encodeRenderCommand<wmtcmd_render_setviewport>();
-  setvp.type = WMTRenderCommandSetViewport;
-  setvp.viewport = {0.0, 0.0, (double)width, (double)height, 0.0, 1.0};
-
-  auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
-  setdsso.type = WMTRenderCommandSetDSSO;
-  setdsso.dsso = dsv_flag ? depth_write_state_.handle : depth_readonly_state_.handle;
-  setdsso.stencil_ref = 0;
-
-  clearing_texture_ = std::move(texture);
-  clearing_texture_view_ = view;
-}
-
-void
-ClearRenderTargetContext::clear(
-    uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, const std::array<float, 4> &color
-) {
-  if (!clearing_texture_)
-    return;
-  auto &setscr = ctx_.encodeRenderCommand<wmtcmd_render_setscissorrect>();
-  setscr.type = WMTRenderCommandSetScissorRect;
-  setscr.scissor_rect = {offset_x, offset_y, width, height};
-
-  auto &setcolor = ctx_.encodeRenderCommand<wmtcmd_render_setbytes>();
-  setcolor.type = WMTRenderCommandSetFragmentBytes;
-  void *temp = ctx_.allocate_cpu_heap(sizeof(color), 16);
-  memcpy(temp, color.data(), sizeof(color));
-  setcolor.bytes.set(temp);
-  setcolor.length = sizeof(color);
-  setcolor.index = 0;
-
-  auto &draw = ctx_.encodeRenderCommand<wmtcmd_render_draw>();
-  draw.type = WMTRenderCommandDraw;
-  draw.primitive_type = WMTPrimitiveTypeTriangle;
-  draw.vertex_start = 0;
-  draw.vertex_count = 3;
-  draw.base_instance = 0;
-  draw.instance_count = ctx_.currentRenderEncoder()->render_target_array_length;
-}
-
-void
-ClearRenderTargetContext::end() {
-  if (!clearing_texture_)
-    return;
-  ctx_.endPass();
-  clearing_texture_ = nullptr;
-  clearing_texture_view_ = 0;
-};
-
 DepthStencilBlitContext::DepthStencilBlitContext(
     WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
 ) :
@@ -346,18 +196,19 @@ DepthStencilBlitContext::copyFromBuffer(
   auto height = depth_stencil->height(view);
   auto &pass_info = *ctx_.startRenderPass(0b11, 0, 0, 0);
   auto &depth = pass_info.depth;
-  depth.attachment = ctx_.access(depth_stencil, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  depth.attachment = ctx_.access<PipelineStage::Pixel>(depth_stencil, view, ResourceAccess::Write);
   depth.depth_plane = 0;
   depth.load_action = WMTLoadActionLoad;
   depth.store_action = WMTStoreActionStore;
 
   auto &stencil = pass_info.stencil;
-  stencil.attachment = ctx_.access(depth_stencil, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  stencil.attachment = ctx_.access<PipelineStage::Pixel>(depth_stencil, view, ResourceAccess::Write);
   stencil.depth_plane = 0;
   stencil.load_action = WMTLoadActionLoad;
   stencil.store_action = WMTStoreActionStore;
 
-  auto [src_, src_sub_offset] = ctx_.access(src, src_offset, src_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
+  auto [src_, src_sub_offset] =
+      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length, ResourceAccess::Read);
 
   pass_info.render_target_width = width;
   pass_info.render_target_height = height;
@@ -380,7 +231,7 @@ DepthStencilBlitContext::copyFromBuffer(
   auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
   setbuf.type = WMTRenderCommandSetFragmentBuffer;
   setbuf.buffer = src_->buffer();
-  setbuf.index = 0;
+  setbuf.index = kCustomBufferArgumentIndex0;
   setbuf.offset = src_offset + src_sub_offset;
 
   linear_texture_desc desc{bytes_per_row, bytes_per_image};
@@ -390,7 +241,7 @@ DepthStencilBlitContext::copyFromBuffer(
   memcpy(temp, &desc, sizeof(desc));
   setdesc.bytes.set(temp);
   setdesc.length = sizeof(desc);
-  setdesc.index = 1;
+  setdesc.index = kCustomBufferArgumentIndex1;
 
   auto &draw = ctx_.encodeRenderCommand<wmtcmd_render_draw>();
   draw.type = WMTRenderCommandDraw;
@@ -434,9 +285,9 @@ DepthStencilBlitContext::copyFromTexture(
   auto stencil_view = depth_stencil->createView(view_desc);
 
   ctx_.startComputePass(0);
-  auto tex_depth = ctx_.access(depth_stencil, depth_view, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  auto tex_stencil = ctx_.access(depth_stencil, stencil_view, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  auto [dst_, dst_sub_offset] = ctx_.access(dst, dst_offset, dst_length, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  auto tex_depth = ctx_.access(depth_stencil, depth_view, ResourceAccess::Read).texture;
+  auto tex_stencil = ctx_.access(depth_stencil, stencil_view, ResourceAccess::Read).texture;
+  auto [dst_, dst_sub_offset] = ctx_.access(dst, dst_offset, dst_length, ResourceAccess::Write);
 
   auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;
@@ -477,163 +328,6 @@ DepthStencilBlitContext::copyFromTexture(
   ctx_.endPass();
 }
 
-ClearResourceKernelContext::ClearResourceKernelContext(
-    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
-) :
-    ctx_(ctx),
-    device_(device) {
-  auto library = lib.getLibrary();
-  cs_clear_buffer_uint_ = library.newFunction("cs_clear_buffer_uint");
-  cs_clear_buffer_float_ = library.newFunction("cs_clear_buffer_float");
-  cs_clear_tbuffer_uint_ = library.newFunction("cs_clear_tbuffer_uint");
-  cs_clear_tbuffer_float_ = library.newFunction("cs_clear_tbuffer_float");
-  cs_clear_texture2d_uint_ = library.newFunction("cs_clear_texture2d_uint");
-  cs_clear_texture2d_float_ = library.newFunction("cs_clear_texture2d_float");
-  cs_clear_texture2d_array_uint_ = library.newFunction("cs_clear_texture2d_array_uint");
-  cs_clear_texture2d_array_float_ = library.newFunction("cs_clear_texture2d_array_float");
-}
-
-void
-ClearResourceKernelContext::setClearColor(const std::array<float, 4> &color, bool is_integer) {
-  if (is_integer) {
-    meta_temp_.color_f32[0] = uint32_t(std::max(color[0], 0.0f));
-    meta_temp_.color_f32[1] = uint32_t(std::max(color[1], 0.0f));
-    meta_temp_.color_f32[2] = uint32_t(std::max(color[2], 0.0f));
-    meta_temp_.color_f32[3] = uint32_t(std::max(color[3], 0.0f));
-  } else {
-    meta_temp_.color_f32[0] = color[0];
-    meta_temp_.color_f32[1] = color[1];
-    meta_temp_.color_f32[2] = color[2];
-    meta_temp_.color_f32[3] = color[3];
-  }
-};
-
-void
-ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Texture> texture, TextureViewKey view) {
-
-  clearing_texture_ = texture;
-  clearing_view_ = 0;
-  ctx_.startComputePass(0);
-
-  bool is_integer = IsIntegerFormat(texture->pixelFormat(view));
-
-  setClearColor(color, is_integer);
-
-  bool is_array = false;
-  switch (texture->textureType(view)) {
-  case WMTTextureType1DArray:
-  case WMTTextureType2DArray:
-    is_array = true;
-    dispatch_depth_ = texture->arrayLength(view);
-    break;
-  case WMTTextureTypeCube:
-  case WMTTextureTypeCubeArray:
-  case WMTTextureType3D:
-  case WMTTextureType2DMultisample:
-  case WMTTextureType2DMultisampleArray:
-    // not a valid clear target
-    return;
-  default:
-    break;
-  }
-
-  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
-  setpso.type = WMTComputeCommandSetPSO;
-  setpso.pso = is_integer ? (is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_)
-                          : (is_array ? cs_clear_texture2d_array_float_ : cs_clear_texture2d_float_);
-  setpso.threadgroup_size = {32, 1, 1};
-}
-
-void
-ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, BufferViewKey view) {
-
-  clearing_buffer_ = buffer;
-  clearing_view_ = view;
-  ctx_.startComputePass(0);
-
-  bool is_integer = IsIntegerFormat(buffer->pixelFormat(view));
-
-  setClearColor(color, is_integer);
-
-  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
-  setpso.type = WMTComputeCommandSetPSO;
-  setpso.pso = is_integer ? cs_clear_tbuffer_uint_ : cs_clear_tbuffer_float_;
-  setpso.threadgroup_size = {32, 1, 1};
-}
-
-void
-ClearResourceKernelContext::begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer) {
-
-  clearing_buffer_ = buffer;
-  clearing_view_ = 0;
-  ctx_.startComputePass(0);
-
-  setClearColor(color, raw_buffer_is_integer);
-
-  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
-  setpso.type = WMTComputeCommandSetPSO;
-  setpso.pso = raw_buffer_is_integer ? cs_clear_buffer_uint_ : cs_clear_buffer_float_;
-  setpso.threadgroup_size = {32, 1, 1};
-}
-
-void
-ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height) {
-  meta_temp_.offset[0] = offset_x;
-  meta_temp_.offset[1] = offset_y;
-  meta_temp_.size[0] = width;
-  meta_temp_.size[1] = height;
-
-  if (clearing_texture_) {
-    auto &dst_ = ctx_.access(clearing_texture_, clearing_view_, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-    auto &settex = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
-    settex.type = WMTComputeCommandSetTexture;
-    settex.texture = dst_.texture;
-    settex.index = 0;
-  } else if (clearing_buffer_) {
-    if (clearing_view_) {
-      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, clearing_view_, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-      auto &settexbuf = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
-      settexbuf.type = WMTComputeCommandSetTexture;
-      settexbuf.texture = dst_.texture;
-      settexbuf.index = 0;
-      meta_temp_.offset[0] += dst_sub_offset;
-    } else {
-      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, offset_x, width, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-      auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
-      setbuf.type = WMTComputeCommandSetBuffer;
-      setbuf.buffer = dst_->buffer();
-      setbuf.index = 0;
-      setbuf.offset = 0;
-      meta_temp_.offset[0] += dst_sub_offset;
-    }
-  } else {
-    return;
-  }
-
-  auto &setmeta = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
-  setmeta.type = WMTComputeCommandSetBytes;
-  void *temp = ctx_.allocate_cpu_heap(sizeof(meta_temp_), 16);
-  memcpy(temp, &meta_temp_, sizeof(meta_temp_));
-  setmeta.bytes.set(temp);
-  setmeta.length = sizeof(meta_temp_);
-  setmeta.index = 1;
-
-  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
-  dispatch.type = WMTComputeCommandDispatchThreads;
-  dispatch.size = {width, height, dispatch_depth_};
-}
-
-void
-ClearResourceKernelContext::end() {
-  if (!clearing_texture_ && !clearing_buffer_)
-    return;
-  ctx_.endPass();
-  clearing_texture_ = nullptr;
-  clearing_buffer_ = nullptr;
-  clearing_view_ = 0;
-  dispatch_depth_ = 1;
-};
-
 MTLFXMVScaleContext::MTLFXMVScaleContext(
     WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
 ) :
@@ -659,8 +353,8 @@ MTLFXMVScaleContext::dispatch(
     TextureViewKey view_downscaled, float mv_scale_x, float mv_scale_y
 ) {
   ctx_.startComputePass(0);
-  auto tex_dilated = ctx_.access(dilated, view_dilated, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  auto tex_downscaled = ctx_.access(downscaled, view_downscaled, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  auto tex_dilated = ctx_.access(dilated, view_dilated, ResourceAccess::Read).texture;
+  auto tex_downscaled = ctx_.access(downscaled, view_downscaled, ResourceAccess::Write).texture;
 
   auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;
@@ -855,6 +549,55 @@ StretchBlitContext::blit(
   ctx_.stretchBlit(
       std::move(src), src_view, std::move(dst), dst_view, pso, sampler,
       src_origin, src_size, dst_origin, dst_size);
+}
+
+TileBarrierContext::TileBarrierContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx) :
+    ctx_(ctx),
+    device_(device) {
+  tile_function_ = lib.getLibrary().newFunction("tile_barrier");
+}
+
+void
+TileBarrierContext::dispatch() {
+  if (auto tile_pso = getPSO(ctx_.currentRenderEncoder()->tile_barrier_pso_key)) {
+    auto &cmd_pso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+    cmd_pso.type = WMTRenderCommandSetPSO;
+    cmd_pso.pso = tile_pso;
+
+    auto &cmd_dispatch = ctx_.encodeRenderCommand<wmtcmd_render_dispatch_threads_per_tile>();
+    cmd_dispatch.type = WMTRenderCommandDispatchThreadsPerTile;
+    cmd_dispatch.width = kBarrierTileSize;
+    cmd_dispatch.height = kBarrierTileSize;
+
+    if (auto pso_recover = ctx_.currentRenderEncoder()->last_pso) {
+      auto &cmd_recover = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
+      cmd_recover.type = WMTRenderCommandSetPSO;
+      cmd_recover.pso = pso_recover;
+    }
+  }
+}
+
+WMT::RenderPipelineState
+TileBarrierContext::getPSO(TileBarrierPSOKey &key) {
+  auto it = psos_.find(key);
+  if (it != psos_.end())
+    return it->second;
+
+  WMTTileRenderPipelineInfo info;
+  WMT::InitializeTileRenderPipelineInfo(info);
+  memcpy(&info.color_formats, key.color_formats, sizeof(key.color_formats));
+  info.raster_sample_count = key.raster_sample_count;
+  info.tile_function = tile_function_;
+
+  WMT::Reference<WMT::Error> err;
+  auto pso = device_.newRenderPipelineState(info, err);
+
+  if (!pso) {
+    ERR("Failed to create tile PSO: ", err.description().getUTF8String());
+    return {};
+  }
+
+  return psos_.emplace(key, std::move(pso)).first->second;
 }
 
 } // namespace dxmt

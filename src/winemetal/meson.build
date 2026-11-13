@@ -22,7 +22,7 @@ if wine_build_path != ''
   )
   lib_ntdll = cc.find_library('ntdll', dirs : [ join_paths(wine_build_path, 'dlls/ntdll', windows_builtin_install_dir)], static: true)
   lib_dbghelp = cc.find_library('dbghelp', dirs : [ join_paths(wine_build_path, 'dlls/dbghelp', windows_builtin_install_dir) ])
-  winebuild = join_paths(wine_build_path, 'tools/winebuild/winebuild')
+  winebuild = find_program(join_paths(wine_build_path, 'tools/winebuild/winebuild'), 'winebuild')
 elif wine_install_path != ''
   if not wine_install_path.startswith('/')
     wine_install_path = join_paths(meson.project_source_root(), wine_install_path)
@@ -30,7 +30,7 @@ elif wine_install_path != ''
   lib_winecrt0 = cc.find_library('winecrt0', dirs : [ join_paths(wine_install_path,'lib/wine', windows_builtin_install_dir) ])
   lib_ntdll = cc.find_library('ntdll', dirs : [ join_paths(wine_install_path, 'lib/wine', windows_builtin_install_dir)], static: true)
   lib_dbghelp = cc.find_library('dbghelp', dirs : [ join_paths(wine_install_path, 'lib/wine', windows_builtin_install_dir) ])
-  winebuild = join_paths(wine_install_path, 'bin/winebuild')
+  winebuild = find_program(join_paths(wine_install_path, 'bin/winebuild'), 'winebuild')
 else
   error('One of the options -Dwine_build_path or -Dwine_install_path is required')
 endif
@@ -58,6 +58,6 @@ custom_target('postprocess_lib',
   build_by_default : true
 )
 
-if cpu_family == 'x86_64'
+if get_option('build_macos_bridge') and (cpu_family == 'x86_64' or cpu_family == 'aarch64')
   subdir('unix')
 endif

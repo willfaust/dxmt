@@ -295,6 +295,13 @@ static int wmtr_host_bc(void) {
  * announces all of them, and a missed write shows up as a wrong-looking frame
  * rather than an error. Narrowing to dirty ranges is an optimisation to make
  * once frames are correct, not before. */
+struct wmtr_heap {
+    uint64_t handle, size;
+    unsigned refs, buffers;
+    uint8_t *guest, *baseline;
+    int guest_owned;
+    struct wmtr_heap *next;
+};
 struct wmtr_buf {
     uint64_t handle;      /* tagged remote handle -- the key   */
     void    *shadow;      /* guest memory the app writes into  */
@@ -306,6 +313,8 @@ struct wmtr_buf {
     uint32_t  pages;
     uint32_t  refs;       /* ml820: mirrors the guest's retain/release count */
     uint32_t  rb_pending; /* ml821: a GPU readback for this buffer is outstanding */
+    struct wmtr_heap *heap;
+    uint64_t heap_offset;
 };
 
 /* Upload only what CHANGED.
@@ -373,6 +382,76 @@ struct wmtr_buf_chunk {
 static struct wmtr_buf_chunk *wmtr_chunks;
 static unsigned long wmtr_bufs_live;
 static pthread_mutex_t wmtr_bufs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t wmtr_heap_creation_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct wmtr_heap *wmtr_heaps;
+
+/* All heap records and their guest pointers are protected by wmtr_bufs_lock. */
+static void wmtr_heap_dispose_locked(struct wmtr_heap *heap) {
+    if (heap->refs || heap->buffers) return;
+    struct wmtr_heap **link = &wmtr_heaps;
+    while (*link && *link != heap) link = &(*link)->next;
+    if (*link) *link = heap->next;
+    if (heap->baseline) munmap(heap->baseline, heap->size);
+    if (heap->guest_owned) munmap(heap->guest, heap->size);
+    free(heap);
+}
+static int wmtr_heap_register(uint64_t handle, uint64_t size) {
+    if (!size || size > SIZE_MAX || size >= WMT_HEAP_AUTO_SHADOW) return -1;
+    struct wmtr_heap *heap = calloc(1, sizeof(*heap));
+    if (!heap) return -1;
+    heap->baseline = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (heap->baseline == MAP_FAILED) { free(heap); return -1; }
+    heap->handle = handle; heap->size = size; heap->refs = 1;
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    heap->next = wmtr_heaps; wmtr_heaps = heap;
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    return 0;
+}
+static void wmtr_heap_reference(uint64_t handle, int retain) {
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    struct wmtr_heap *heap = wmtr_heaps;
+    while (heap && heap->handle != handle) heap = heap->next;
+    if (heap) {
+        if (retain) heap->refs++;
+        else if (heap->refs) { heap->refs--; wmtr_heap_dispose_locked(heap); }
+    }
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+}
+/* Automatic heaps have no simultaneous aliases: this bridge does not expose makeAliasable. */
+/* Caller serializes automatic allocations until the new buffer is attached. */
+static void *wmtr_heap_native_pointer(uint64_t handle, uint64_t *offset, uint64_t length) {
+    void *result = NULL;
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    struct wmtr_heap *heap = wmtr_heaps;
+    while (heap && heap->handle != handle) heap = heap->next;
+    if (heap && heap->refs && length && length <= heap->size && (!heap->guest || heap->guest_owned)) {
+        if (*offset == UINT64_MAX) {
+            *offset = 0;
+            for (;;) {
+                uint64_t next = *offset;
+                for (struct wmtr_buf_chunk *c=wmtr_chunks; c; c=c->next)
+                    for (unsigned i=0; i<c->used; i++) {
+                        struct wmtr_buf *b=&c->entries[i];
+                        if (b->heap==heap && *offset < b->heap_offset+b->length &&
+                            b->heap_offset < *offset+length && b->heap_offset+b->length > next)
+                            next=b->heap_offset+b->length;
+                    }
+                if (next == *offset) break;
+                *offset=next;
+                if (*offset > heap->size || length > heap->size-*offset) break;
+            }
+        }
+        if (*offset > heap->size || length > heap->size-*offset) goto done;
+        if (!heap->guest) {
+            void *memory = mmap(NULL, (size_t)heap->size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (memory != MAP_FAILED) { heap->guest = memory; heap->guest_owned = 1; }
+        }
+        if (heap->guest) result = heap->guest + (size_t)*offset;
+    }
+done:
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    return result;
+}
 
 /* Caller must hold wmtr_bufs_lock. */
 static struct wmtr_buf *wmtr_buf_find_locked(uint64_t handle) {
@@ -433,6 +512,7 @@ static void wmtr_buf_remove(uint64_t handle) {
      * and retire only when the guest's last reference goes. */
     if (b && b->refs > 1) { b->refs--; b = NULL; }
     if (b) {
+        struct wmtr_heap *heap = b->heap;
         /* ml803: owned==1 came from calloc, owned==2 from mmap. The mmap
          * fallback exists because a 32MB calloc failed with ENOMEM on the
          * research VM while the process held only ~3GB -- libmalloc's zone
@@ -443,6 +523,8 @@ static void wmtr_buf_remove(uint64_t handle) {
         free(b->page_sum);
         b->handle = 0; b->shadow = NULL; b->page_sum = NULL;
         b->length = 0; b->cpu_visible = 0; b->owned = 0; b->pages = 0;
+        b->heap = NULL; b->heap_offset = 0;
+        if (heap) { heap->buffers--; wmtr_heap_dispose_locked(heap); }
         if (wmtr_bufs_live) wmtr_bufs_live--;
     }
     pthread_mutex_unlock(&wmtr_bufs_lock);
@@ -561,7 +643,7 @@ static uint64_t wmtr_enc_cmdbuf(uint64_t enc) {
 static void wmtr_rb_add(uint64_t cmdbuf, uint64_t buf) {
     if (!cmdbuf || !buf) return;
     struct wmtr_buf b;
-    if (!wmtr_buf_lookup(buf, &b) || !b.cpu_visible || !b.shadow) return;
+    if (!wmtr_buf_lookup(buf, &b) || !b.cpu_visible || !b.shadow || b.heap) return;
     pthread_mutex_lock(&wmtr_rb_lock);
     struct wmtr_rb *e = NULL, *free_e = NULL;
     for (unsigned i = 0; i < WMTR_RB_SLOTS; i++) {
@@ -697,6 +779,164 @@ static int wmtr_buf_upload(uint64_t handle, const void *src, uint64_t off, uint6
     return 0;
 }
 
+static int wmtr_heap_attach(uint64_t handle, uint64_t heap_handle, uint64_t offset, void *shadow, uint64_t length) {
+    int result = -1;
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    struct wmtr_heap *heap = wmtr_heaps;
+    while (heap && heap->handle != heap_handle) heap = heap->next;
+    struct wmtr_buf *buffer = wmtr_buf_find_locked(handle);
+    if (heap && heap->refs && buffer && shadow && offset <= heap->size && length <= heap->size - offset &&
+        (uintptr_t)shadow >= offset) {
+        uint8_t *base = (uint8_t *)shadow - (size_t)offset;
+        if (!heap->guest || heap->guest == base) {
+            heap->guest = base; heap->buffers++;
+            buffer->heap = heap; buffer->heap_offset = offset;
+            result = 0;
+        }
+    }
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    return result;
+}
+
+struct wmtr_heap_batch {
+    uint8_t *wire;
+    uint32_t count, bytes;
+    struct rm_buffer_range ranges[RM_MULTI_MAX_RANGES];
+    uint8_t *baseline[RM_MULTI_MAX_RANGES];
+};
+static int wmtr_heap_batch_send(struct wmtr_heap_batch *batch) {
+    if (!batch->count) return 0;
+    struct rm_buffer_multi *header=(void *)batch->wire;
+    header->count=batch->count; header->data_bytes=batch->bytes;
+    uint8_t *data=batch->wire+sizeof(*header);
+    memcpy(data+batch->bytes,batch->ranges,batch->count*sizeof(batch->ranges[0]));
+    uint32_t size=(uint32_t)(sizeof(*header)+batch->bytes+batch->count*sizeof(batch->ranges[0]));
+    if (wmtr_call(RM_OP_BUFFER_UPLOAD_MULTI,batch->wire,size,NULL,0,NULL)!=RM_OK) return -1;
+    size_t off=0;
+    for (uint32_t i=0;i<batch->count;i++) {
+        memcpy(batch->baseline[i],data+off,(size_t)batch->ranges[i].length);
+        off+=(size_t)batch->ranges[i].length;
+    }
+    batch->count=0; batch->bytes=0;
+    return 0;
+}
+
+/* Send only bytes changed by the CPU, so a stale alias cannot overwrite GPU data. */
+static int wmtr_heap_flush_locked(void) {
+    struct wmtr_heap *active = wmtr_heaps;
+    while (active && !active->buffers) active = active->next;
+    if (!active) return 0;
+    struct wmtr_heap_batch batch = {0};
+    batch.wire = malloc(RM_CHUNK_BYTES);
+    if (!batch.wire) return -1;
+    const uint32_t data_cap=RM_CHUNK_BYTES-sizeof(struct rm_buffer_multi)-RM_MULTI_MAX_RANGES*sizeof(struct rm_buffer_range);
+    int failed = 0;
+    for (struct wmtr_buf_chunk *chunk = wmtr_chunks; chunk && !failed; chunk = chunk->next)
+    for (unsigned ci = 0; ci < chunk->used && !failed; ci++) {
+        struct wmtr_buf *b = &chunk->entries[ci];
+        if (!b->handle || !b->heap) continue;
+        uint8_t *guest = b->shadow, *baseline = b->heap->baseline + b->heap_offset;
+        uint64_t i = 0;
+        while (i < b->length) {
+            size_t block = (size_t)((b->length-i > 65536) ? 65536 : b->length-i);
+            uint64_t end = i + block;
+            if (!memcmp(guest+i,baseline+i,block)) { i=end; continue; }
+            while (i < end) {
+                uint8_t value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
+                if (value == baseline[i]) { i++; continue; }
+                uint64_t start = i; uint32_t count = 0;
+                do {
+                    batch.wire[sizeof(struct rm_buffer_multi)+batch.bytes+count++] = value; i++;
+                    if (i == b->length || count == data_cap-batch.bytes) break;
+                    value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
+                } while (value != baseline[i]);
+                batch.ranges[batch.count]=(struct rm_buffer_range){b->handle,start,count};
+                batch.baseline[batch.count]=baseline+start;
+                batch.count++; batch.bytes+=count;
+                if ((batch.count == RM_MULTI_MAX_RANGES || batch.bytes == data_cap) && wmtr_heap_batch_send(&batch)) {
+                    failed = 1; break;
+                }
+            }
+            if (failed) break;
+        }
+        if (!failed && wmtr_heap_batch_send(&batch)) failed=1;
+    }
+    if (!failed && wmtr_heap_batch_send(&batch)) failed=1;
+    free(batch.wire);
+    return failed ? -1 : 0;
+}
+static int wmtr_heap_flush(void) {
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    int result = wmtr_heap_flush_locked();
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    return result;
+}
+
+/* Preserve CPU writes made after submission while applying the completed GPU data. */
+static int wmtr_heap_sync(void) {
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    struct wmtr_heap *active = wmtr_heaps;
+    while (active && !active->buffers) active = active->next;
+    if (!active) { pthread_mutex_unlock(&wmtr_bufs_lock); return 0; }
+    uint8_t *scratch = malloc(RM_CHUNK_BYTES);
+    if (!scratch) { pthread_mutex_unlock(&wmtr_bufs_lock); return -1; }
+    int failed = 0;
+    for (struct wmtr_buf_chunk *chunk = wmtr_chunks; chunk && !failed; chunk = chunk->next)
+    for (unsigned ci = 0; ci < chunk->used && !failed; ci++) {
+        struct wmtr_buf *b = &chunk->entries[ci];
+        if (!b->handle || !b->heap) continue;
+        uint8_t *guest = b->shadow, *baseline = b->heap->baseline + b->heap_offset;
+        for (uint64_t off = 0; off < b->length;) {
+            uint32_t n = (uint32_t)((b->length - off > RM_CHUNK_BYTES) ? RM_CHUNK_BYTES : b->length - off);
+            struct rm_buffer_range range = {b->handle, off, n}; uint32_t got = 0;
+            if (wmtr_call(RM_OP_BUFFER_READ, &range, sizeof(range), scratch, n, &got) != RM_OK || got != n) {
+                failed = 1; break;
+            }
+            if (!memcmp(baseline+off,scratch,n)) { off+=n; continue; }
+            for (uint32_t block = 0; block < n;) {
+                uint32_t count = n-block > 64 ? 64 : n-block;
+                if (memcmp(baseline+off+block,scratch+block,count)) {
+                    for (uint32_t i=block;i<block+count;i++) {
+                        uint8_t expected=baseline[off+i];
+                        if (expected != scratch[i]) {
+                            __atomic_compare_exchange_n(guest+off+i,&expected,scratch[i],0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);
+                            baseline[off+i]=scratch[i];
+                        }
+                    }
+                }
+                block += count;
+            }
+            off += n;
+        }
+    }
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    free(scratch);
+    return failed ? -1 : 0;
+}
+static int wmtr_heap_update(uint64_t handle, uint64_t offset, const void *data, uint64_t length) {
+    int result = -1;
+    pthread_mutex_lock(&wmtr_bufs_lock);
+    struct wmtr_buf *b = wmtr_buf_find_locked(handle);
+    if (b && b->heap && data && offset <= b->length && length <= b->length - offset && length <= SIZE_MAX) {
+        uint8_t *scratch = malloc(RM_CHUNK_BYTES);
+        if (scratch) {
+            uint8_t *guest = (uint8_t *)b->shadow + offset;
+            memmove(guest, data, (size_t)length);
+            result = 0;
+            for (uint64_t off = 0; off < length;) {
+                size_t n = (size_t)((length - off > RM_CHUNK_BYTES) ? RM_CHUNK_BYTES : length - off);
+                memcpy(scratch, guest + off, n);
+                if (wmtr_buf_upload(handle, scratch, offset + off, n)) { result = -1; break; }
+                memcpy(b->heap->baseline + b->heap_offset + offset + off, scratch, n);
+                off += n;
+            }
+            free(scratch);
+        }
+    }
+    pthread_mutex_unlock(&wmtr_bufs_lock);
+    return result;
+}
+
 /* ---- ml821: coalesce many ranges into one round trip --------------------
  *
  * The flush sent one message per changed run. In gameplay that was 104 upload
@@ -812,11 +1052,11 @@ static unsigned wmtr_ub_add(struct wmtr_ub *u, struct wmtr_buf *b, uint32_t p0, 
 }
 
 /* Push every CPU-visible shadow to the host. Called before submission. */
-static void wmtr_flush_buffers(void) {
+static int wmtr_flush_buffers(void) {
     /* Held for the whole walk: an entry retiring mid-flush would otherwise let
      * this hash a shadow the owner has already freed. */
     pthread_mutex_lock(&wmtr_bufs_lock);
-    unsigned n = 0, failed = 0;
+    unsigned n = 0, failed = wmtr_heaps && wmtr_heap_flush_locked() != 0;
     struct timeval t_f0; gettimeofday(&t_f0, 0);                 /* ml819 */
     unsigned long rpc_before = wmtr_call_n; double rpc_ms_before = wmtr_call_ms;
     static struct wmtr_ub ub;            /* ml821: safe -- the walk holds the lock */
@@ -826,7 +1066,7 @@ static void wmtr_flush_buffers(void) {
         struct wmtr_buf *b = &chunk->entries[ci];
         if (!b->handle) continue;
         n++;
-        if (!b->cpu_visible || !b->shadow || !b->length) continue;
+        if (!b->cpu_visible || !b->shadow || !b->length || b->heap) continue;
         wmtr_flush_seen += b->length;
 
         if (!b->page_sum) {
@@ -962,6 +1202,7 @@ static void wmtr_flush_buffers(void) {
         if (reported++ < 4)
             fprintf(stderr, "[wmt-remote] %u buffer upload(s) failed during flush\n", failed);
     }
+    return failed ? -1 : 0;
 }
 
 /* Drawable -> texture pairing.

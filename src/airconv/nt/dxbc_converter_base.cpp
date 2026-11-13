@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "dxbc_converter_base.hpp"
 #include "../dxbc_converter.hpp"
 #include "air_builder.hpp"
@@ -42,11 +60,16 @@ Converter::LoadOperandIndex(const IndexByTempComponent &SrcOpIndex) {
   auto Comp = SrcOpIndex.component;
   SrcOperandTemp RelReg{
       ._ = {{Comp, Comp, Comp, Comp}, false, false, OperandDataType::Integer},
-      .phase = SrcOpIndex.phase,
       .regid = SrcOpIndex.regid,
+      .phase = SrcOpIndex.phase,
   };
   auto Rel = LoadOperand(RelReg, 0b1);
   return ir.CreateAdd(Rel, ir.getInt32(SrcOpIndex.offset));
+}
+
+llvm::Value *
+Converter::LoadOperandIndex(const IndexByControlPointId &SrcOpIndex) {
+  return ir.CreateAdd(res.thread_id_in_patch, ir.getInt32(SrcOpIndex.offset));
 }
 
 llvm::Value *
@@ -54,9 +77,9 @@ Converter::LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex) {
   auto Comp = SrcOpIndex.component;
   SrcOperandIndexableTemp RelReg{
       ._ = {{Comp, Comp, Comp, Comp}, false, false, OperandDataType::Integer},
-      .phase = SrcOpIndex.phase,
-      .regindex = SrcOpIndex.regid,
       .regfile = SrcOpIndex.regfile,
+      .regindex = SrcOpIndex.regid,
+      .phase = SrcOpIndex.phase,
   };
   auto Rel = LoadOperand(RelReg, 0b1);
   return ir.CreateAdd(Rel, ir.getInt32(SrcOpIndex.offset));
@@ -67,11 +90,10 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 
   auto RangeId = SrcOp.rangeid;
 
-  auto V = res.cb_range_map[RangeId](nullptr).build(ctx);
-  if (auto err = V.takeError()) {
+  auto descriptor = ctx.binding.GetConstantBuffer(air, RangeId, LoadOperandIndex(SrcOp.rangeindex));
+  if (!descriptor)
     return ApplySrcModifier(SrcOp._, llvm::ConstantAggregateZero::get(air.getIntTy(4)), Mask);
-  }
-  auto Handle = V.get();
+  auto Handle = descriptor->Pointer;
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -229,6 +251,7 @@ Converter::LoadOperand(const SrcOperandAttribute &SrcOp, mask_t Mask) {
   switch (SrcOp.attribute) {
   case InputAttribute::VertexId:
   case InputAttribute::InstanceId:
+  case InputAttribute::SampleIndex:
     assert(0 && "never reached: should be handled separately");
     break;
   case InputAttribute::ThreadId: {
@@ -339,7 +362,7 @@ Converter::LoadOperand(const SrcOperandInputICP &SrcOp, mask_t Mask) {
   auto TyHandle = GetArrayType(Handle);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
-  auto RegId = ir.getInt32(SrcOp.regid);
+  auto RegId = LoadOperandIndex(SrcOp.regid);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -380,7 +403,7 @@ Converter::LoadOperand(const SrcOperandInputOCP &SrcOp, mask_t Mask) {
   auto TyHandle = GetArrayType(Handle);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
-  auto RegId = ir.getInt32(SrcOp.regid);
+  auto RegId = LoadOperandIndex(SrcOp.regid);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -426,28 +449,18 @@ llvm::Optional<TextureResourceHandle>
 Converter::LoadTexture(const SrcOperandResource &SrcOp) {
   using namespace llvm::air;
 
-  auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.srv_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetSRVTexture(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
+  if (!descriptor)
     return {};
 
   Texture texture;
-  texture.kind = res.resource_kind;
-  texture.memory_access = (Texture::MemoryAccess)res.memory_access;
-  texture.sample_type = std::visit(
-      patterns{
-          [](air::MSLInt) { return Texture::sample_int; }, [](air::MSLUint) { return Texture::sample_uint; },
-          [](auto) { return Texture::sample_float; }
-      },
-      res.component_type
-  );
+  texture.kind = descriptor->ResourceKind;
+  texture.memory_access = descriptor->MemoryAccess;
+  texture.sample_type = descriptor->SampleType;
 
   return llvm::Optional<TextureResourceHandle>(
-      {texture, res.resource_kind_logical, res_handle.get(), md.get(), SrcOp.read_swizzle,
-       global_coherent && SupportsMemoryCoherency()}
+      {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -455,28 +468,18 @@ llvm::Optional<TextureResourceHandle>
 Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
   using namespace llvm::air;
 
-  auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetUAVTexture(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
+  if (!descriptor)
     return {};
 
   Texture texture;
-  texture.kind = res.resource_kind;
-  texture.memory_access = (Texture::MemoryAccess)res.memory_access;
-  texture.sample_type = std::visit(
-      patterns{
-          [](air::MSLInt) { return Texture::sample_int; }, [](air::MSLUint) { return Texture::sample_uint; },
-          [](auto) { return Texture::sample_float; }
-      },
-      res.component_type
-  );
+  texture.kind = descriptor->ResourceKind;
+  texture.memory_access = descriptor->MemoryAccess;
+  texture.sample_type = descriptor->SampleType;
 
   return llvm::Optional<TextureResourceHandle>(
-      {texture, res.resource_kind_logical, res_handle.get(), md.get(), SrcOp.read_swizzle,
-       global_coherent && SupportsMemoryCoherency()}
+      {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -484,28 +487,18 @@ llvm::Optional<TextureResourceHandle>
 Converter::LoadTexture(const AtomicDstOperandUAV &DstOp) {
   using namespace llvm::air;
 
-  auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[DstOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetUAVTexture(air, DstOp.range_id, LoadOperandIndex(DstOp.index));
+  if (!descriptor)
     return {};
 
   Texture texture;
-  texture.kind = res.resource_kind;
-  texture.memory_access = (Texture::MemoryAccess)res.memory_access;
-  texture.sample_type = std::visit(
-      patterns{
-          [](air::MSLInt) { return Texture::sample_int; }, [](air::MSLUint) { return Texture::sample_uint; },
-          [](auto) { return Texture::sample_float; }
-      },
-      res.component_type
-  );
+  texture.kind = descriptor->ResourceKind;
+  texture.memory_access = descriptor->MemoryAccess;
+  texture.sample_type = descriptor->SampleType;
 
   return llvm::Optional<TextureResourceHandle>(
-      {texture, res.resource_kind_logical, res_handle.get(), md.get(), swizzle_identity,
-       global_coherent && SupportsMemoryCoherency()}
+      {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, swizzle_identity,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -513,20 +506,14 @@ llvm::Optional<BufferResourceHandle>
 Converter::LoadBuffer(const SrcOperandResource &SrcOp) {
   using namespace llvm::air;
 
-  if (!res.srv_buf_range_map.contains(SrcOp.range_id))
-    return {};
+  auto descriptor = ctx.binding.GetSRVBuffer(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
 
-  auto &[stride, res_handle_fn, md_fn, global_coherent] = res.srv_buf_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  if (!descriptor)
     return {};
 
   return llvm::Optional<BufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency()}
+      {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, SrcOp.read_swizzle,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -534,20 +521,13 @@ llvm::Optional<BufferResourceHandle>
 Converter::LoadBuffer(const SrcOperandUAV &SrcOp) {
   using namespace llvm::air;
 
-  if (!res.uav_buf_range_map.contains(SrcOp.range_id))
-    return {};
-
-  auto &[stride, res_handle_fn, md_fn, global_coherent] = res.uav_buf_range_map[SrcOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetUAVBuffer(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
+  if (!descriptor)
     return {};
 
   return llvm::Optional<BufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency()}
+      {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, SrcOp.read_swizzle,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -555,20 +535,13 @@ llvm::Optional<AtomicBufferResourceHandle>
 Converter::LoadBuffer(const AtomicDstOperandUAV &DstOp) {
   using namespace llvm::air;
 
-  if (!res.uav_buf_range_map.contains(DstOp.range_id))
-    return {};
-
-  auto &[stride, res_handle_fn, md_fn, global_coherent] = res.uav_buf_range_map[DstOp.range_id];
-  auto res_handle = res_handle_fn(nullptr).build(ctx);
-  if (res_handle.takeError())
-    return {};
-
-  auto md = md_fn(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetUAVBuffer(air, DstOp.range_id, LoadOperandIndex(DstOp.index));
+  if (!descriptor)
     return {};
 
   return llvm::Optional<AtomicBufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, DstOp.mask, global_coherent && SupportsMemoryCoherency()}
+      {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, DstOp.mask,
+       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
   );
 }
 
@@ -597,34 +570,24 @@ llvm::Optional<UAVCounterHandle>
 Converter::LoadCounter(const AtomicDstOperandUAV &SrcOp) {
   using namespace llvm::air;
 
-  if (!res.uav_counter_range_map.contains(SrcOp.range_id))
+  auto descriptor = ctx.binding.GetUAVCounter(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
+  if (!descriptor)
     return {};
 
-  auto handle = res.uav_counter_range_map[SrcOp.range_id](nullptr).build(ctx);
-  if (handle.takeError())
-    return {};
-
-  return llvm::Optional<UAVCounterHandle>({handle.get()});
+  return llvm::Optional<UAVCounterHandle>({descriptor->Pointer});
 }
 
 llvm::Optional<SamplerHandle>
 Converter::LoadSampler(const SrcOperandSampler &SrcOp) {
   using namespace llvm::air;
 
-  auto &[sampler_handle_fn, sampler_cube_fn, sampler_metadata] = res.sampler_range_map[SrcOp.range_id];
-  auto smp = sampler_handle_fn(nullptr).build(ctx);
-  if (smp.takeError())
-    return {};
-  auto smpcube = sampler_cube_fn(nullptr).build(ctx);
-  if (smpcube.takeError())
-    return {};
-  auto md = sampler_metadata(nullptr).build(ctx);
-  if (md.takeError())
+  auto descriptor = ctx.binding.GetSampler(air, SrcOp.range_id, LoadOperandIndex(SrcOp.index));
+  if (!descriptor)
     return {};
 
-  auto Bias = ir.CreateBitCast(ir.CreateTrunc(md.get(), ctx.types._int), ctx.types._float);
+  auto Bias = ir.CreateBitCast(ir.CreateTrunc(descriptor->Metadata, ctx.types._int), ctx.types._float);
 
-  return llvm::Optional<SamplerHandle>({smp.get(), smpcube.get(), Bias});
+  return llvm::Optional<SamplerHandle>({descriptor->SamplerHandle, descriptor->CubeSamplerHandle, Bias});
 }
 
 void
@@ -676,6 +639,13 @@ void
 Converter::StoreOperand(const DstOperandOutputCoverageMask &DstOp, llvm::Value *Value) {
   auto ValueInt = ZExtAndBitcastToInt32(Value);
   auto Ptr = ir.CreateConstGEP1_32(ir.getInt32Ty(), res.coverage_mask_reg, 0);
+  ir.CreateStore(ExtractElement(ValueInt, 0), Ptr);
+}
+
+void
+Converter::StoreOperand(const DstOperandOutputStencilRef &DstOp, llvm::Value *Value) {
+  auto ValueInt = ZExtAndBitcastToInt32(Value);
+  auto Ptr = ir.CreateConstGEP1_32(ir.getInt32Ty(), res.stencil_ref_reg, 0);
   ir.CreateStore(ExtractElement(ValueInt, 0), Ptr);
 }
 
@@ -1066,7 +1036,11 @@ Converter::operator()(const InstIntegerUnaryOp &unary) {
     break;
   case IntegerUnaryOp::FirstHiBitSigned:
     Value = ir.CreateSelect(
-        ir.CreateIsNotNeg(Value), air.CreateCountZero(Value, false), air.CreateCountZero(ir.CreateNot(Value), true)
+        ir.CreateIsNotNeg(Value), air.CreateCountZero(Value, false),
+        ir.CreateAdd(
+            air.CreateCountZero(ir.CreateShl(ir.CreateNot(Value), 1ull), false),
+            llvm::ConstantInt::get(Value->getType(), 1)
+        )
     );
     Value = MaxIfInMask(~((uint32_t)0x1f), Value);
     break;
@@ -1307,9 +1281,19 @@ Converter::operator()(const InstIntegerBinaryOpWithTwoDst &bin) {
   }
   case IntegerBinaryOpWithTwoDst::UDiv:
     if (!IsNull(bin.dst_hi))
-      StoreOperand(bin.dst_hi, ir.CreateUDiv(Src0Hi, Src1Hi));
+      StoreOperand(
+          bin.dst_hi,
+          ir.CreateSelect(
+              ir.CreateIsNull(Src1Hi), ConstantInt::getAllOnesValue(Src1Hi->getType()), ir.CreateUDiv(Src0Hi, Src1Hi)
+          )
+      );
     if (!IsNull(bin.dst_low))
-      StoreOperand(bin.dst_low, ir.CreateURem(Src0Lo, Src1Lo));
+      StoreOperand(
+          bin.dst_low,
+          ir.CreateSelect(
+              ir.CreateIsNull(Src1Lo), ConstantInt::getAllOnesValue(Src1Lo->getType()), ir.CreateURem(Src0Lo, Src1Lo)
+          )
+      );
     break;
   case IntegerBinaryOpWithTwoDst::UAddCarry: {
     if (!IsNull(bin.dst_hi))
@@ -1450,12 +1434,14 @@ Converter::operator()(const InstLoad &load) {
   llvm::Value *ArrayIndex = nullptr;
   llvm::Value *SampleIndex = nullptr;
   llvm::Constant *Offset = nullptr;
+  llvm::Value *OOB = nullptr;
 
   switch (Tex->Logical) {
   case Texture::texture_buffer:
     Address = LoadOperand(load.src_address, kMaskComponentX);
-    Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex->Metadata));
     Offset = air.getInt(load.offsets[0]);
+    OOB = ir.CreateICmpUGE(ir.CreateAdd(Address, Offset), DecodeTextureBufferElement(Tex->Metadata));
+    Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex->Metadata));
     break;
   case Texture::texture1d:
     Address = LoadOperand(load.src_address, kMaskComponentX);
@@ -1503,6 +1489,9 @@ Converter::operator()(const InstLoad &load) {
   if (!Offset->isNullValue())
     Address = ir.CreateAdd(Address, Offset);
 
+  if (OOB)
+    Address = ir.CreateSelect(OOB, llvm::ConstantInt::getAllOnesValue(Address->getType()), Address);
+
   llvm::Value *LOD = LoadOperand(load.src_address, kMaskComponentW);
   llvm::Value *InBounds = SampleIndex ? nullptr : TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, LOD);
 
@@ -1523,10 +1512,12 @@ Converter::operator()(const InstLoadUAVTyped &load) {
   llvm::Value *Address = nullptr;
   llvm::Value *ArrayIndex = nullptr;
   llvm::Value *SampleIndex = nullptr;
+  llvm::Value *OOB = nullptr;
 
   switch (Tex->Logical) {
   case Texture::texture_buffer:
     Address = LoadOperand(load.src_address, kMaskComponentX);
+    OOB = ir.CreateICmpUGE(Address, DecodeTextureBufferElement(Tex->Metadata));
     Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex->Metadata));
     break;
   case Texture::texture1d:
@@ -1556,6 +1547,9 @@ Converter::operator()(const InstLoadUAVTyped &load) {
 
   if (Tex->Texture.memory_access == Texture::acesss_readwrite)
     air.CreateTextureFence(Tex->Texture, Tex->Handle);
+
+  if (OOB)
+    Address = ir.CreateSelect(OOB, llvm::ConstantInt::getAllOnesValue(Address->getType()), Address);
 
   llvm::Value *NoLOD = nullptr;
   llvm::Value *InBounds = TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, NoLOD);
@@ -1764,7 +1758,7 @@ Converter::operator()(const InstSampleLOD &sample) {
     return;
   }
 
-  llvm::Value *LOD = LoadOperand(sample.src_lod, kMaskComponentX);
+  llvm::Value *LOD = ir.CreateFAdd(LoadOperand(sample.src_lod, kMaskComponentX), Sampler->Bias);
 
   auto [Value, Residency] =
       air.CreateSample(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
@@ -2538,10 +2532,12 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
   if (Tex) {
     llvm::Value *Address = nullptr;
     llvm::Value *ArrayIndex = nullptr;
+    llvm::Value *OOB = nullptr;
 
     switch (Tex->Logical) {
     case Texture::texture_buffer:
       Address = LoadOperand(atomic.dst_address, kMaskComponentX);
+      OOB = ir.CreateICmpUGE(Address, DecodeTextureBufferElement(Tex->Metadata));
       Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex->Metadata));
       break;
     case Texture::texture1d:
@@ -2566,6 +2562,8 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
     default:
       return;
     }
+    if (OOB)
+      Address = ir.CreateSelect(OOB, llvm::ConstantInt::getAllOnesValue(Address->getType()), Address);
     auto Value =
         air.CreateAtomicRMW(Tex->Texture, Tex->Handle, Op, Address, LoadOperand(atomic.src, kMaskAll), ArrayIndex);
     StoreOperand(atomic.dst_original, Value);
@@ -2665,11 +2663,9 @@ Converter::LoadInterpolant(uint32_t Index) {
     return {};
 
   auto interpolant = res.interpolant_map[Index];
-  auto h = interpolant.interpolant(nullptr).build(ctx);
-  if (h.takeError())
-    return {};
+  auto h = ctx.function->getArg(interpolant.arg_index);
 
-  return llvm::Optional<InterpolantHandle>({h.get(), interpolant.perspective});
+  return llvm::Optional<InterpolantHandle>({h, interpolant.perspective});
 }
 
 void
@@ -2741,18 +2737,14 @@ Converter::operator()(const InstMaskedSumOfAbsDiff &msad) {
 
   StoreOperand(msad.dst, Result);
 }
-
 void
 Converter::operator()(const InstEmit &) {
-  if (res.call_emit().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_emit();
 }
+
 void
 Converter::operator()(const InstCut &) {
-  if (res.call_cut().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_cut();
 }
 
 llvm::Value *

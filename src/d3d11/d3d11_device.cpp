@@ -214,7 +214,7 @@ const GUID kGpaUUID = {0xccffef16,
                        0x468f,
                        {0xbc, 0xe3, 0xcd, 0x95, 0x33, 0x69, 0xa3, 0x9a}};
 
-class MTLD3D11DeviceImpl final : public MTLD3D11Device, public IMTLD3D11DeviceExt {
+class MTLD3D11DeviceImpl final : public MTLD3D11Device, public IMTLD3D11DeviceExt, public IMTLSwapChainFactory {
 friend class MTLD3D11DXGIDevice;
 public:
   MTLD3D11DeviceImpl(
@@ -456,9 +456,8 @@ public:
       HRESULT hr = pipeline_cache_->AddStreamOutputLayout(
           pShaderBytecode, NumEntries, pSODeclaration, NumStrides,
           pBufferStrides, RasterizedStream, &so_layout);
-      if (FAILED(hr))
-        return hr;
-      return so_layout->QueryInterface(IID_PPV_ARGS(ppGeometryShader));
+      if (SUCCEEDED(hr))
+        return so_layout->QueryInterface(IID_PPV_ARGS(ppGeometryShader));
     }
     ERR("CreateGeometryShaderWithStreamOutput: not supported, expect problem");
     return pipeline_cache_->AddGeometryShader(pShaderBytecode, BytecodeLength,
@@ -551,8 +550,9 @@ public:
       desc.RenderTarget[i].RenderTargetWriteMask =
           pBlendStateDesc->RenderTarget[i].RenderTargetWriteMask;
     }
-    auto hr = CreateBlendState1(&desc, &pBlendState1);
-    *ppBlendState = pBlendState1;
+    auto hr = CreateBlendState1(&desc, ppBlendState ? &pBlendState1: nullptr);
+    if (ppBlendState)
+      *ppBlendState = pBlendState1;
     return hr;
   }
 
@@ -580,8 +580,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = 0;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState: nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -592,37 +593,13 @@ public:
         pSamplerDesc, (D3D11SamplerState **)ppSamplerState);
   }
 
-  HRESULT STDMETHODCALLTYPE CreateQuery(const D3D11_QUERY_DESC *pQueryDesc,
-                                        ID3D11Query **ppQuery) override {
-    InitReturnPtr(ppQuery);
-
-    if (!pQueryDesc)
-      return E_INVALIDARG;
-
-    switch (pQueryDesc->Query) {
-    case D3D11_QUERY_EVENT:
-      *ppQuery = ref(new MTLD3D11EventQueryImpl<BOOL>(this, pQueryDesc));
-      return S_OK;
-    case D3D11_QUERY_OCCLUSION:
-    case D3D11_QUERY_OCCLUSION_PREDICATE:
-      return CreateOcculusionQuery(this, pQueryDesc, ppQuery);
-    case D3D11_QUERY_TIMESTAMP:
-      *ppQuery = ref(new MTLD3D11EventQueryImpl<UINT64>(this, pQueryDesc));
-      return S_OK;
-    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
-      *ppQuery = ref(new MTLD3D11EventQueryImpl<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(this, pQueryDesc));
-      return S_OK;
-    }
-    case D3D11_QUERY_PIPELINE_STATISTICS: {
-      *ppQuery =
-          ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(
-              this, pQueryDesc));
-      return S_OK;
-    }
-    default:
-      ERR("CreateQuery: query type not implemented: ", pQueryDesc->Query);
-      return E_NOTIMPL;
-    }
+  HRESULT STDMETHODCALLTYPE
+  CreateQuery(const D3D11_QUERY_DESC *pQueryDesc, ID3D11Query **ppQuery) override {
+    D3D11_QUERY_DESC1 desc;
+    desc.Query = pQueryDesc->Query;
+    desc.MiscFlags = pQueryDesc->MiscFlags;
+    desc.ContextType = D3D11_CONTEXT_TYPE_ALL;
+    return CreateQuery1(&desc, reinterpret_cast<ID3D11Query1 **>(ppQuery));
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -636,8 +613,8 @@ public:
   CreateCounter(const D3D11_COUNTER_DESC *pCounterDesc,
                 ID3D11Counter **ppCounter) override {
     InitReturnPtr(ppCounter);
-    WARN("Not supported");
-    return DXGI_ERROR_UNSUPPORTED;
+    WARN("CreateCounter: not supported");
+    return E_NOTIMPL;
   }
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext(
@@ -645,7 +622,8 @@ public:
       ID3D11DeviceContext **ppDeferredContext) override{
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext *>(ppDeferredContext3);
     return hr;
   }
 
@@ -682,12 +660,12 @@ public:
 
       /* UNCHECKED */
       outFormatSupport |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D |
-                          D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_MIP |
-                          D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | // ?
+                          D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE |
+                          D3D11_FORMAT_SUPPORT_MIP |
                           D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
 
       if (!(metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
-        outFormatSupport |= D3D11_FORMAT_SUPPORT_BUFFER;
+        outFormatSupport |= D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
       }
 
       if (metal_format.Flag & MTL_DXGI_FORMAT_BACKBUFFER) {
@@ -757,9 +735,11 @@ public:
                                           pNumQualityLevels);
   }
 
-  void STDMETHODCALLTYPE CheckCounterInfo(D3D11_COUNTER_INFO *pCounterInfo)
-      override { // We basically don't support counters
-    pCounterInfo->LastDeviceDependentCounter = D3D11_COUNTER(0);
+  void STDMETHODCALLTYPE
+  CheckCounterInfo(D3D11_COUNTER_INFO *pCounterInfo) override {
+    if (!pCounterInfo)
+      return;
+    pCounterInfo->LastDeviceDependentCounter = D3D11_COUNTER{D3D11_COUNTER_DEVICE_DEPENDENT_0};
     pCounterInfo->NumSimultaneousCounters = 0;
     pCounterInfo->NumDetectableParallelUnits = 0;
   }
@@ -771,8 +751,8 @@ public:
                                          UINT *pUnitsLength,
                                          LPSTR szDescription,
                                          UINT *pDescriptionLength) override {
-    WARN("Not supported");
-    return DXGI_ERROR_UNSUPPORTED;
+    WARN("CheckCounter: not supported");
+    return E_NOTIMPL;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -915,7 +895,8 @@ public:
       ID3D11DeviceContext1 **ppDeferredContext) override{
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext1 *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext1 *>(ppDeferredContext3);
     return hr;
   }
 
@@ -943,8 +924,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = pRasterizerDesc->ForcedSampleCount;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState: nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -984,7 +966,8 @@ public:
   CreateDeferredContext2(UINT ContextFlags, ID3D11DeviceContext2 **ppDeferredContext) override {
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext2 *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext2 *>(ppDeferredContext3);
     return hr;
   }
 
@@ -992,14 +975,15 @@ public:
       ID3D11Resource *resource, UINT *tile_count,
       D3D11_PACKED_MIP_DESC *mip_desc, D3D11_TILE_SHAPE *tile_shape,
       UINT *subresource_tiling_count, UINT first_subresource_tiling,
-      D3D11_SUBRESOURCE_TILING *subresource_tiling) override{IMPLEMENT_ME}
+      D3D11_SUBRESOURCE_TILING *subresource_tiling) override{
+    UNIMPLEMENTED("tiled resource: get resource tiling");
+  }
 
   HRESULT STDMETHODCALLTYPE
-      CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount,
-                                     UINT Flags,
-                                     UINT *pNumQualityLevels) override {
+  CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount, UINT Flags, UINT *pNumQualityLevels) override {
     if (Flags) {
-      IMPLEMENT_ME;
+      ERR("CheckMultisampleQualityLevels1: unsupported flags ", Flags);
+      return E_INVALIDARG;
     }
     *pNumQualityLevels = 0;
     MTL_DXGI_FORMAT_DESC desc;
@@ -1148,9 +1132,37 @@ public:
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
   }
 
-  HRESULT STDMETHODCALLTYPE CreateQuery1(const D3D11_QUERY_DESC1 *desc,
-                                         ID3D11Query1 **query) override {
-    IMPLEMENT_ME
+  HRESULT STDMETHODCALLTYPE
+  CreateQuery1(const D3D11_QUERY_DESC1 *pQueryDesc, ID3D11Query1 **ppQuery) override {
+    InitReturnPtr(ppQuery);
+
+    if (!pQueryDesc)
+      return E_INVALIDARG;
+
+    if (!ppQuery)
+      return S_FALSE;
+
+    switch (pQueryDesc->Query) {
+    case D3D11_QUERY_EVENT:
+      *ppQuery = ref(new MTLD3D11EventQueryImpl<BOOL>(this, pQueryDesc));
+      return S_OK;
+    case D3D11_QUERY_OCCLUSION:
+    case D3D11_QUERY_OCCLUSION_PREDICATE:
+      return CreateOcclusionQuery(this, pQueryDesc, ppQuery);
+    case D3D11_QUERY_TIMESTAMP:
+      return CreateTimestampQuery(this, pQueryDesc, ppQuery);
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      *ppQuery = ref(new MTLD3D11EventQueryImpl<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(this, pQueryDesc));
+      return S_OK;
+    }
+    case D3D11_QUERY_PIPELINE_STATISTICS: {
+      *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(this, pQueryDesc));
+      return S_OK;
+    }
+    default:
+      ERR("CreateQuery1: query type not implemented: ", pQueryDesc->Query);
+      return E_NOTIMPL;
+    }
   }
 
   void STDMETHODCALLTYPE
@@ -1160,23 +1172,27 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext3(
     UINT ContextFlags, ID3D11DeviceContext3 **ppDeferredContext) override {
+    if (feature_flags_ & D3D11_CREATE_DEVICE_SINGLETHREADED)
+      return DXGI_ERROR_INVALID_CALL;
     *ppDeferredContext = std::move(dxmt::CreateDeferredContext(this, ContextFlags));
     return S_OK;
   }
 
-  void STDMETHODCALLTYPE WriteToSubresource(ID3D11Resource *dst_resource,
-                                            UINT dst_subresource,
-                                            const D3D11_BOX *dst_box,
-                                            const void *src_data,
-                                            UINT src_row_pitch,
-                                            UINT src_depth_pitch) override {
-    IMPLEMENT_ME
+  void STDMETHODCALLTYPE
+  WriteToSubresource(
+      ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
+      UINT SrcRowPitch, UINT SrcDepthPitch
+  ) override {
+    UNIMPLEMENTED("map-on-default: write resource");
   }
 
   void STDMETHODCALLTYPE
-  ReadFromSubresource(void *dst_data, UINT dst_row_pitch, UINT dst_depth_pitch,
-                      ID3D11Resource *src_resource, UINT src_subresource,
-                      const D3D11_BOX *src_box) override{IMPLEMENT_ME}
+  ReadFromSubresource(
+      void *pDstData, UINT DstRowPitch, UINT DstDepthPitch, ID3D11Resource *SrcResource, UINT SrcSubresource,
+      const D3D11_BOX *pSrcBox
+  ) override {
+    UNIMPLEMENTED("map-on-default: read resource");
+  }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
     return container_->GetMTLDevice();
@@ -1263,6 +1279,14 @@ public:
     return dxmt::CreateFence(this, InitialValue, Flags, riid, ppFence);
   };
 
+  HRESULT STDMETHODCALLTYPE
+  CreateSwapChain(
+      IDXGIFactory1 *pFactory, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain
+  ) override {
+    return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+  }
+
 private:
   MTLDXGIObject<IMTLDXGIDevice> *container_;
   D3D_FEATURE_LEVEL feature_level_;
@@ -1344,7 +1368,15 @@ public:
     }
 
     if (riid == __uuidof(ID3D10Device) || riid == __uuidof(ID3D10Device1)) {
+      if (!(d3d11_device_.feature_flags_ & 0x80000000)) {
+        return E_NOINTERFACE;
+      }
       *ppvObject = ref_and_cast<ID3D10Device>(d3d11_device_.d3d10_.get());
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLSwapChainFactory)) {
+      *ppvObject = ref_and_cast<IMTLSwapChainFactory>(&d3d11_device_);
       return S_OK;
     }
 
@@ -1358,7 +1390,7 @@ public:
       return S_OK;
     }
 
-    if (riid == __uuidof(ID3D11Debug))
+    if (riid == __uuidof(ID3D11Debug) || riid == __uuidof(ID3D11InfoQueue) || riid == __uuidof(IMTLD3D11ContextExt))
       return E_NOINTERFACE;
 
     if (riid == kRenderdocUUID || riid == kPixUUID || riid == kGpaUUID)
@@ -1386,12 +1418,20 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateSurface(const DXGI_SURFACE_DESC *desc, UINT surface_count,
                 DXGI_USAGE usage, const DXGI_SHARED_RESOURCE *shared_resource,
-                IDXGISurface **surface) override{IMPLEMENT_ME}
+                IDXGISurface **surface) override{
+    UNIMPLEMENTED("CreateSurface");
+  }
 
   HRESULT STDMETHODCALLTYPE
-      QueryResourceResidency(IUnknown *const *resources,
-                             DXGI_RESIDENCY *residency,
-                             UINT resource_count) override{IMPLEMENT_ME}
+  QueryResourceResidency(IUnknown *const *ppResources, DXGI_RESIDENCY *pResidency, UINT ResourceCount) override {
+    if (!ppResources || !pResidency)
+      return E_INVALIDARG;
+
+    // Basically in DXMT D3D11 implementation, all resources are assumed to be resident.
+    for (uint32_t i = 0; i < ResourceCount; i++)
+      pResidency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
+    return S_OK;
+  }
 
   HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override {
     if (Priority < -7 || Priority > 7)

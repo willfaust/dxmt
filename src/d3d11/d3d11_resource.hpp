@@ -3,12 +3,13 @@
 #include "dxmt_dynamic.hpp"
 #include "dxmt_staging.hpp"
 #include "dxmt_texture.hpp"
+#include "dxmt_keyed_mutex.hpp"
 #include "d3d11_device_child.hpp"
 #include "com/com_pointer.hpp"
 #include "com/com_guid.hpp"
 #include "d3d11_view.hpp"
+#include "d3d11_surface.hpp"
 #include "dxgi_resource.hpp"
-#include "dxmt_resource_binding.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_buffer.hpp"
 #include "../d3d10/d3d10_texture.hpp"
@@ -129,15 +130,40 @@ struct D3D11ResourceCommon : ID3D11Resource {
   virtual HRESULT GetSharedHandle(HANDLE *pSharedHandle) = 0;
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle) = 0;
+  virtual HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) = 0;
 
-  virtual Rc<Buffer> buffer() = 0;
-  virtual BufferSlice bufferSlice() = 0;
-  virtual Rc<Texture> texture() = 0;
   virtual Rc<StagingResource> staging(UINT Subresource) = 0;
   virtual Rc<DynamicBuffer> dynamicBuffer(UINT *pBufferLength, UINT *pBindFlags) = 0;
   virtual Rc<DynamicLinearTexture> dynamicLinearTexture(UINT *pBytesPerRow, UINT *pBytesPerImage) = 0;
   virtual Rc<DynamicBuffer> dynamicTexture(UINT Subresource, UINT *pBytesPerRow, UINT *pBytesPerImage) = 0;
+
+  Rc<Buffer> buffer_{};
+  Rc<Texture> texture_{};
+  uint32_t bind_flags_{};
+  Rc<KeyedMutex> keyed_mutex_{};
+
+  const Rc<Buffer> &buffer() const {
+    return buffer_;
+  }
+  const Rc<Texture> &texture() const {
+    return texture_;
+  }
+  uint32_t bindFlags() const {
+    return bind_flags_;
+  }
+  bool
+  hazardsFree() const {
+    return (bind_flags_ & (D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET |
+                           D3D11_BIND_DEPTH_STENCIL)) == 0;
+  }
+  const Rc<KeyedMutex> &keyedMutex() const {
+    return keyed_mutex_;
+  }
 };
+
+inline D3D11ResourceCommon* GetResourceCommon(ID3D11Resource *pResource) {
+  return static_cast<D3D11ResourceCommon *>(pResource);
+}
 
 inline Rc<DynamicBuffer>
 GetDynamicBuffer(ID3D11Resource *pResource, UINT *pBufferLength, UINT *pBindFlags) {
@@ -164,12 +190,15 @@ GetTexture(ID3D11Resource *pResource) {
 template <typename tag, typename... Base>
 class TResourceBase : public MTLD3D11DeviceChild<D3D11ResourceCommon, Base...> {
 public:
-  TResourceBase(const tag::DESC1 &desc, MTLD3D11Device *device)
-      : MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(
-            device),
-        desc(desc),
-        dxgi_resource(new MTLDXGIResource<TResourceBase<tag, Base...>>(this)),
-        d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {}
+  TResourceBase(const tag::DESC1 &desc, MTLD3D11Device *device) :
+      MTLD3D11DeviceChild<D3D11ResourceCommon, Base...>(device),
+      desc(desc),
+      dxgi_resource(this),
+      keyed_mutex(this, device->GetImmediateContextPrivate()),
+      d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()),
+      dxgi_surface(this) {
+    this->bind_flags_ = desc.BindFlags;
+  }
 
   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {
     return E_NOINTERFACE;
@@ -213,7 +242,24 @@ public:
     if (riid == __uuidof(IDXGIObject) ||
         riid == __uuidof(IDXGIDeviceSubObject) ||
         riid == __uuidof(IDXGIResource) || riid == __uuidof(IDXGIResource1)) {
-      *ppvObject = ref(dxgi_resource.get());
+      *ppvObject = ref(&dxgi_resource);
+      return S_OK;
+    }
+
+    if ((riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1) || riid == __uuidof(IDXGISurface2))) {
+      if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ||
+                    tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (this->desc.ArraySize * this->desc.MipLevels == 1) {
+          *ppvObject = ref(&dxgi_surface);
+          return S_OK;
+        }
+      }
+    }
+
+    if (riid == __uuidof(IDXGIKeyedMutex)) {
+      if (!(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+        return E_NOINTERFACE;
+      *ppvObject = ref(&keyed_mutex);
       return S_OK;
     }
 
@@ -282,11 +328,16 @@ public:
       override {
     return E_INVALIDARG;
   }
+  virtual HRESULT CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) override {
+    return DXGI_ERROR_INVALID_CALL;
+  }
 
 protected:
   tag::DESC1 desc;
-  std::unique_ptr<IDXGIResource1> dxgi_resource;
+  MTLDXGIResource<TResourceBase<tag, Base...>> dxgi_resource;
+  MTLDXGIKeyedMutex<TResourceBase<tag, Base...>, IMTLD3D11DeviceContext> keyed_mutex;
   tag::D3D10_IMPL d3d10;
+  D3D11DXGISurface dxgi_surface;
 };
 
 template <typename RESOURCE_IMPL_ = ID3D11Resource,
@@ -361,10 +412,12 @@ public:
   TResourceViewBase(const tag::DESC1 *pDesc, tag::RESOURCE_IMPL *pResource,
                     MTLD3D11Device *device)
       : MTLD3D11DeviceChild<typename tag::COM_IMPL, Base...>(device),
-        d3d10(static_cast<typename tag::COM_IMPL *>(this)), resource(pResource) {
+        d3d10(static_cast<typename tag::COM_IMPL *>(this)) {
     if (pDesc) {
       desc = *pDesc;
     }
+    this->resource_ = pResource;
+    this->bind_flags_ = this->resource_->bind_flags_;
   }
 
   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {
@@ -421,20 +474,12 @@ public:
   void STDMETHODCALLTYPE GetDesc1(tag::DESC1 *pDesc) /* override / final */ { *pDesc = desc; }
 
   void STDMETHODCALLTYPE GetResource(tag::RESOURCE **ppResource) final {
-    resource->QueryInterface(IID_PPV_ARGS(ppResource));
+    this->resource_->QueryInterface(IID_PPV_ARGS(ppResource));
   }
-
-  virtual ULONG64 GetUnderlyingResourceId() { return (ULONG64)resource.ptr(); };
-
-  virtual dxmt::ResourceSubset GetViewRange() { return ResourceSubset(desc); };
 
 protected:
   tag::DESC1 desc;
   tag::D3D10_IMPL d3d10;
-  /**
-  strong ref to resource
-  */
-  Com<typename tag::RESOURCE_IMPL> resource;
 };
 
 #pragma region Resource Factory
@@ -629,7 +674,7 @@ CalculateBufferViewOffsetAndSize(const D3D11_BUFFER_DESC &buffer_desc,
 };
 #pragma endregion
 
-constexpr UINT kD3D11OuputBindFlags =
+constexpr UINT kD3D11OutputBindFlags =
     D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_RENDER_TARGET;
 
 } // namespace dxmt

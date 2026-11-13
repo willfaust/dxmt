@@ -2,11 +2,38 @@
 
 #include "Metal.hpp"
 #include "dxmt_buffer.hpp"
+#include "dxmt_command_constants.hpp"
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
 #include <optional>
 #include <unordered_map>
+
+namespace dxmt {
+struct TileBarrierPSOKey {
+  WMTPixelFormat color_formats[8];
+  unsigned raster_sample_count;
+};
+} // namespace dxmt
+
+namespace std {
+template <> struct hash<dxmt::TileBarrierPSOKey> {
+  size_t
+  operator()(const dxmt::TileBarrierPSOKey &v) const noexcept {
+    constexpr size_t binsize = sizeof(v);
+    return std::hash<string_view>{}({reinterpret_cast<const char *>(&v), binsize});
+  };
+};
+
+template <> struct equal_to<dxmt::TileBarrierPSOKey> {
+  bool
+  operator()(const dxmt::TileBarrierPSOKey &x, const dxmt::TileBarrierPSOKey &y) const {
+    constexpr size_t binsize = sizeof(x);
+    return std::string_view({reinterpret_cast<const char *>(&x), binsize}) ==
+           std::string_view({reinterpret_cast<const char *>(&y), binsize});
+  }
+};
+}; // namespace std
 
 namespace dxmt {
 
@@ -131,19 +158,17 @@ public:
   void
   MarshalGSDispatchArguments(WMT::RenderCommandEncoder encoder, WMT::Buffer commands, uint32_t commands_offset) {
     encoder.setRenderPipelineState(gs_draw_arguments_marshal);
-    encoder.setVertexBuffer(commands, commands_offset, 0);
+    encoder.setVertexBuffer(commands, commands_offset, kCustomBufferArgumentIndex0);
     encoder.drawPrimitives(WMTPrimitiveTypePoint, 0, 1);
-    encoder.setVertexBuffer({}, 0, 0);
-    encoder.setVertexBuffer({}, 0, 1);
+    encoder.setVertexBuffer({}, 0, kCustomBufferArgumentIndex0);
   }
 
   void
   MarshalTSDispatchArguments(WMT::RenderCommandEncoder encoder, WMT::Buffer commands, uint32_t commands_offset) {
     encoder.setRenderPipelineState(ts_draw_arguments_marshal);
-    encoder.setVertexBuffer(commands, commands_offset, 0);
+    encoder.setVertexBuffer(commands, commands_offset, kCustomBufferArgumentIndex0);
     encoder.drawPrimitives(WMTPrimitiveTypePoint, 0, 1);
-    encoder.setVertexBuffer({}, 0, 0);
-    encoder.setVertexBuffer({}, 0, 1);
+    encoder.setVertexBuffer({}, 0, kCustomBufferArgumentIndex0);
   }
 
 private:
@@ -176,31 +201,6 @@ private:
   WMT::Reference<WMT::RenderPipelineState> ts_draw_arguments_marshal;
 };
 
-class ClearRenderTargetContext {
-public:
-  ClearRenderTargetContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
-
-  void begin(Rc<Texture> texture, TextureViewKey view);
-
-  void clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, const std::array<float, 4>& color);
-
-  void end();
-
-private:
-  ArgumentEncodingContext &ctx_;
-  WMT::Device device_;
-  WMT::Reference<WMT::Function> vs_clear_;
-  WMT::Reference<WMT::Function> fs_clear_float_;
-  WMT::Reference<WMT::Function> fs_clear_uint_;
-  WMT::Reference<WMT::Function> fs_clear_sint_;
-  WMT::Reference<WMT::Function> fs_clear_depth_;
-  WMT::Reference<WMT::DepthStencilState> depth_write_state_;
-  WMT::Reference<WMT::DepthStencilState> depth_readonly_state_;
-  std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::RenderPipelineState>> pso_cache_;
-  Rc<Texture> clearing_texture_;
-  TextureViewKey clearing_texture_view_;
-};
-
 class DepthStencilBlitContext {
 
 public:
@@ -224,47 +224,6 @@ private:
   WMT::Reference<WMT::RenderPipelineState> pso_copy_d32s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d24s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d32s8_;
-};
-
-class ClearResourceKernelContext {
-public:
-  ClearResourceKernelContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
-
-  void begin(const std::array<float, 4> &color, Rc<Texture> texture, TextureViewKey view);
-  void begin(const std::array<float, 4> &color, Rc<Buffer> buffer, BufferViewKey view);
-  void begin(const std::array<float, 4> &color, Rc<Buffer> buffer, bool raw_buffer_is_integer);
-
-  void clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height);
-
-  void end();
-
-private:
-  void setClearColor(const std::array<float, 4> &color, bool is_integer);
-
-  ArgumentEncodingContext &ctx_;
-  WMT::Device device_;
-  WMT::Reference<WMT::Function> cs_clear_buffer_uint_;
-  WMT::Reference<WMT::Function> cs_clear_buffer_float_;
-  WMT::Reference<WMT::Function> cs_clear_tbuffer_uint_;
-  WMT::Reference<WMT::Function> cs_clear_tbuffer_float_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_uint_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_float_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_array_uint_;
-  WMT::Reference<WMT::Function> cs_clear_texture2d_array_float_;
-  Rc<Texture> clearing_texture_;
-  Rc<Buffer> clearing_buffer_;
-  TextureViewKey clearing_view_ = 0; // type compatible with BufferViewKey
-  uint32_t dispatch_depth_ = 1;
-
-  struct DXMTClearMetadata {
-    union {
-      float color_f32[4];
-      uint32_t color_u32[4];
-    };
-    uint32_t offset[2];
-    uint32_t size[2];
-  };
-  DXMTClearMetadata meta_temp_;
 };
 
 class MTLFXMVScaleContext {
@@ -379,6 +338,23 @@ private:
   std::unordered_map<uint64_t, WMT::Reference<WMT::RenderPipelineState>> psos_;
   WMT::Reference<WMT::SamplerState> sampler_point_;
   WMT::Reference<WMT::SamplerState> sampler_linear_;
+};
+
+constexpr auto kBarrierTileSize = 16;
+
+class TileBarrierContext {
+public:
+  TileBarrierContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  void dispatch();
+
+private:
+  WMT::RenderPipelineState getPSO(TileBarrierPSOKey &format);
+
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::Function> tile_function_;
+  std::unordered_map<TileBarrierPSOKey, WMT::Reference<WMT::RenderPipelineState>> psos_;
 };
 
 } // namespace dxmt

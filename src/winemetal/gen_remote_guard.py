@@ -55,6 +55,18 @@ ROUTED = {
     '_MTLDevice_newDepthStencilState', '_MTLDevice_newSamplerState',
     # resources and sync
     '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
+    '_MTLCommandBuffer_property',
+    '_MTLDevice_newLibraryWithSource', '_NSObject_description',
+    '_MTLCounterSampleBuffer_newTimestampBuffer', '_MTLCounterSampleBuffer_resolveCounterRange',
+    '_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers',
+    '_MTLDevice_heapBufferSizeAndAlign',
+    '_MTLDevice_heapTextureSizeAndAlign',
+    '_MTLDevice_newHeap', '_MTLHeap_newBuffer', '_MTLHeap_newTexture',
+    '_MTLDevice_newIndirectCommandBuffer',
+    '_MTLDevice_newTileRenderPipelineState',
+    '_MTLTexture_getBytes',
+    '_MTLDevice_newResidencySet', '_MTLResidencySet_addAllocations', '_MTLResidencySet_removeAllocations',
+    '_MTLResidencySet_removeAllAllocations', '_MTLResidencySet_commit', '_MTLCommandQueue_addResidencySet',
     # presentation seam: the HWND stays guest-local, the host layer crosses
     '_CreateMetalViewFromHWND', '_ReleaseMetalView',
     '_MetalLayer_nextDrawable', '_MetalDrawable_texture',
@@ -79,8 +91,8 @@ ROUTED = {
     '_MTLCommandEncoder_setLabel',
     '_MTLDevice_newRenderPipelineStateVD',
     '_MTLDevice_newSharedTexture',
-    '_MTLDevice_newResidencySet', '_MTLResidencySet_addAllocation',
-    '_MTLResidencySet_commit', '_MTLCommandQueue_addResidencySet',
+    '_MadeiraMTLDevice_newResidencySet', '_MTLResidencySet_addAllocation',
+    '_MadeiraMTLResidencySet_commit', '_MadeiraMTLCommandQueue_addResidencySet',
     '_MTLDevice_newGeometryEmulationPipelineState',
 }
 
@@ -147,7 +159,10 @@ def guard_body(name, st, zero):
         body.append('    struct %s *p = obj;' % st)
         for f in zero:
             body.append('    p->%s = 0;   /* never hand back uninitialised stack */' % f)
-    body += ['    return wmtr_unimplemented("%s");' % name[1:],
+    label = name[1:]
+    if label in ('MadeiraMTLDevice_heapTextureSizeAndAlign', 'MadeiraMTLDevice_heapBufferSizeAndAlign'):
+        label = label[len('Madeira'):]
+    body += ['    return wmtr_unimplemented("%s");' % label,
              '  }',
              '  return %s(obj);' % name, '}']
     return body
@@ -181,6 +196,8 @@ def main():
         if e == 'NULL' or not e.startswith('&'):
             continue
         name = e.lstrip('&')
+        if name.startswith('_rmg_upstream_'):
+            continue  # These guards are defined beside the upstream handlers.
         if name.startswith('_rmg'):
             name = '_' + name[len('_rmg_'):]
         if name in ROUTED or LOCAL_OK.match(name.lstrip('_')):
@@ -202,6 +219,8 @@ def main():
         if e == 'NULL' or not e.startswith('&'):
             continue
         name = e.lstrip('&')
+        if name.startswith('_rmg_upstream_'):
+            continue  # These guards are defined beside the upstream handlers.
         if name.startswith('_rmg'):
             name = '_' + name[len('_rmg_'):]
         if not name.endswith('32'):
@@ -226,6 +245,8 @@ def main():
             body = m.group(1)
             def one(mm):
                 lead, name = mm.group(1), mm.group(2)
+                if name.startswith('_rmg_upstream_'):
+                    return mm.group(0)
                 base = '_' + name[len('_rmg_'):] if name.startswith('_rmg_') else name
                 want = '_rmg' + base if base in wanted else base
                 return '%s&%s,' % (lead, want)

@@ -1,8 +1,25 @@
-#include "dxbc_instructions.hpp"
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
 
-#include "DXBCParser/ShaderBinary.h"
+#include "dxbc_instructions.hpp"
 #include "dxbc_converter.hpp"
 #include "shader_common.hpp"
+#include "DXBCParser/ShaderBinary.h"
 
 namespace dxmt::dxbc {
 
@@ -21,6 +38,13 @@ auto readOperandRelativeIndex(
     };
   }
 
+  case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID: {
+    // Hull shaders index the input patch with the control point they run for.
+    return IndexByControlPointId{
+      .offset = offset,
+    };
+  }
+
   case D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP: {
     return IndexByIndexableTempComponent{
       .regfile = OpIndex.m_RelIndex,
@@ -33,6 +57,7 @@ auto readOperandRelativeIndex(
 
   default:
     DXASSERT_DXBC(false);
+    return 0u;
   };
 };
 
@@ -128,33 +153,9 @@ auto readDstOperand(
     };
   }
   case D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF: {
-    DXASSERT_DXBC(O.m_IndexDimension == D3D10_SB_OPERAND_INDEX_0D);
-    // for (unsigned c = 0; c < DXBC::kWidth; c++) {
-    //   if (!Mask.IsSet(c))
-    //     continue;
-
-    //   // Retrieve signature element.
-    //   DXASSERT(m_pSM->IsPS(), "PS has only one output stream.");
-    //   const DxilSignatureElement *E =
-    //   m_pOutputSignature->GetElement(O.m_Type); CompType DxbcValueType =
-    //   E->GetCompType(); Type *pLlvmDxbcValueType =
-    //   DxbcValueType.GetLLVMType(m_Ctx);
-
-    //   Value *Args[5];
-    //   Args[0] = m_pOP->GetU32Const((unsigned)OP::OpCode::StoreOutput); //
-    //   OpCode Args[1] = m_pOP->GetU32Const(E->GetID()); // Output signature
-    //   element ID Args[2] = m_pOP->GetU32Const(0);          // Row, relative
-    //   to the element Args[3] = m_pOP->GetU8Const(
-    //       c - E->GetStartCol()); // Col, relative to the element
-    //   Args[4] = MarkPrecise(CastDxbcValue(DstVal[c], ValueType,
-    //   DxbcValueType),
-    //                         c); // Value
-    //   Function *F =
-    //       m_pOP->GetOpFunc(OP::OpCode::StoreOutput, pLlvmDxbcValueType);
-    //   MarkPrecise(m_pBuilder->CreateCall(F, Args));
-    // }
-    assert(0 && "Unhandled operand type");
-    break;
+    return DstOperandOutputStencilRef{
+      ._ = {.mask = 1, .write_type = write_type},
+    };
   }
 
   case D3D10_SB_OPERAND_TYPE_NULL: {
@@ -277,14 +278,14 @@ SrcOperand readSrcOperand(
     return SrcOperandInputICP{
       ._ = readSrcOperandCommon(O, read_type),
       .cpid = readOperandIndex(O.m_Index[0], O.m_IndexType[0], phase),
-      .regid = O.m_Index[1].m_RegIndex,
+      .regid = readOperandIndex(O.m_Index[1], O.m_IndexType[1], phase),
     };
   }
   case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT: {
     return SrcOperandInputOCP{
       ._ = readSrcOperandCommon(O, read_type),
       .cpid = readOperandIndex(O.m_Index[0], O.m_IndexType[0], phase),
-      .regid = O.m_Index[1].m_RegIndex,
+      .regid = readOperandIndex(O.m_Index[1], O.m_IndexType[1], phase),
     };
   }
   case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT: {
@@ -1840,7 +1841,6 @@ Instruction readInstruction(
     return inst;
   };
   case microsoft::D3D11_SB_OPCODE_ATOMIC_CMP_STORE: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = DstOperandSideEffect{._ = {.mask = 0b1111, .write_type = OperandDataType::Integer}},
       .dst_resource = readAtomicDst(Inst.m_Operands[0], phase),
@@ -1898,7 +1898,6 @@ Instruction readInstruction(
   };
 
   case microsoft::D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = readDstOperand(Inst.m_Operands[0], phase, OperandDataType::Integer),
       .dst_resource = readAtomicDst(Inst.m_Operands[1], phase),
@@ -2116,6 +2115,7 @@ Instruction readInstruction(
   default: {
     llvm::outs() << "unhandled dxbc instruction " << Inst.OpCode() << "\n";
     assert(0 && "unhandled dxbc instruction");
+    return InstNop {};
   }
   }
 };

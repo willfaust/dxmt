@@ -163,7 +163,9 @@ Presenter::synchronizeLayerProperties() {
 
 WMT::MetalDrawable
 Presenter::encodeCommands(
-    WMT::CommandBuffer cmdbuf, WMT::Fence fence, WMT::Texture backbuffer, DXMTPresentMetadata metadata
+    WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
+    std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
+    std::function<void(WMT::RenderCommandEncoder)> &&update_fences
 ) {
   auto drawable = layer_.nextDrawable();
   /* iOS-Madeira RAW mode: the unix thunk returns nil inside the
@@ -178,8 +180,7 @@ Presenter::encodeCommands(
   info.colors[0].store_action = WMTStoreActionStore;
   info.colors[0].texture = drawable.texture();
   auto encoder = cmdbuf.renderCommandEncoder(info);
-  if (fence)
-    encoder.waitForFence(fence, WMTRenderStageFragment);
+  wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
   encoder.setFragmentTexture(gamma_lut_texture_, 1);
 
@@ -194,18 +195,11 @@ Presenter::encodeCommands(
   }
   encoder.setViewport({0, 0, width, height, 0, 1});
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
-
+  update_fences(encoder);
   encoder.endEncoding();
 
   return drawable;
 }
-
-constexpr uint32_t kPresentFCIndex_BackbufferSizeMatched = 0x100;
-constexpr uint32_t kPresentFCIndex_HDRPQ = 0x101;
-constexpr uint32_t kPresentFCIndex_WithHDRMetadata = 0x102;
-constexpr uint32_t kPresentFCIndex_BackbufferIsSRGB = 0x103;
-constexpr uint32_t kPresentFCIndex_BackbufferIsMS = 0x104;
-constexpr uint32_t kPresentFCIndex_GammaEnabled = 0x105;
 
 void
 Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable) {

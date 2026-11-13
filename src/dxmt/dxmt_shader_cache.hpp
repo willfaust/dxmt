@@ -2,10 +2,11 @@
 #include "Metal.hpp"
 #include "thread.hpp"
 #include <string>
+#include "airconv_public.h"
 
 namespace dxmt {
 
-constexpr int kDXMTShaderCacheVersion = 19; /* madeira-bcd: vertex fetch bounds; madeira-bcd: byte-aligned vertex fetch; madeira ml1382: precise DXBC min/max */
+constexpr int kDXMTShaderCacheVersion = AIRCONV_VERSION;
 
 // Base directory every DXMT cache lives under, so the Metal shader cache and
 // this one cannot disagree about where that is.

@@ -1,10 +1,12 @@
 airconv_src = files([
  'airconv_context.cpp',
+ 'air_operations.cpp',
  'dxso_compile.cpp',
  'ffp_compile.cpp',
  'air_type.cpp',
  'air_signature.cpp',
- 'air_operations.cpp',
+ 'dxbc_binding_sm50.cpp',
+ 'dxbc_binding_rootsig.cpp',
  'dxbc_converter.cpp',
  'dxbc_converter_gs.cpp',
  'dxbc_converter_ts.cpp',
@@ -12,10 +14,17 @@ airconv_src = files([
  'dxbc_converter_cfg.cpp',
  'dxbc_instructions.cpp',
  'dxbc_signature.cpp',
+ 'dxil_converter.cpp',
+ 'dxil_metadata.cpp',
+ 'dxil_metadata_reader.cpp',
  'metallib_writer.cpp',
  'nt/air_builder.cpp',
+ 'nt/air_vertex_puller.cpp',
  'nt/dxbc_converter_base.cpp',
+ 'nt/dxbc_io_helper.cpp',
+ 'nt/dxil_converter_base.cpp',
  'transforms/lower_16bit_texread.cpp',
+ 'transforms/simdgroup_implicit_membarrier.cpp',
 ])
 
 airconv_cli_src = files(['airconv_cli.cpp'])
@@ -47,6 +56,11 @@ airconv_args = [
   '-D__STDC_FORMAT_MACROS',
   '-D__STDC_LIMIT_MACROS',
 ]
+
+if clangpp.has_argument('-Wno-unnecessary-virtual-specifier')
+  # LLVM
+  airconv_args += ['-Wno-unnecessary-virtual-specifier']
+endif
 
 llvm_ld_flags = [
  '-L'+join_paths(meson.project_source_root(), 'toolchains/llvm/lib')
@@ -100,6 +114,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if cpu_family == 'x86_64' or dxmt_native
+if get_option('build_macos_bridge') and (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild)
   subdir('darwin')
 endif

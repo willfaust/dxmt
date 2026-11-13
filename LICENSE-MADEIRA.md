@@ -1,13 +1,14 @@
 # Licensing of Madeira's modifications
 
-This repository is a fork of [DXMT](https://github.com/3Shain/DXMT). **The upstream licence
-is unchanged and continues to apply to all upstream code.** See `LICENSE`.
+This repository is a fork of [DXMT](https://github.com/3Shain/DXMT). Upstream
+code is distributed under its applicable licence. See `LICENSE` and `LICENSE.OLD`.
 
 ## What is licensed how
 
 | Code | Licence |
 |---|---|
-| All upstream DXMT code | as in `LICENSE` (MIT) — unchanged |
+| Upstream DXMT code through v0.80 | MIT, as recorded in `LICENSE.OLD` |
+| Later upstream DXMT code | LGPL-2.1-or-later, as in `LICENSE` and `COPYING.LIB` |
 | Code imported from the `v0.4-d3d9` tag of `dacevedo12/dxmt` (see below) | **LGPL-2.1-or-later**, as received (`COPYING.LIB`) |
 | Modifications and new files authored for **Madeira** by Will Faust | **GPL-3.0-or-later** |
 | Modifications and new files contributed for **Madeira** by 125hz | **GPL-3.0-or-later**, with the Madeira Converter Exception below |
@@ -31,10 +32,9 @@ imported from a different fork of the same upstream:
   DXMT project notice ("Copyright (c) 2023-2026 Feifan He for CodeWeavers",
   LGPL-2.1-or-later) and the full text is in `COPYING.LIB`; the imported files
   carry no per-file notices of their own. That repository's `LICENSE.OLD`
-  records that DXMT releases up to v0.80 were MIT; this fork branched in the
-  MIT era, which is why the `LICENSE` here is still the MIT one and why it
-  stays that way — it states the terms of the code this fork actually took
-  from upstream.
+  records that DXMT releases up to v0.80 were MIT. This fork branched in the
+  MIT era and later incorporated upstream code distributed under the
+  LGPL-2.1-or-later terms in `LICENSE`.
 - **What the imported code says about its own sources:** its comments state
   that the x87 set-up (`setupFpu`) was ported from Wine's wined3d `setup_fpu`
   and DXVK's `SetupFPU`, that the CPU vertex transform behind

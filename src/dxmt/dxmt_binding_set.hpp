@@ -4,8 +4,8 @@
 
 namespace dxmt {
 
-template <typename E> struct redunant_binding_trait {
-  static bool is_redunant(const E &left, const E &right);
+template <typename E> struct redundant_binding_trait {
+  static bool is_redundant(const E &left, const E &right);
 };
 
 /**
@@ -14,6 +14,7 @@ Element is required to be move-assignable
 template <typename Element, size_t NumElements> class BindingSet {
   bit::bitset<NumElements> dirty;
   bit::bitset<NumElements> bound;
+  bit::bitset<NumElements> hazard;
   std::array<Element, NumElements> storage;
 
 public:
@@ -22,6 +23,7 @@ public:
   BindingSet(BindingSet &&move) : storage(std::move(move.storage)) {
     bound = move.bound;
     dirty = move.bound; // intended behavior
+    hazard = move.hazard;
   };
 
   BindingSet &
@@ -29,6 +31,7 @@ public:
     storage = std::move(move.storage);
     bound = move.bound;
     dirty = move.bound; // intended behavior
+    hazard = move.hazard;
     return *this;
   }
 
@@ -59,22 +62,22 @@ public:
   }
 
   constexpr bool
-  any_dirty_masked(uint16_t mask) noexcept {
+  any_dirty_masked(uint16_t mask) const noexcept {
     return (dirty.qword(0) & (uint64_t)mask) != 0;
   }
 
   constexpr bool
-  any_dirty_masked(uint64_t mask) noexcept {
+  any_dirty_masked(uint64_t mask) const noexcept {
     return (dirty.qword(0) & mask) != 0;
   }
 
   constexpr bool
-  any_dirty_masked(uint64_t mask_hi, uint64_t mask_lo) noexcept {
+  any_dirty_masked(uint64_t mask_hi, uint64_t mask_lo) const noexcept {
     return ((dirty.qword(0) & mask_lo) | (dirty.qword(1) & mask_hi)) != 0;
   }
 
   constexpr bool
-  all_bound_masked(uint32_t mask) noexcept {
+  all_bound_masked(uint32_t mask) const noexcept {
     return (bound.qword(0) & mask) == mask;
   }
 
@@ -83,10 +86,15 @@ public:
     return bound.any();
   }
 
+  constexpr bool
+  any_bound_masked(uint64_t mask) const noexcept {
+    return (bound.qword(0) & mask) != 0;
+  }
+
   constexpr uint32_t
-  max_binding_64() noexcept {
-    auto qword = dirty.qword(0);
-    return qword == 0 ? 0 : 64 - __builtin_clzll(qword);
+  max_binding_64() const noexcept {
+    uint64_t qword = dirty.qword(0);
+    return 64u - bit::tzcnt(qword);
   }
 
   inline void
@@ -117,17 +125,18 @@ public:
   /**
   try to bind element at specific slot, and return a reference to the
   corresponding element storage it also tells if a replacement does happen
-  this is useful because we don't have to fully initalize the element
+  this is useful because we don't have to fully initialize the element
   (so no initialization overhead if no replacement)
   */
   inline Element &
-  bind(size_t slot, Element &&element, bool &replacement) {
+  bind(size_t slot, Element &&element, bool &replacement, bool hazard = true) {
     if (bound.get(slot)) {
-      if (redunant_binding_trait<Element>::is_redunant(storage[slot], element)) {
+      if (redundant_binding_trait<Element>::is_redundant(storage[slot], element)) {
         return storage[slot];
       }
     } else {
       bound.set(slot, true);
+      this->hazard.set(slot, hazard);
     }
     // new (storage.data() + slot) Element(std::forward<Element>(element));
     // std::construct_at(storage.data() + slot, std::forward<Element>(element));
@@ -145,10 +154,11 @@ public:
       // yeah that's weird but since we don't use placement construction
       // (because it's slow-as-f for some weird reason)
       // and Com<T> (typically inside Element) doesn't reset pointer at
-      // destruction then a redunant Release occur when trying to move Element
+      // destruction then a redundant Release occur when trying to move Element
       // at bind()
       storage[slot] = {};
       bound.set(slot, false);
+      hazard.set(slot, false);
       dirty.set(slot, true);
       return true;
     }
@@ -157,13 +167,23 @@ public:
 
   class bound_iterator {
     const BindingSet &binding_set;
+    const bit::bitset<NumElements> &bits;
     size_t current;
 
     void
     advance_to_next() {
-      while (current < NumElements && !binding_set.bound.get(current)) {
-        ++current;
+      while (current < NumElements) {
+        auto qword_index = current / 64;
+        auto tz = bit::tzcnt(uint64_t(bits.qword(qword_index) & ~((1ull << (current % 64)) - 1ull)));
+        if (tz < 64) {
+          current = qword_index * 64 + tz;
+          return;
+        }
+        current = (qword_index + 1) * 64;
+        continue;
       }
+      // just in case, clamp it
+      current = NumElements;
     }
 
   public:
@@ -173,7 +193,10 @@ public:
     using pointer = void;
     using reference = std::pair<size_t, const Element &>;
 
-    bound_iterator(const BindingSet &set, size_t start) : binding_set(set), current(start) {
+    bound_iterator(const BindingSet &set, const bit::bitset<NumElements> &bits, size_t start) :
+        binding_set(set),
+        bits(bits),
+        current(start) {
       advance_to_next();
     }
 
@@ -197,22 +220,27 @@ public:
     }
 
     bool
-    operator==(const bound_iterator &other) const {
-      return current == other.current;
-    }
-    bool
-    operator!=(const bound_iterator &other) const {
-      return !(*this == other);
+    operator!=(uint64_t index) const {
+      return current != index;
     }
   };
 
   bound_iterator
   begin() const {
-    return bound_iterator(*this, 0);
+    return bound_iterator(*this, bound, 0);
   }
-  bound_iterator
+  uint64_t
   end() const {
-    return bound_iterator(*this, NumElements);
+    return NumElements;
+  }
+
+  bound_iterator
+  hazard_begin() const {
+    return bound_iterator(*this, hazard, 0);
+  }
+  uint64_t
+  hazard_end() const {
+    return NumElements;
   }
 };
 } // namespace dxmt

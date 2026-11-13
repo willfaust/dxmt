@@ -1,3 +1,22 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ * Copyright 2026 Marc-Aurel Zent for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "com/com_pointer.hpp"
 #include <mutex>
 #include <unordered_map>
@@ -84,7 +103,6 @@ LocalShareOpen(MTLD3D11Device *pDevice, uintptr_t handle, REFIID riid, void **pp
 template <typename tag_texture>
 class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
-  Rc<Texture> underlying_texture_;
   Rc<RenamableTexturePool> renamable_;
   /* ml675: top mip levels dropped from the PHYSICAL Metal texture. The D3D
    * descriptor this object reports stays LOGICAL, so GetDesc keeps telling the
@@ -100,139 +118,118 @@ private:
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
   class TextureSRV : public SRVBase {
-  private:
-    TextureViewKey view_key_;
-
   public:
-    TextureSRV(TextureViewKey view_key,
+    TextureSRV(const TextureViewDescriptor &descriptor,
                const tag_shader_resource_view<>::DESC1 *pDesc,
                DeviceTexture *pResource, MTLD3D11Device *pDevice)
-        : SRVBase(pDesc, pResource, pDevice), view_key_(view_key) {}
+        : SRVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength()
+      );
+    }
 
-    Rc<Buffer> buffer() final { return {}; };
-    Rc<Texture> texture() final { return this->resource->underlying_texture_; };
-    unsigned viewId() final { return view_key_;};
-    BufferSlice bufferSlice() final { return {};}
   };
 
   using UAVBase =
       TResourceViewBase<tag_unordered_access_view<DeviceTexture<tag_texture>>>;
   class TextureUAV : public UAVBase {
-  private:
-    TextureViewKey view_key_;
-
   public:
-    TextureUAV(TextureViewKey view_key,
+    TextureUAV(const TextureViewDescriptor &descriptor,
                const tag_unordered_access_view<>::DESC1 *pDesc,
                DeviceTexture *pResource, MTLD3D11Device *pDevice)
-        : UAVBase(pDesc, pResource, pDevice), view_key_(view_key){}
-
-    Rc<Buffer> buffer() final { return {}; };
-    Rc<Texture> texture() final { return this->resource->underlying_texture_; };
-    unsigned viewId() final { return view_key_;};
-    BufferSlice bufferSlice() final { return {};}
-    Rc<Buffer> counter() final { return {}; };
+        : UAVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength()
+      );
+    }
   };
 
   using RTVBase =
       TResourceViewBase<tag_render_target_view<DeviceTexture<tag_texture>>>;
   class TextureRTV : public RTVBase {
-  private:
-    TextureViewKey view_key_;
-    WMTPixelFormat view_format_;
-    MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
-
   public:
     TextureRTV(
-        TextureViewKey view_key, WMTPixelFormat view_format, const tag_render_target_view<>::DESC1 *pDesc,
+        const TextureViewDescriptor &descriptor, WMTPixelFormat view_format, const tag_render_target_view<>::DESC1 *pDesc,
         DeviceTexture *pResource, MTLD3D11Device *pDevice, const MTL_RENDER_PASS_ATTACHMENT_DESC &mtl_rtv_desc
     ) :
-        RTVBase(pDesc, pResource, pDevice),
-        view_key_(view_key),
-        view_format_(view_format),
-        attachment_desc(mtl_rtv_desc) {}
-
-    WMTPixelFormat
-    pixelFormat() final {
-      return view_format_;
-    }
-
-    MTL_RENDER_PASS_ATTACHMENT_DESC &description() final {
-      return attachment_desc;
-    };
-
-    Rc<Texture> texture() final {
-      return this->resource->underlying_texture_;
-    }
-
-    unsigned viewId() final {
-      return view_key_;
+        RTVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->format_ = view_format;
+      this->pass_desc_ = mtl_rtv_desc;
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength()
+      );
     }
   };
 
   using DSVBase =
       TResourceViewBase<tag_depth_stencil_view<DeviceTexture<tag_texture>>>;
   class TextureDSV : public DSVBase {
-  private:
-    TextureViewKey view_key_;
-    WMTPixelFormat view_format_;
-    MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
-
   public:
     TextureDSV(
-        TextureViewKey view_key, WMTPixelFormat view_format, const tag_depth_stencil_view<>::DESC1 *pDesc,
+        const TextureViewDescriptor &descriptor, WMTPixelFormat view_format, const tag_depth_stencil_view<>::DESC1 *pDesc,
         DeviceTexture *pResource, MTLD3D11Device *pDevice, const MTL_RENDER_PASS_ATTACHMENT_DESC &attachment_desc
     ) :
-        DSVBase(pDesc, pResource, pDevice),
-        view_key_(view_key),
-        view_format_(view_format),
-        attachment_desc(attachment_desc) {}
-
-    WMTPixelFormat
-    pixelFormat() final {
-      return view_format_;
-    }
-
-    MTL_RENDER_PASS_ATTACHMENT_DESC &description() final {
-      return attachment_desc;
-    };
-
-    UINT readonlyFlags() final {
-      return this->desc.Flags;
-    };
-
-    Rc<Texture> texture() final {
-      return this->resource->underlying_texture_;
-    }
-
-    unsigned viewId() final {
-      return view_key_;
-    }
-
-    dxmt::Rc<dxmt::RenamableTexturePool> renamable() final {
-      return this->resource->renamable_;
+        DSVBase(pDesc, pResource, pDevice) {
+      this->texture_ = pResource->texture_.ptr();
+      this->view_id_ = this->texture_->createView(descriptor);
+      this->format_ = view_format;
+      this->pass_desc_ = attachment_desc;
+      this->renamable_ = pResource->renamable_.ptr();
+      this->readonly_flags_ = this->desc.Flags & 0b11;
+      this->subset_ = ResourceSubsetState(
+        &descriptor,
+        this->texture_->miplevelCount(),
+        this->texture_->arrayLength(),
+        this->readonly_flags_
+      );
     }
   };
 
 public:
   DeviceTexture(const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, MTLD3D11Device *pDevice) :
-      TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
-      underlying_texture_(std::move(u_texture)) {}
+      TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice) {
+        this->texture_ = std::move(u_texture);
+      }
 
   DeviceTexture(
       const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, Rc<RenamableTexturePool> &&renamable,
       MTLD3D11Device *pDevice
   ) :
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
-      underlying_texture_(std::move(u_texture)),
-      renamable_(std::move(renamable)) {}
+      renamable_(std::move(renamable)) {
+        this->texture_ = std::move(u_texture);
+      }
+
+  DeviceTexture(
+      const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, Rc<KeyedMutex> &&keyed_mutex,
+      MTLD3D11Device *pDevice
+  ) :
+      TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice) {
+        this->texture_ = std::move(u_texture);
+        this->keyed_mutex_ = std::move(keyed_mutex);
+      }
 
   DeviceTexture(
       const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, D3DKMT_HANDLE localHandle, D3DKMT_HANDLE globalHandle,
-      MTLD3D11Device *pDevice
+      Rc<KeyedMutex> && keyed_mutex, MTLD3D11Device *pDevice
   ) :
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
-      underlying_texture_(std::move(u_texture)), local_kmt_(localHandle), global_kmt_(globalHandle) {}
+      local_kmt_(localHandle), global_kmt_(globalHandle) {
+        this->texture_ = std::move(u_texture);
+        this->keyed_mutex_ = std::move(keyed_mutex);
+      }
 
   /* ml675: the bias lives on the resource, not in a process-global pointer map.
    * ml670 keyed it on the COM pointer and never erased on destruction, so a
@@ -284,7 +281,7 @@ public:
       ERR("DeviceTexture: cannot open a renamable texture on another device");
       return E_INVALIDARG;
     }
-    auto texture = this->underlying_texture_->shareTo(pDevice->GetMTLDevice());
+    auto texture = this->texture_->shareTo(pDevice->GetMTLDevice());
     if (!texture)
       return E_FAIL;
     auto desc = this->desc;
@@ -304,9 +301,6 @@ public:
     }
   }
 
-  Rc<Buffer> buffer() final { return {}; };
-  Rc<Texture> texture() final { return this->underlying_texture_; };
-  BufferSlice bufferSlice() final { return {};}
   Rc<StagingResource> staging(UINT) final { return nullptr; }
   Rc<DynamicBuffer> dynamicBuffer(UINT*, UINT*) final { return {}; }
   Rc<DynamicLinearTexture> dynamicLinearTexture(UINT*, UINT*) final { return {}; };
@@ -328,7 +322,7 @@ public:
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->underlying_texture_.ptr(), finalDesc,
+            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
         ))) {
       return E_FAIL;
@@ -336,8 +330,7 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    TextureViewKey key = underlying_texture_->createView(descriptor);
-    *ppView = ref(new TextureRTV(key, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
+    *ppView = ref(new TextureRTV(descriptor, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
     return S_OK;
   };
 
@@ -357,7 +350,7 @@ public:
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->underlying_texture_.ptr(), finalDesc,
+            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
         ))) {
       return E_FAIL;
@@ -365,8 +358,7 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    TextureViewKey key = underlying_texture_->createView(descriptor);
-    *ppView = ref(new TextureDSV(key, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
+    *ppView = ref(new TextureDSV(descriptor, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
     return S_OK;
   };
 
@@ -416,7 +408,7 @@ public:
       }
     }
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, physMips, arraySize, this->underlying_texture_.ptr(), physDesc, descriptor
+            this->m_parent, physMips, arraySize, this->texture_.ptr(), physDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture SRV");
       return E_FAIL;
@@ -424,8 +416,7 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    TextureViewKey key = underlying_texture_->createView(descriptor);
-    *ppView = ref(new TextureSRV(key, &finalDesc, this, this->m_parent));
+    *ppView = ref(new TextureSRV(descriptor, &finalDesc, this, this->m_parent));
     return S_OK;
   };
 
@@ -446,7 +437,7 @@ public:
       arraySize = this->desc.ArraySize;
     }
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->underlying_texture_.ptr(), finalDesc, descriptor
+            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture UAV");
       return E_FAIL;
@@ -454,8 +445,7 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    TextureViewKey key = underlying_texture_->createView(descriptor);
-    *ppView = ref(new TextureUAV(key, &finalDesc, this, this->m_parent));
+    *ppView = ref(new TextureUAV(descriptor, &finalDesc, this, this->m_parent));
     return S_OK;
   };
 
@@ -538,6 +528,7 @@ struct SharedResourceData {
     D3D11_TEXTURE2D_DESC1 desc2d;
     D3D11_TEXTURE3D_DESC1 desc3d;
   } desc;
+  D3DKMT_HANDLE mutex_handle;
 };
 
 
@@ -730,6 +721,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
    * Texture, not the D3D wrapper, so the bias must be visible there too. */
   texture->setMipBias(mip_bias);
 
+  MTL_DXGI_FORMAT_DESC format_desc;
+  MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
+
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
 
   auto initialize = [&](Rc<TextureAllocation> &&allocation) {
@@ -749,7 +743,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
                                   (size_t)sub.ArraySlice * finalDesc.MipLevels];
         initializer.initWithData(
             texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel, data.pSysMem, data.SysMemPitch,
-            data.SysMemSlicePitch
+            data.SysMemSlicePitch, format_desc.Flag
         );
       }
     }
@@ -768,6 +762,8 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     flags.set(TextureAllocationFlag::GpuPrivate);
     if (finalDesc.Usage == D3D11_USAGE_IMMUTABLE)
       flags.set(TextureAllocationFlag::GpuReadonly);
+    if (!(finalDesc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)))
+      flags.set(TextureAllocationFlag::ShaderReadonly);
     flags.set(TextureAllocationFlag::Shared);
     auto allocation = texture->allocate(flags);
 
@@ -809,6 +805,12 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     runtimeData.dimension = tag::dimension;
     memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
 
+    Rc<KeyedMutex> keyed_mutex = {};
+    if (finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+      keyed_mutex = KeyedMutex::create(pDevice->GetMTLDevice());
+    }
+    runtimeData.mutex_handle = keyed_mutex ? keyed_mutex->globalHandle() : 0;
+
     D3DKMT_CREATEALLOCATION create = {};
     create.hDevice = pDevice->GetLocalD3DKMT();
     create.pPrivateRuntimeData = &runtimeData;
@@ -831,12 +833,10 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       return E_FAIL;
     }
 
-    // TODO: handle keyed mutex
-
     initialize(std::move(allocation));
     {
       auto *tex = ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
-                                             create.hGlobalShare, pDevice));
+                                             create.hGlobalShare, std::move(keyed_mutex), pDevice));
       tex->SetMipBias(mip_bias);
       *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(tex);
     }
@@ -845,6 +845,8 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
 
   Flags<TextureAllocationFlag> flags;
   flags.set(finalDesc.CPUAccessFlags ? TextureAllocationFlag::GpuManaged : TextureAllocationFlag::GpuPrivate);
+  if (!(finalDesc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
   if (finalDesc.Usage == D3D11_USAGE_IMMUTABLE)
     flags.set(TextureAllocationFlag::GpuReadonly);
   if (single_subresource && (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
@@ -892,8 +894,8 @@ CreateDeviceTexture3D(MTLD3D11Device *pDevice,
 template <typename tag>
 HRESULT
 ImportSharedTextureInternal(
-    MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort, REFIID riid,
-    void **ppTexture
+    MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort,
+    D3DKMT_HANDLE hSharedKeyedMutex, REFIID riid, void **ppTexture
 ) {
   WMTTextureInfo info;
   typename tag::DESC1 finalDesc;
@@ -906,7 +908,11 @@ ImportSharedTextureInternal(
     return E_FAIL;
   texture->rename(std::move(allocation));
 
-  Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
+  Rc<KeyedMutex> keyed_mutex;
+  if (hSharedKeyedMutex & 0xc0000000)
+    keyed_mutex = KeyedMutex::import(pDevice->GetMTLDevice(), hSharedKeyedMutex);
+
+  Com<DeviceTexture<tag>> device_texture = (ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(keyed_mutex), pDevice)));
   return device_texture->QueryInterface(riid, ppTexture);
 }
 
@@ -975,15 +981,15 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
   {
   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
     return ImportSharedTextureInternal<tag_texture_1d>(
-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc1d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     return ImportSharedTextureInternal<tag_texture_2d>(
-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc2d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
     return ImportSharedTextureInternal<tag_texture_3d>(
-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc3d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");
@@ -1067,15 +1073,15 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
   {
   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
     return ImportSharedTextureInternal<tag_texture_1d>(
-        pDevice, &runtimeData.desc.desc1d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc1d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     return ImportSharedTextureInternal<tag_texture_2d>(
-        pDevice, &runtimeData.desc.desc2d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc2d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
     return ImportSharedTextureInternal<tag_texture_3d>(
-        pDevice, &runtimeData.desc.desc3d, mach_port, riid, ppTexture
+        pDevice, &runtimeData.desc.desc3d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");

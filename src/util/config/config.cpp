@@ -52,6 +52,18 @@ namespace dxmt {
     { R"(\\OMORI\.exe$)", {{
       { "dxgi.forceSDR",   "True" },
     }} },
+    /** Outcast: A New Beginning */
+    { R"(\\O2-Win64-Shipping\.exe$)", {{
+      { "d3d11.sampleNaNToZero",   "True" },
+    }} },
+    /** Shadow of the Tomb Raider */
+    { R"(\\SotTR\.exe$)", {{
+      { "d3d11.defuseFma",   "True" },
+    }} },
+    /** Helldivers 2 */
+    { R"(\\helldivers2\.exe$)", {{
+      { "d3d11.maxFeatureLevel",   "12_1" },
+    }} },
   }};
 
   const Config* findProfile(const ProfileList& profiles, const std::string& appName) {

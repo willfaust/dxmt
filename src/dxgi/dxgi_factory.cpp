@@ -5,6 +5,7 @@
 #include "dxgi_vk_interfaces.h"
 #include "com/com_guid.hpp"
 #include "log/log.hpp"
+#include "util_hotpatch.h"
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
@@ -79,6 +80,7 @@ public:
     return DXGI_ERROR_UNSUPPORTED;
   }
 
+  DXMT_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE
   CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
                   IDXGISwapChain **ppSwapChain) override {
@@ -112,6 +114,7 @@ public:
     return hr;
   }
 
+  DXMT_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(
       IUnknown *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
@@ -121,11 +124,9 @@ public:
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
 
-    // A device of DXMT's own, or a Direct3D 12 queue that presents through
-    // Vulkan (vkd3d-proton); see dxgi_swapchain_vk.cpp
-    Com<IMTLDXGIDevice> metal_dxgi_device;
+    Com<IMTLSwapChainFactory> swapchain_factory;
     Com<IDXGIVkSwapChainFactory> vk_swapchain_factory;
-    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&metal_dxgi_device))) &&
+    if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory))) &&
         (!VkSwapChainEnabled() ||
          FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&vk_swapchain_factory))))) {
       ERR("Unsupported device type");
@@ -151,14 +152,15 @@ public:
       fsDesc.Windowed = TRUE;
     }
 
-    if (metal_dxgi_device == nullptr)
+    if (swapchain_factory == nullptr)
       return CreateVkSwapChain(this, pDevice, vk_swapchain_factory.ptr(), hWnd,
                                &desc, &fsDesc, pRestrictToOutput, ppSwapChain);
 
-    return metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
+    return swapchain_factory->CreateSwapChain(this, hWnd, &desc, &fsDesc,
                                               ppSwapChain);
   }
 
+  DXMT_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
       IUnknown *pDevice, IUnknown *pWindow, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) override {
@@ -168,6 +170,7 @@ public:
     return E_NOTIMPL;
   }
 
+  DXMT_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(
       IUnknown *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) override {
