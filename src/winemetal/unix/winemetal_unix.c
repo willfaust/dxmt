@@ -7013,11 +7013,29 @@ _MTLTexture_getBytes(void *obj) {
     struct rm_texture_read_layout layout = {0};
     uint32_t received = 0;
     if (wmtr_call(RM_OP_TEXTURE_READ_LAYOUT, &query, sizeof(query), &layout, sizeof(layout), &received) != RM_OK ||
-        received != sizeof(layout) || layout.reserved || !layout.block_width || layout.block_width > 16 ||
+        received != sizeof(layout) || layout.reserved > RM_TEXTURE_READ_PVRTC || !layout.block_width || layout.block_width > 16 ||
         !layout.block_height || layout.block_height > 16 || !layout.block_bytes || layout.block_bytes > 16)
       return STATUS_UNSUCCESSFUL;
     uint64_t columns = (params->size.width - 1) / layout.block_width + 1;
     uint64_t rows = (params->size.height - 1) / layout.block_height + 1;
+    if (layout.reserved == RM_TEXTURE_READ_PVRTC) {
+      if (params->origin.x || params->origin.y || params->origin.z || params->size.depth != 1 || params->bytes_per_row)
+        return STATUS_INVALID_PARAMETER;
+      if (columns > SIZE_MAX / layout.block_bytes || rows > SIZE_MAX / (columns * layout.block_bytes))
+        return STATUS_INVALID_PARAMETER;
+      size_t length = (size_t)(columns * rows * layout.block_bytes);
+      if ((uintptr_t)params->data.ptr > UINTPTR_MAX - length) return STATUS_INVALID_PARAMETER;
+      for (size_t offset = 0; offset < length;) {
+        uint32_t bytes = (uint32_t)((length - offset) > RM_CHUNK_BYTES ? RM_CHUNK_BYTES : (length - offset));
+        struct rm_texture_read_pvrtc arg = {{params->texture, 0, 0, 0, params->size.width, params->size.height,
+                                            params->level, params->slice}, offset, bytes};
+        received = 0;
+        if (wmtr_call(RM_OP_TEXTURE_READ_PVRTC, &arg, sizeof(arg), (uint8_t *)params->data.ptr + offset,
+                      bytes, &received) != RM_OK || received != bytes) return STATUS_UNSUCCESSFUL;
+        offset += bytes;
+      }
+      return STATUS_SUCCESS;
+    }
     if (columns > SIZE_MAX / layout.block_bytes || params->origin.x > UINT64_MAX - params->size.width ||
         params->origin.y > UINT64_MAX - params->size.height || params->origin.z > UINT64_MAX - params->size.depth)
       return STATUS_INVALID_PARAMETER;
