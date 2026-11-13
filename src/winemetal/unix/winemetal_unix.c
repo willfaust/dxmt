@@ -7049,8 +7049,6 @@ _MTLTexture_getBytes(void *obj) {
     uint64_t columns = (params->size.width - 1) / layout.block_width + 1;
     uint64_t rows = (params->size.height - 1) / layout.block_height + 1;
     if (layout.reserved == RM_TEXTURE_READ_PVRTC) {
-      if (columns < 2) columns = 2;
-      if (rows < 2) rows = 2;
       if (params->origin.x || params->origin.y || params->origin.z || params->size.depth != 1 || params->bytes_per_row)
         return STATUS_INVALID_PARAMETER;
       if (columns > SIZE_MAX / layout.block_bytes || rows > SIZE_MAX / (columns * layout.block_bytes))
