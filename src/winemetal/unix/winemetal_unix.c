@@ -8926,13 +8926,14 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
   if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;
   struct WMTBufferInfo *info = translated.info.ptr;
   uint32_t guest_memory = (uint32_t)(uintptr_t)info->memory.ptr;
-  if (wmtr_enabled() && (info->options & 0x30) == WMTResourceStorageModeShared && !guest_memory)
+  int remote_shared = wmtr_enabled() && (info->options & 0x30) == WMTResourceStorageModeShared;
+  if (remote_shared && !guest_memory)
     return STATUS_NOT_IMPLEMENTED;
-  if (wmtr_enabled() && guest_memory && info->length > 0x100000000ull - guest_memory) {
+  if (remote_shared && info->length > 0x100000000ull - guest_memory) {
     info->memory.ptr = NULL; info->gpu_address = 0;
     return STATUS_INVALID_PARAMETER;
   }
-  if (wmtr_enabled() && guest_memory) info->memory.ptr = UInt32ToPtr(guest_memory);
+  if (remote_shared) info->memory.ptr = UInt32ToPtr(guest_memory);
   if (!wmtr_enabled() && [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate) {
     bool reserved = info->gpu_address == WMT_HEAP_GUEST_RESERVATION;
     info->memory.ptr = NULL;
