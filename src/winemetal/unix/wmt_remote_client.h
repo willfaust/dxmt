@@ -779,6 +779,9 @@ static int wmtr_heap_attach(uint64_t handle, uint64_t heap_handle, uint64_t offs
 
 /* Send only bytes changed by the CPU, so a stale alias cannot overwrite GPU data. */
 static int wmtr_heap_flush_locked(void) {
+    struct wmtr_heap *active = wmtr_heaps;
+    while (active && !active->buffers) active = active->next;
+    if (!active) return 0;
     uint8_t *scratch = malloc(RM_CHUNK_BYTES);
     if (!scratch) return -1;
     int failed = 0;
@@ -814,7 +817,9 @@ static int wmtr_heap_flush(void) {
 /* Preserve CPU writes made after submission while applying the completed GPU data. */
 static int wmtr_heap_sync(void) {
     pthread_mutex_lock(&wmtr_bufs_lock);
-    if (!wmtr_heaps) { pthread_mutex_unlock(&wmtr_bufs_lock); return 0; }
+    struct wmtr_heap *active = wmtr_heaps;
+    while (active && !active->buffers) active = active->next;
+    if (!active) { pthread_mutex_unlock(&wmtr_bufs_lock); return 0; }
     uint8_t *scratch = malloc(RM_CHUNK_BYTES);
     if (!scratch) { pthread_mutex_unlock(&wmtr_bufs_lock); return -1; }
     int failed = 0;
