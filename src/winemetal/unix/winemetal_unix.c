@@ -39,6 +39,8 @@ extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name,
 #include <bootstrap.h>
 #endif
 #include <mach/mach_port.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 /* ml1050: mach_absolute_time / mach_timebase_info / mach_wait_until for the
  * present limiter and the frame timers. */
 #include <mach/mach_time.h>
@@ -8790,9 +8792,42 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
   struct unixcall_mtlheap_newbuffer translated = *original;
   translated.info.ptr = UInt32ToPtr((uint32_t)(uintptr_t)original->info.ptr);
   if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;
-  /* shortcut: shared heap memory is not guest-addressable, add guest-backed heaps before enabling it. */
-  if (!wmtr_enabled() && [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate)
-    return STATUS_NOT_IMPLEMENTED;
+  struct WMTBufferInfo *info = translated.info.ptr;
+  uint32_t guest_memory = (uint32_t)(uintptr_t)info->memory.ptr;
+  if (!wmtr_enabled() && [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate) {
+    bool reserved = info->gpu_address == WMT_HEAP_GUEST_RESERVATION;
+    info->memory.ptr = NULL;
+    info->gpu_address = 0;
+    if (!reserved || !guest_memory) return STATUS_NOT_IMPLEMENTED;
+    size_t page = vm_page_size;
+    if (!page || page > 65536 || (page & (page - 1)) || !info->length ||
+        info->length > UINT32_MAX - 65536u || guest_memory % page ||
+        (uint64_t)guest_memory + info->length + 65536u > 0x100000000ull)
+      return STATUS_INVALID_PARAMETER;
+    NTSTATUS status = _MTLHeap_newBuffer(&translated);
+    id<MTLBuffer> buffer = (id<MTLBuffer>)translated.ret;
+    if (status != STATUS_SUCCESS || !buffer || !info->memory.ptr) {
+      [buffer release]; info->memory.ptr = NULL; info->gpu_address = 0;
+      return STATUS_UNSUCCESSFUL;
+    }
+    uintptr_t source = (uintptr_t)info->memory.ptr;
+    size_t page_offset = source & (page - 1);
+    size_t map_length = ((size_t)info->length + page_offset + page - 1) & ~(page - 1);
+    vm_address_t target = (vm_address_t)(uintptr_t)UInt32ToPtr(guest_memory);
+    vm_address_t expected = target;
+    vm_prot_t current, maximum;
+    kern_return_t result = vm_remap(mach_task_self(), &target, map_length, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    mach_task_self(), (vm_address_t)(source - page_offset), FALSE,
+                                    &current, &maximum, VM_INHERIT_NONE);
+    if (result != KERN_SUCCESS || target != expected ||
+        (current & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) {
+      [buffer release]; info->memory.ptr = NULL; info->gpu_address = 0;
+      return STATUS_UNSUCCESSFUL;
+    }
+    info->memory.ptr = (void *)(uintptr_t)(guest_memory + page_offset);
+    original->ret = translated.ret;
+    return STATUS_SUCCESS;
+  }
   NTSTATUS status = _MTLHeap_newBuffer(&translated);
   original->ret = translated.ret;
   return status;

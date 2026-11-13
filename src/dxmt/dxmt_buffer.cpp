@@ -25,6 +25,9 @@
 #include <cassert>
 #include <mutex>
 #include "dxmt_mem_census.hpp"
+#if defined(__i386__) && !defined(DXMT_MADEIRA)
+#include <windows.h>
+#endif
 
 namespace dxmt {
 
@@ -76,6 +79,15 @@ BufferAllocation::BufferAllocation(
   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
     assert(0 && "heap doesn't support placed buffer");
   }
+#if defined(__i386__) && !defined(DXMT_MADEIRA)
+  if (!(heap.handle >> 63) && !flags_.test(BufferAllocationFlag::CpuInvisible) && info_.length <= SIZE_MAX - 65536) {
+    // Write-watch keeps Wine's optional swap backing away from these Metal aliases.
+    heap_mapping_ = VirtualAlloc(nullptr, (SIZE_T)info_.length + 65536,
+                                 MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    info_.memory.set(heap_mapping_);
+    if (heap_mapping_) info_.gpu_address = WMT_HEAP_GUEST_RESERVATION;
+  }
+#endif
   obj_ = heap.newBuffer(info_, heap_offset);
   g_live_bufalloc.created.fetch_add(1, std::memory_order_relaxed);
   gpuAddress_ = info_.gpu_address;
@@ -92,6 +104,12 @@ BufferAllocation::free() {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
   }
+#if defined(__i386__) && !defined(DXMT_MADEIRA)
+  if (heap_mapping_) {
+    VirtualFree(heap_mapping_, 0, MEM_RELEASE);
+    heap_mapping_ = nullptr;
+  }
+#endif
   delete this;
 }
 

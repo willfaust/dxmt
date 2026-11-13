@@ -184,6 +184,9 @@ private:
   uint32_t suballocation_count_ = 1;
 
   void * placed_buffer = nullptr;
+#if defined(__i386__) && !defined(DXMT_MADEIRA)
+  void *heap_mapping_ = nullptr;
+#endif
 };
 
 class Buffer {

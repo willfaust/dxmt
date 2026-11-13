@@ -199,6 +199,8 @@ struct WMTConstMemoryPointer {
 STATIC_ASSERT(sizeof(WMTMemoryPointer) == 8);
 STATIC_ASSERT(sizeof(WMTConstMemoryPointer) == 8);
 
+/* Marks a dedicated 32-bit guest reservation supplied for a local heap alias. */
+#define WMT_HEAP_GUEST_RESERVATION UINT64_C(0x574d54484541504d)
 struct WMTBufferInfo {
   uint64_t length;                 // in
   enum WMTResourceOptions options; // in
