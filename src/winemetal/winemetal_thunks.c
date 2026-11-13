@@ -8,6 +8,11 @@
 #include <wineunixlib.h>
 #include "assert.h"
 #include "string.h"
+#ifdef _WIN32
+#include <windows.h>
+#include <stdlib.h>
+#include "wmt_heap_arena.h"
+#endif
 
 /* ml761: top-level API census.
  *
@@ -48,11 +53,17 @@ extern void wmt_api_census_note(unsigned code);
 WINEMETAL_API void
 NSObject_retain(obj_handle_t obj) {
   UNIX_CALL(0, &obj);
+#ifdef _WIN32
+  wmt_heap_reference(obj, 1);
+#endif
 }
 
 WINEMETAL_API void
 NSObject_release(obj_handle_t obj) {
   UNIX_CALL(1, &obj);
+#ifdef _WIN32
+  wmt_heap_reference(obj, 0);
+#endif
 }
 
 WINEMETAL_API obj_handle_t
@@ -1410,6 +1421,13 @@ MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
   params.device = device;
   WMT_MEMPTR_SET(params.info, info);
   UNIX_CALL(162, &params);
+#ifdef _WIN32
+  if (params.ret && (params.ret >> 63) && info && (info->options & 0x30) == WMTResourceStorageModeShared &&
+      !wmt_heap_create(params.ret, info->size)) {
+    NSObject_release(params.ret);
+    return 0;
+  }
+#endif
   return params.ret;
 }
 
@@ -1441,10 +1459,24 @@ MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *in
 WINEMETAL_API obj_handle_t
 MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
   struct unixcall_mtlheap_newbuffer params = {0};
+#ifdef _WIN32
+  struct wmt_heap_buffer *token = NULL;
+  void *shadow = NULL;
+  int prepared = info ? wmt_heap_begin(heap, offset, info->length, &shadow, &token) : 0;
+  if (prepared < 0) { WMT_MEMPTR_SET(info->memory, NULL); info->gpu_address = 0; return 0; }
+  if (prepared > 0) WMT_MEMPTR_SET(info->memory, shadow);
+#endif
   params.heap = heap;
   WMT_MEMPTR_SET(params.info, info);
   params.offset = offset;
-  UNIX_CALL(165, &params);
+  wmt_api_census_note(165);
+  if (WINE_UNIX_CALL(165, &params)) {
+    params.ret = 0;
+    if (info) { WMT_MEMPTR_SET(info->memory, NULL); info->gpu_address = 0; }
+  }
+#ifdef _WIN32
+  if (token) wmt_heap_finish(token, params.ret);
+#endif
   return params.ret;
 }
 

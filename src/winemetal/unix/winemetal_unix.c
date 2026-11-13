@@ -167,6 +167,7 @@ _NSObject_retain(NSObject **obj) {
     struct rm_arg_handle a = { (uint64_t)(uintptr_t)*obj };
     struct rm_ret_handle r;
     wmtr_buf_retain(a.handle);   /* ml820: no-op unless it is a registered buffer */
+    wmtr_heap_reference(a.handle, 1);
     /* The host returns the SAME handle; identity must not change under retain. */
     wmtr_call(RM_OP_RETAIN, &a, sizeof a, &r, sizeof r, 0);
     return STATUS_SUCCESS;
@@ -249,6 +250,7 @@ _NSObject_release(NSObject **obj) {
   if (wmtr_enabled() && RM_IS_REMOTE((uint64_t)(uintptr_t)*obj)) {
     struct rm_arg_handle a = { (uint64_t)(uintptr_t)*obj };
     wmtr_buf_remove(a.handle);   /* ml820: retires only on the LAST guest reference */
+    wmtr_heap_reference(a.handle, 0);
     wmtr_call(RM_OP_RELEASE, &a, sizeof a, 0, 0, 0);
     return STATUS_SUCCESS;
   }
@@ -623,10 +625,9 @@ _MTLCommandBuffer_commit(void *obj) {
     /* Push guest shadows BEFORE the GPU reads them. The app writes into buffer
      * contents with no call of its own, so this is the last point at which the
      * host copy can be made to match. */
-    wmtr_flush_buffers();
+    if (wmtr_flush_buffers()) return STATUS_UNSUCCESSFUL;
     struct rm_arg_handle a = { params->handle };
-    wmtr_call(RM_OP_COMMIT, &a, sizeof a, 0, 0, 0);
-    return STATUS_SUCCESS;
+    return wmtr_call(RM_OP_COMMIT, &a, sizeof a, 0, 0, 0) == RM_OK ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
   }
   /* ml1140: retirement belongs to the GPU completion, not waitUntilCompleted.
    * The finish thread skips that wait for buffers already completed, so the
@@ -650,8 +651,9 @@ _MTLCommandBuffer_waitUntilCompleted(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   if (wmtr_enabled()) {
     struct rm_arg_handle a = { params->handle };
-    wmtr_call(RM_OP_WAIT_COMPLETED, &a, sizeof a, 0, 0, 0);
+    if (wmtr_call(RM_OP_WAIT_COMPLETED, &a, sizeof a, 0, 0, 0) != RM_OK) return STATUS_UNSUCCESSFUL;
     wmtr_rb_drain(params->handle);   /* ml820: GPU results back before the guest reads them */
+    if (wmtr_heap_sync()) return STATUS_UNSUCCESSFUL;
     return STATUS_SUCCESS;
   }
   [(id<MTLCommandBuffer>)params->handle waitUntilCompleted];
@@ -665,7 +667,10 @@ _MTLCommandBuffer_status(void *obj) {
     struct rm_arg_handle a = { params->handle };
     struct rm_ret_u64 r;
     params->ret = (wmtr_call(RM_OP_CMDBUF_STATUS, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.value : 0;
-    if (params->ret >= WMTCommandBufferStatusCompleted) wmtr_rb_drain(params->handle);   /* ml820 */
+    if (params->ret >= WMTCommandBufferStatusCompleted) {
+      wmtr_rb_drain(params->handle);
+      if (wmtr_heap_sync()) return STATUS_UNSUCCESSFUL;
+    }
     return STATUS_SUCCESS;
   }
   params->ret = [(id<MTLCommandBuffer>)params->handle status];
@@ -6173,7 +6178,10 @@ _MTLBuffer_updateContents(void *obj) {
      * table across a memcpy and an RPC. */
     struct wmtr_buf b;
     const int found = wmtr_buf_lookup(params->buffer, &b);
-    const int in_range = found && params->offset + params->length <= b.length;
+    const int in_range = found && params->offset <= b.length && params->length <= b.length - params->offset;
+
+    if (found && b.heap)
+      return wmtr_heap_update(params->buffer, params->offset, params->data.ptr, params->length) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
 
     if (found && b.shadow && in_range) {
       memcpy((char *)b.shadow + params->offset, params->data.ptr, params->length);
@@ -6751,6 +6759,12 @@ _MTLDevice_newHeap(void *obj) {
     struct rm_ret_handle result = {0};
     if (wmtr_call(RM_OP_HEAP_CREATE, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK)
       return STATUS_UNSUCCESSFUL;
+    if (result.handle && (info->options & 0x30) == WMTResourceStorageModeShared &&
+        wmtr_heap_register(result.handle, info->size)) {
+      struct rm_arg_handle release = {result.handle};
+      wmtr_call(RM_OP_RELEASE, &release, sizeof(release), NULL, 0, NULL);
+      return STATUS_UNSUCCESSFUL;
+    }
     params->ret = result.handle;
     return STATUS_SUCCESS;
   }
@@ -6844,15 +6858,29 @@ _MTLHeap_newBuffer(void *obj) {
   if (wmtr_enabled()) {
     params->ret = 0;
     if (!info) return STATUS_INVALID_PARAMETER;
+    void *shadow = info->memory.ptr;
+    int shared = (info->options & 0x30) == WMTResourceStorageModeShared;
     info->memory.ptr = NULL;
     info->gpu_address = 0;
+    if (shared && !shadow) shadow = wmtr_heap_native_pointer(params->heap, params->offset, info->length);
+    if (shared && (!shadow || params->offset == UINT64_MAX || wmtr_heap_flush())) return STATUS_UNSUCCESSFUL;
     struct rm_heap_new_buffer arg = {params->heap, params->offset, info->length, info->options};
     struct rm_ret_handle_u64 result = {0};
     if (wmtr_call(RM_OP_HEAP_NEW_PRIVATE_BUFFER, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK)
       return STATUS_UNSUCCESSFUL;
     params->ret = result.handle;
     info->gpu_address = result.value;
-    if (result.handle) wmtr_buf_add(result.handle, NULL, info->length, info->options, 0, 0);
+    if (result.handle) {
+      wmtr_buf_add(result.handle, shared ? shadow : NULL, info->length, info->options, shared, 0);
+      if (shared && (wmtr_heap_attach(result.handle, params->heap, params->offset, shadow, info->length) || wmtr_heap_sync())) {
+        wmtr_buf_remove(result.handle);
+        struct rm_arg_handle release = {result.handle};
+        wmtr_call(RM_OP_RELEASE, &release, sizeof(release), NULL, 0, NULL);
+        params->ret = 0; info->gpu_address = 0;
+        return STATUS_UNSUCCESSFUL;
+      }
+      info->memory.ptr = shared ? shadow : NULL;
+    }
     return STATUS_SUCCESS;
   }
   id<MTLHeap> heap = (id<MTLHeap>)params->heap;
@@ -8459,7 +8487,18 @@ static NTSTATUS
 _MadeiraMTLDevice_heapTextureSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heaptexturesizealign *params = obj;
   params->ret_size = 0; params->ret_align = 0;
-  if (wmtr_enabled()) return STATUS_SUCCESS;
+  if (wmtr_enabled()) {
+    struct WMTTextureInfo *info = params->info.ptr;
+    if (!info) return STATUS_INVALID_PARAMETER;
+    struct { struct rm_wmt_info header; struct WMTTextureInfo info; } payload = {
+      {params->device, sizeof(*info), 0}, *info
+    };
+    struct rm_size_and_align result = {0};
+    if (wmtr_call(RM_OP_HEAP_TEXTURE_SIZE, &payload, sizeof(payload), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret_size = result.size; params->ret_align = result.align;
+    return STATUS_SUCCESS;
+  }
   {
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
     fill_texture_descriptor(desc, params->info.ptr);
@@ -8473,7 +8512,18 @@ static NTSTATUS
 _MTLDevice_newPlacementHeap(void *obj) {
   struct unixcall_mtldevice_newplacementheap *params = obj;
   params->ret = 0;
-  if (wmtr_enabled()) return STATUS_SUCCESS;
+  if (wmtr_enabled()) {
+    if ((params->options & 0x30) != WMTResourceStorageModePrivate) return STATUS_SUCCESS;
+    struct WMTHeapInfo info = {0};
+    info.size = params->size;
+    info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeTracked;
+    info.type = WMTHeapTypePlacement;
+    struct unixcall_mtldevice_newheap call = {0};
+    call.device = params->device; call.info.ptr = &info;
+    NTSTATUS status = _MTLDevice_newHeap(&call);
+    params->ret = call.ret;
+    return status;
+  }
   {
     MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
     hd.type = MTLHeapTypePlacement;
@@ -8490,7 +8540,13 @@ _MTLHeap_newTextureAtOffset(void *obj) {
   struct unixcall_mtlheap_newtextureatoffset *params = obj;
   struct WMTTextureInfo *info = params->info.ptr;
   params->ret = 0;
-  if (wmtr_enabled()) return STATUS_SUCCESS;
+  if (wmtr_enabled()) {
+    struct unixcall_mtlheap_newtexture call = {0};
+    call.heap = params->heap; call.info = params->info; call.offset = params->offset;
+    NTSTATUS status = _MTLHeap_newTexture(&call);
+    params->ret = call.ret;
+    return status;
+  }
   {
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
     fill_texture_descriptor(desc, info);
@@ -8508,7 +8564,14 @@ static NTSTATUS
 _MadeiraMTLDevice_heapBufferSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heapbuffersizealign *params = obj;
   params->ret_size = 0; params->ret_align = 0;
-  if (wmtr_enabled()) return STATUS_SUCCESS;
+  if (wmtr_enabled()) {
+    struct rm_heap_buffer_size arg = {params->device, params->length, params->options};
+    struct rm_size_and_align result = {0};
+    if (wmtr_call(RM_OP_HEAP_BUFFER_SIZE, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK)
+      return STATUS_UNSUCCESSFUL;
+    params->ret_size = result.size; params->ret_align = result.align;
+    return STATUS_SUCCESS;
+  }
   {
     MTLSizeAndAlign sa = [(id<MTLDevice>)params->device heapBufferSizeAndAlignWithLength:params->length
                                                                                   options:madeira_cpu_cache_mode((MTLResourceOptions)params->options)];
@@ -8521,7 +8584,18 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   struct unixcall_mtlheap_newbufferatoffset *params = obj;
   struct WMTBufferInfo *info = params->info.ptr;
   params->ret = 0;
-  if (wmtr_enabled()) return STATUS_SUCCESS;
+  if (wmtr_enabled()) {
+    if (!info) return STATUS_INVALID_PARAMETER;
+    if ((info->options & 0x30) != WMTResourceStorageModePrivate) {
+      info->memory.ptr = NULL; info->gpu_address = 0;
+      return STATUS_SUCCESS;
+    }
+    struct unixcall_mtlheap_newbuffer call = {0};
+    call.heap = params->heap; call.info = params->info; call.offset = params->offset;
+    NTSTATUS status = _MTLHeap_newBuffer(&call);
+    params->ret = call.ret;
+    return status;
+  }
   {
     id<MTLBuffer> b = [(id<MTLHeap>)params->heap newBufferWithLength:info->length
                                                              options:madeira_cpu_cache_mode((MTLResourceOptions)info->options)
@@ -8796,6 +8870,13 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
   if (!translated.info.ptr) return STATUS_INVALID_PARAMETER;
   struct WMTBufferInfo *info = translated.info.ptr;
   uint32_t guest_memory = (uint32_t)(uintptr_t)info->memory.ptr;
+  if (wmtr_enabled() && (info->options & 0x30) == WMTResourceStorageModeShared && !guest_memory)
+    return STATUS_NOT_IMPLEMENTED;
+  if (wmtr_enabled() && guest_memory && info->length > 0x100000000ull - guest_memory) {
+    info->memory.ptr = NULL; info->gpu_address = 0;
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (wmtr_enabled() && guest_memory) info->memory.ptr = UInt32ToPtr(guest_memory);
   if (!wmtr_enabled() && [(id<MTLHeap>)original->heap storageMode] != MTLStorageModePrivate) {
     bool reserved = info->gpu_address == WMT_HEAP_GUEST_RESERVATION;
     info->memory.ptr = NULL;
@@ -8831,6 +8912,7 @@ static NTSTATUS _MTLHeap_newBuffer_wow64(void *obj) {
     return STATUS_SUCCESS;
   }
   NTSTATUS status = _MTLHeap_newBuffer(&translated);
+  if (wmtr_enabled() && info->memory.ptr) info->memory.ptr = (void *)(uintptr_t)guest_memory;
   original->ret = translated.ret;
   return status;
 }
