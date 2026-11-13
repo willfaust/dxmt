@@ -798,13 +798,38 @@ static int wmtr_heap_attach(uint64_t handle, uint64_t heap_handle, uint64_t offs
     return result;
 }
 
+struct wmtr_heap_batch {
+    uint8_t *wire;
+    uint32_t count, bytes;
+    struct rm_buffer_range ranges[RM_MULTI_MAX_RANGES];
+    uint8_t *baseline[RM_MULTI_MAX_RANGES];
+};
+static int wmtr_heap_batch_send(struct wmtr_heap_batch *batch) {
+    if (!batch->count) return 0;
+    struct rm_buffer_multi *header=(void *)batch->wire;
+    header->count=batch->count; header->data_bytes=batch->bytes;
+    uint8_t *data=batch->wire+sizeof(*header);
+    memcpy(data+batch->bytes,batch->ranges,batch->count*sizeof(batch->ranges[0]));
+    uint32_t size=(uint32_t)(sizeof(*header)+batch->bytes+batch->count*sizeof(batch->ranges[0]));
+    if (wmtr_call(RM_OP_BUFFER_UPLOAD_MULTI,batch->wire,size,NULL,0,NULL)!=RM_OK) return -1;
+    size_t off=0;
+    for (uint32_t i=0;i<batch->count;i++) {
+        memcpy(batch->baseline[i],data+off,(size_t)batch->ranges[i].length);
+        off+=(size_t)batch->ranges[i].length;
+    }
+    batch->count=0; batch->bytes=0;
+    return 0;
+}
+
 /* Send only bytes changed by the CPU, so a stale alias cannot overwrite GPU data. */
 static int wmtr_heap_flush_locked(void) {
     struct wmtr_heap *active = wmtr_heaps;
     while (active && !active->buffers) active = active->next;
     if (!active) return 0;
-    uint8_t *scratch = malloc(RM_CHUNK_BYTES);
-    if (!scratch) return -1;
+    struct wmtr_heap_batch batch = {0};
+    batch.wire = malloc(RM_CHUNK_BYTES);
+    if (!batch.wire) return -1;
+    const uint32_t data_cap=RM_CHUNK_BYTES-sizeof(struct rm_buffer_multi)-RM_MULTI_MAX_RANGES*sizeof(struct rm_buffer_range);
     int failed = 0;
     for (struct wmtr_buf_chunk *chunk = wmtr_chunks; chunk && !failed; chunk = chunk->next)
     for (unsigned ci = 0; ci < chunk->used && !failed; ci++) {
@@ -813,21 +838,31 @@ static int wmtr_heap_flush_locked(void) {
         uint8_t *guest = b->shadow, *baseline = b->heap->baseline + b->heap_offset;
         uint64_t i = 0;
         while (i < b->length) {
-            size_t unchanged = (size_t)((b->length-i > 65536) ? 65536 : b->length-i);
-            if (!memcmp(guest+i,baseline+i,unchanged)) { i+=unchanged; continue; }
-            uint8_t value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
-            if (value == baseline[i]) { i++; continue; }
-            uint64_t start = i, count = 0;
-            do {
-                scratch[count++] = value; i++;
-                if (i == b->length || count == RM_CHUNK_BYTES) break;
-                value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
-            } while (value != baseline[i]);
-            if (wmtr_buf_upload(b->handle, scratch, start, count)) { failed = 1; break; }
-            memcpy(baseline + start, scratch, (size_t)count);
+            size_t block = (size_t)((b->length-i > 65536) ? 65536 : b->length-i);
+            uint64_t end = i + block;
+            if (!memcmp(guest+i,baseline+i,block)) { i=end; continue; }
+            while (i < end) {
+                uint8_t value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
+                if (value == baseline[i]) { i++; continue; }
+                uint64_t start = i; uint32_t count = 0;
+                do {
+                    batch.wire[sizeof(struct rm_buffer_multi)+batch.bytes+count++] = value; i++;
+                    if (i == b->length || count == data_cap-batch.bytes) break;
+                    value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
+                } while (value != baseline[i]);
+                batch.ranges[batch.count]=(struct rm_buffer_range){b->handle,start,count};
+                batch.baseline[batch.count]=baseline+start;
+                batch.count++; batch.bytes+=count;
+                if ((batch.count == RM_MULTI_MAX_RANGES || batch.bytes == data_cap) && wmtr_heap_batch_send(&batch)) {
+                    failed = 1; break;
+                }
+            }
+            if (failed) break;
         }
+        if (!failed && wmtr_heap_batch_send(&batch)) failed=1;
     }
-    free(scratch);
+    if (!failed && wmtr_heap_batch_send(&batch)) failed=1;
+    free(batch.wire);
     return failed ? -1 : 0;
 }
 static int wmtr_heap_flush(void) {
