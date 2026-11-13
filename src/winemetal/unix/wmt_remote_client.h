@@ -813,6 +813,8 @@ static int wmtr_heap_flush_locked(void) {
         uint8_t *guest = b->shadow, *baseline = b->heap->baseline + b->heap_offset;
         uint64_t i = 0;
         while (i < b->length) {
+            size_t unchanged = (size_t)((b->length-i > 65536) ? 65536 : b->length-i);
+            if (!memcmp(guest+i,baseline+i,unchanged)) { i+=unchanged; continue; }
             uint8_t value = __atomic_load_n(guest + i, __ATOMIC_RELAXED);
             if (value == baseline[i]) { i++; continue; }
             uint64_t start = i, count = 0;
@@ -855,10 +857,19 @@ static int wmtr_heap_sync(void) {
             if (wmtr_call(RM_OP_BUFFER_READ, &range, sizeof(range), scratch, n, &got) != RM_OK || got != n) {
                 failed = 1; break;
             }
-            for (uint32_t i = 0; i < n; i++) {
-                uint8_t expected = baseline[off + i];
-                __atomic_compare_exchange_n(guest + off + i, &expected, scratch[i], 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-                baseline[off + i] = scratch[i];
+            if (!memcmp(baseline+off,scratch,n)) { off+=n; continue; }
+            for (uint32_t block = 0; block < n;) {
+                uint32_t count = n-block > 64 ? 64 : n-block;
+                if (memcmp(baseline+off+block,scratch+block,count)) {
+                    for (uint32_t i=block;i<block+count;i++) {
+                        uint8_t expected=baseline[off+i];
+                        if (expected != scratch[i]) {
+                            __atomic_compare_exchange_n(guest+off+i,&expected,scratch[i],0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);
+                            baseline[off+i]=scratch[i];
+                        }
+                    }
+                }
+                block += count;
             }
             off += n;
         }
@@ -879,7 +890,7 @@ static int wmtr_heap_update(uint64_t handle, uint64_t offset, const void *data, 
             result = 0;
             for (uint64_t off = 0; off < length;) {
                 size_t n = (size_t)((length - off > RM_CHUNK_BYTES) ? RM_CHUNK_BYTES : length - off);
-                for (size_t i = 0; i < n; i++) scratch[i] = __atomic_load_n(guest + off + i, __ATOMIC_RELAXED);
+                memcpy(scratch, guest + off, n);
                 if (wmtr_buf_upload(handle, scratch, offset + off, n)) { result = -1; break; }
                 memcpy(b->heap->baseline + b->heap_offset + offset + off, scratch, n);
                 off += n;
