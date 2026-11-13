@@ -1465,6 +1465,7 @@ MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset
   int prepared = info ? wmt_heap_begin(heap, offset, info->length, &shadow, &token) : 0;
   if (prepared < 0) { WMT_MEMPTR_SET(info->memory, NULL); info->gpu_address = 0; return 0; }
   if (prepared > 0) WMT_MEMPTR_SET(info->memory, shadow);
+  if (prepared > 0 && offset == UINT64_MAX) info->gpu_address = WMT_HEAP_AUTO_SHADOW | token->offset;
 #endif
   params.heap = heap;
   WMT_MEMPTR_SET(params.info, info);

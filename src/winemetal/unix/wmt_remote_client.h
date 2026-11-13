@@ -382,6 +382,7 @@ struct wmtr_buf_chunk {
 static struct wmtr_buf_chunk *wmtr_chunks;
 static unsigned long wmtr_bufs_live;
 static pthread_mutex_t wmtr_bufs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t wmtr_heap_creation_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct wmtr_heap *wmtr_heaps;
 
 /* All heap records and their guest pointers are protected by wmtr_bufs_lock. */
@@ -395,7 +396,7 @@ static void wmtr_heap_dispose_locked(struct wmtr_heap *heap) {
     free(heap);
 }
 static int wmtr_heap_register(uint64_t handle, uint64_t size) {
-    if (!size || size > SIZE_MAX) return -1;
+    if (!size || size > SIZE_MAX || size >= WMT_HEAP_AUTO_SHADOW) return -1;
     struct wmtr_heap *heap = calloc(1, sizeof(*heap));
     if (!heap) return -1;
     heap->baseline = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -416,18 +417,38 @@ static void wmtr_heap_reference(uint64_t handle, int retain) {
     }
     pthread_mutex_unlock(&wmtr_bufs_lock);
 }
-static void *wmtr_heap_native_pointer(uint64_t handle, uint64_t offset, uint64_t length) {
+/* Automatic heaps have no simultaneous aliases: this bridge does not expose makeAliasable. */
+/* Caller serializes automatic allocations until the new buffer is attached. */
+static void *wmtr_heap_native_pointer(uint64_t handle, uint64_t *offset, uint64_t length) {
     void *result = NULL;
     pthread_mutex_lock(&wmtr_bufs_lock);
     struct wmtr_heap *heap = wmtr_heaps;
     while (heap && heap->handle != handle) heap = heap->next;
-    if (heap && heap->refs && length && offset <= heap->size && length <= heap->size - offset) {
+    if (heap && heap->refs && length && length <= heap->size && (!heap->guest || heap->guest_owned)) {
+        if (*offset == UINT64_MAX) {
+            *offset = 0;
+            for (;;) {
+                uint64_t next = *offset;
+                for (struct wmtr_buf_chunk *c=wmtr_chunks; c; c=c->next)
+                    for (unsigned i=0; i<c->used; i++) {
+                        struct wmtr_buf *b=&c->entries[i];
+                        if (b->heap==heap && *offset < b->heap_offset+b->length &&
+                            b->heap_offset < *offset+length && b->heap_offset+b->length > next)
+                            next=b->heap_offset+b->length;
+                    }
+                if (next == *offset) break;
+                *offset=next;
+                if (*offset > heap->size || length > heap->size-*offset) break;
+            }
+        }
+        if (*offset > heap->size || length > heap->size-*offset) goto done;
         if (!heap->guest) {
             void *memory = mmap(NULL, (size_t)heap->size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (memory != MAP_FAILED) { heap->guest = memory; heap->guest_owned = 1; }
         }
-        if (heap->guest) result = heap->guest + (size_t)offset;
+        if (heap->guest) result = heap->guest + (size_t)*offset;
     }
+done:
     pthread_mutex_unlock(&wmtr_bufs_lock);
     return result;
 }

@@ -149,6 +149,7 @@ typedef int NTSTATUS;
  * and before the first routed handler; the packer's include sits much further
  * down, past every handler this routes. */
 #include "wmt_remote_client.h"
+static __thread uint64_t wmtr_texture_guest_limit = UINT64_MAX;
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -6860,27 +6861,40 @@ _MTLHeap_newBuffer(void *obj) {
     if (!info) return STATUS_INVALID_PARAMETER;
     void *shadow = info->memory.ptr;
     int shared = (info->options & 0x30) == WMTResourceStorageModeShared;
+    uint64_t shadow_offset = params->offset;
+    uint64_t hint = info->gpu_address;
     info->memory.ptr = NULL;
     info->gpu_address = 0;
-    if (shared && !shadow) shadow = wmtr_heap_native_pointer(params->heap, params->offset, info->length);
-    if (shared && (!shadow || params->offset == UINT64_MAX || wmtr_heap_flush())) return STATUS_UNSUCCESSFUL;
+    if (shared) {
+      pthread_mutex_lock(&wmtr_heap_creation_lock);
+      if (shadow && shadow_offset == UINT64_MAX) {
+        if (!(hint & WMT_HEAP_AUTO_SHADOW)) { pthread_mutex_unlock(&wmtr_heap_creation_lock); return STATUS_UNSUCCESSFUL; }
+        shadow_offset = hint & ~WMT_HEAP_AUTO_SHADOW;
+      }
+      if (!shadow) shadow = wmtr_heap_native_pointer(params->heap, &shadow_offset, info->length);
+      if (!shadow || wmtr_heap_flush()) { pthread_mutex_unlock(&wmtr_heap_creation_lock); return STATUS_UNSUCCESSFUL; }
+    }
     struct rm_heap_new_buffer arg = {params->heap, params->offset, info->length, info->options};
     struct rm_ret_handle_u64 result = {0};
-    if (wmtr_call(RM_OP_HEAP_NEW_PRIVATE_BUFFER, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK)
+    if (wmtr_call(RM_OP_HEAP_NEW_PRIVATE_BUFFER, &arg, sizeof(arg), &result, sizeof(result), NULL) != RM_OK) {
+      if (shared) pthread_mutex_unlock(&wmtr_heap_creation_lock);
       return STATUS_UNSUCCESSFUL;
+    }
     params->ret = result.handle;
     info->gpu_address = result.value;
     if (result.handle) {
       wmtr_buf_add(result.handle, shared ? shadow : NULL, info->length, info->options, shared, 0);
-      if (shared && (wmtr_heap_attach(result.handle, params->heap, params->offset, shadow, info->length) || wmtr_heap_sync())) {
+      if (shared && (wmtr_heap_attach(result.handle, params->heap, shadow_offset, shadow, info->length) || wmtr_heap_sync())) {
         wmtr_buf_remove(result.handle);
         struct rm_arg_handle release = {result.handle};
         wmtr_call(RM_OP_RELEASE, &release, sizeof(release), NULL, 0, NULL);
         params->ret = 0; info->gpu_address = 0;
+        pthread_mutex_unlock(&wmtr_heap_creation_lock);
         return STATUS_UNSUCCESSFUL;
       }
       info->memory.ptr = shared ? shadow : NULL;
     }
+    if (shared) pthread_mutex_unlock(&wmtr_heap_creation_lock);
     return STATUS_SUCCESS;
   }
   id<MTLHeap> heap = (id<MTLHeap>)params->heap;
@@ -7043,28 +7057,66 @@ _MTLTexture_getBytes(void *obj) {
     struct rm_texture_read_layout layout = {0};
     uint32_t received = 0;
     if (wmtr_call(RM_OP_TEXTURE_READ_LAYOUT, &query, sizeof(query), &layout, sizeof(layout), &received) != RM_OK ||
-        received != sizeof(layout) || layout.reserved > RM_TEXTURE_READ_PVRTC || !layout.block_width || layout.block_width > 16 ||
+        received != sizeof(layout) || layout.reserved > RM_TEXTURE_READ_MASKED || !layout.block_width || layout.block_width > 16 ||
         !layout.block_height || layout.block_height > 16 || !layout.block_bytes || layout.block_bytes > 16)
       return STATUS_UNSUCCESSFUL;
     uint64_t columns = (params->size.width - 1) / layout.block_width + 1;
     uint64_t rows = (params->size.height - 1) / layout.block_height + 1;
+    if (layout.reserved == RM_TEXTURE_READ_MASKED) {
+      if (layout.block_width != 1 || layout.block_height != 1 || columns > SIZE_MAX/layout.block_bytes ||
+          params->origin.x > UINT64_MAX-params->size.width || params->origin.y > UINT64_MAX-params->size.height ||
+          params->origin.z > UINT64_MAX-params->size.depth) return STATUS_INVALID_PARAMETER;
+      uint64_t row_bytes=columns*layout.block_bytes;
+      if (rows>1 && params->bytes_per_row>(SIZE_MAX-row_bytes)/(rows-1)) return STATUS_INVALID_PARAMETER;
+      uint64_t image_bytes=(rows-1)*params->bytes_per_row+row_bytes;
+      if (params->size.depth>1 && params->bytes_per_image>(SIZE_MAX-image_bytes)/(params->size.depth-1)) return STATUS_INVALID_PARAMETER;
+      size_t span=(size_t)((params->size.depth-1)*params->bytes_per_image+image_bytes);
+      if (span>wmtr_texture_guest_limit || (uintptr_t)params->data.ptr>UINTPTR_MAX-span) return STATUS_INVALID_PARAMETER;
+      uint8_t *chunk=malloc(RM_CHUNK_BYTES); if (!chunk) return STATUS_UNSUCCESSFUL;
+      NTSTATUS result=STATUS_SUCCESS;
+      for (uint64_t z=0; z<params->size.depth && result==STATUS_SUCCESS; z++)
+      for (uint64_t row=0; row<rows && result==STATUS_SUCCESS; row++)
+      for (uint64_t col=0; col<columns;) {
+        uint64_t count=columns-col, max=RM_CHUNK_BYTES/(2u*layout.block_bytes);
+        if (count>max) count=max;
+        uint32_t bytes=(uint32_t)(count*layout.block_bytes);
+        struct rm_texture_read_region arg={params->texture,params->origin.x+col,params->origin.y+row,
+          params->origin.z+z,count,1,params->level,params->slice};
+        received=0;
+        if (wmtr_call(RM_OP_TEXTURE_READ_MASKED,&arg,sizeof(arg),chunk,bytes*2,&received)!=RM_OK || received!=bytes*2) {
+          result=STATUS_UNSUCCESSFUL; break;
+        }
+        size_t offset=(size_t)(z*params->bytes_per_image+row*params->bytes_per_row+col*layout.block_bytes);
+        for (uint32_t i=0;i<bytes;i++) if (chunk[bytes+i]) ((uint8_t *)params->data.ptr)[offset+i]=chunk[i];
+        col+=count;
+      }
+      free(chunk); return result;
+    }
     if (layout.reserved == RM_TEXTURE_READ_PVRTC) {
+      if (columns < 2) columns = 2;
+      if (rows < 2) rows = 2;
       if (params->origin.x || params->origin.y || params->origin.z || params->size.depth != 1 || params->bytes_per_row)
         return STATUS_INVALID_PARAMETER;
       if (columns > SIZE_MAX / layout.block_bytes || rows > SIZE_MAX / (columns * layout.block_bytes))
         return STATUS_INVALID_PARAMETER;
       size_t length = (size_t)(columns * rows * layout.block_bytes);
-      if ((uintptr_t)params->data.ptr > UINTPTR_MAX - length) return STATUS_INVALID_PARAMETER;
+      if (length > wmtr_texture_guest_limit || (uintptr_t)params->data.ptr > UINTPTR_MAX - length) return STATUS_INVALID_PARAMETER;
+      uint8_t *chunk = malloc(RM_CHUNK_BYTES);
+      if (!chunk) return STATUS_UNSUCCESSFUL;
+      NTSTATUS result = STATUS_SUCCESS;
       for (size_t offset = 0; offset < length;) {
-        uint32_t bytes = (uint32_t)((length - offset) > RM_CHUNK_BYTES ? RM_CHUNK_BYTES : (length - offset));
+        uint32_t bytes = (uint32_t)((length - offset) > RM_CHUNK_BYTES/2 ? RM_CHUNK_BYTES/2 : (length - offset));
         struct rm_texture_read_pvrtc arg = {{params->texture, 0, 0, 0, params->size.width, params->size.height,
                                             params->level, params->slice}, offset, bytes};
         received = 0;
-        if (wmtr_call(RM_OP_TEXTURE_READ_PVRTC, &arg, sizeof(arg), (uint8_t *)params->data.ptr + offset,
-                      bytes, &received) != RM_OK || received != bytes) return STATUS_UNSUCCESSFUL;
+        if (wmtr_call(RM_OP_TEXTURE_READ_PVRTC_MASKED, &arg, sizeof(arg), chunk, bytes*2, &received) != RM_OK ||
+            received != bytes*2) { result = STATUS_UNSUCCESSFUL; break; }
+        for (uint32_t i = 0; i < bytes; i++)
+          if (chunk[bytes+i]) ((uint8_t *)params->data.ptr)[offset+i] = chunk[i];
         offset += bytes;
       }
-      return STATUS_SUCCESS;
+      free(chunk);
+      return result;
     }
     if (columns > SIZE_MAX / layout.block_bytes || params->origin.x > UINT64_MAX - params->size.width ||
         params->origin.y > UINT64_MAX - params->size.height || params->origin.z > UINT64_MAX - params->size.depth)
@@ -7076,7 +7128,7 @@ _MTLTexture_getBytes(void *obj) {
     if (params->size.depth > 1 && (params->bytes_per_image < image_bytes ||
         params->bytes_per_image > (SIZE_MAX - image_bytes) / (params->size.depth - 1))) return STATUS_INVALID_PARAMETER;
     size_t span = (size_t)((params->size.depth - 1) * params->bytes_per_image + image_bytes);
-    if ((uintptr_t)params->data.ptr > UINTPTR_MAX - span) return STATUS_INVALID_PARAMETER;
+    if (span > wmtr_texture_guest_limit || (uintptr_t)params->data.ptr > UINTPTR_MAX - span) return STATUS_INVALID_PARAMETER;
     uint8_t *chunk = malloc(RM_CHUNK_BYTES);
     if (!chunk) return STATUS_UNSUCCESSFUL;
     NTSTATUS result = STATUS_SUCCESS;
@@ -8839,7 +8891,17 @@ WMT_WOW64_POINTER_WRAPPER(_MTLDevice_heapTextureSizeAndAlign, unixcall_mtldevice
 WMT_WOW64_POINTER_WRAPPER(_MTLHeap_newTexture, unixcall_mtlheap_newtexture, info)
 WMT_WOW64_POINTER_WRAPPER(_MTLDevice_newIndirectCommandBuffer, unixcall_mtldevice_newicb, info)
 WMT_WOW64_POINTER_WRAPPER(_MTLDevice_newLibraryWithSource, unixcall_mtldevice_newlibrarywithsource, source)
-WMT_WOW64_POINTER_WRAPPER(_MTLTexture_getBytes, unixcall_mtltexture_replaceregion, data)
+static NTSTATUS _MTLTexture_getBytes_wow64(void *obj) {
+  struct unixcall_mtltexture_replaceregion *original = obj;
+  struct unixcall_mtltexture_replaceregion translated = *original;
+  uint32_t guest = (uint32_t)(uintptr_t)original->data.ptr;
+  translated.data.ptr = UInt32ToPtr(guest);
+  uint64_t old_limit = wmtr_texture_guest_limit;
+  wmtr_texture_guest_limit = 0x100000000ull - guest;
+  NTSTATUS status = _MTLTexture_getBytes(&translated);
+  wmtr_texture_guest_limit = old_limit;
+  return status;
+}
 #undef WMT_WOW64_POINTER_WRAPPER
 
 static NTSTATUS _MTLDevice_newTileRenderPipelineState_wow64(void *obj) {
