@@ -8513,10 +8513,10 @@ _MTLDevice_newPlacementHeap(void *obj) {
   struct unixcall_mtldevice_newplacementheap *params = obj;
   params->ret = 0;
   if (wmtr_enabled()) {
-    if ((params->options & 0x30) != WMTResourceStorageModePrivate) return STATUS_SUCCESS;
     struct WMTHeapInfo info = {0};
     info.size = params->size;
-    info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeTracked;
+    info.options = ((params->options & 0x30) == WMTResourceStorageModePrivate ? WMTResourceStorageModePrivate : WMTResourceStorageModeShared) |
+                   WMTResourceHazardTrackingModeTracked;
     info.type = WMTHeapTypePlacement;
     struct unixcall_mtldevice_newheap call = {0};
     call.device = params->device; call.info.ptr = &info;
@@ -8586,10 +8586,6 @@ _MTLHeap_newBufferAtOffset(void *obj) {
   params->ret = 0;
   if (wmtr_enabled()) {
     if (!info) return STATUS_INVALID_PARAMETER;
-    if ((info->options & 0x30) != WMTResourceStorageModePrivate) {
-      info->memory.ptr = NULL; info->gpu_address = 0;
-      return STATUS_SUCCESS;
-    }
     struct unixcall_mtlheap_newbuffer call = {0};
     call.heap = params->heap; call.info = params->info; call.offset = params->offset;
     NTSTATUS status = _MTLHeap_newBuffer(&call);
