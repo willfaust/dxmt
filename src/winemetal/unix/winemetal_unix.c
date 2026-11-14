@@ -2227,6 +2227,15 @@ _MTLDevice_newComputePipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create(device, descriptor, 1, options, &err);
@@ -2578,6 +2587,15 @@ _MTLDevice_newRenderPipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
@@ -2698,6 +2716,15 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
     descriptor.binaryArchives = nil;
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
+  }
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
   }
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
