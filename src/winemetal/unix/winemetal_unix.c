@@ -1807,8 +1807,11 @@ static struct madeira_arch_slot {
   os_unfair_lock lock;
   id<MTLBinaryArchive> open;
   unsigned n;
-  uint64_t last;
+  uint64_t last, first;   /* first: the oldest unsaved add (madeira-duo arch-age) */
 } madeira_arch_slots[MADEIRA_ARCH_SLOTS];
+static uint64_t madeira_arch_open_first;   /* madeira_arch_q only: the queue archive's oldest unsaved add */
+static _Atomic long madeira_arch_fg_inline;
+static _Atomic uint64_t madeira_arch_fg_inline_ns;
 static _Atomic long madeira_arch_inline, madeira_arch_inline_slow;
 static _Atomic uint64_t madeira_arch_inline_add_ns, madeira_arch_inline_create_ns;
 
@@ -1943,7 +1946,8 @@ static void madeira_arch_say(const char *what) {
   long added = atomic_load_explicit(&madeira_arch_added, memory_order_relaxed);
   long in = atomic_load_explicit(&madeira_arch_inline, memory_order_relaxed);
   fprintf(stderr, "[pso-archive] %s: %ld pipelines found in the saved chunks, %ld not (%ld added, avg %.1f ms "
-                  "an add, %ld failed); inline %ld (avg %.1f ms the add, %.1f ms the create from it, %ld created slowly)\n",
+                  "an add, %ld failed); inline %ld (avg %.1f ms the add, %.1f ms the create from it, %ld created slowly; "
+                  "for the game %ld, avg %.1f ms the add)\n",
           what,
           atomic_load_explicit(&madeira_arch_hits, memory_order_relaxed),
           atomic_load_explicit(&madeira_arch_misses, memory_order_relaxed), added,
@@ -1951,7 +1955,12 @@ static void madeira_arch_say(const char *what) {
           atomic_load_explicit(&madeira_arch_add_failed, memory_order_relaxed), in,
           in ? (double)atomic_load_explicit(&madeira_arch_inline_add_ns, memory_order_relaxed) / 1e6 / in : 0.0,
           in ? (double)atomic_load_explicit(&madeira_arch_inline_create_ns, memory_order_relaxed) / 1e6 / in : 0.0,
-          atomic_load_explicit(&madeira_arch_inline_slow, memory_order_relaxed));
+          atomic_load_explicit(&madeira_arch_inline_slow, memory_order_relaxed),
+          atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed),
+          atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed)
+              ? (double)atomic_load_explicit(&madeira_arch_fg_inline_ns, memory_order_relaxed) / 1e6 /
+                    atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed)
+              : 0.0);
 }
 
 static void madeira_arch_note_hit(void) {
@@ -1967,6 +1976,50 @@ static _Atomic unsigned long long madeira_ovl_arch_miss;
 static _Thread_local int madeira_pso_warm_self;
 static void madeira_ovl_note_miss(void) {
   if (!madeira_pso_warm_self) atomic_fetch_add_explicit(&madeira_ovl_arch_miss, 1, memory_order_relaxed);
+}
+
+/* madeira-duo warm-yield: pso-warm's background compiles share Metal's compiler with
+ * the pipelines the game is waiting for. In Path of Exile 2 (log 2026-11-15 01:17) it
+ * compiled ~4 compute pipelines a second while new maps loaded and the game's own render
+ * pipelines got ~1 a second; 815 warm compiles against 383 render ones, most of the
+ * warmed ones never dispatched. A warm-up that missed the saved chunks now waits, before
+ * it compiles, until no compile for the game is running and the last one ended 500 ms
+ * ago. Archive hits still go straight through. MADEIRA_PSO_WARM_YIELD=0: no waiting. */
+static _Atomic int madeira_fg_compiling;
+static _Atomic uint64_t madeira_fg_last_ns, madeira_warm_yield_ns;
+static _Atomic long madeira_warm_yields;
+static void madeira_warm_yield(void) {
+  static int on = -1;
+  uint64_t t0, now;
+  int waited = 0;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_PSO_WARM_YIELD");
+    on = !(e && !strcmp(e, "0"));
+  }
+  if (!on) return;
+  t0 = now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  while (atomic_load_explicit(&madeira_fg_compiling, memory_order_relaxed) > 0 ||
+         now - atomic_load_explicit(&madeira_fg_last_ns, memory_order_relaxed) < 500000000ull) {
+    { struct timespec ts = { 0, 20000000 }; nanosleep(&ts, NULL); }
+    waited = 1;
+    now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  }
+  if (waited) {
+    atomic_fetch_add_explicit(&madeira_warm_yields, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&madeira_warm_yield_ns, now - t0, memory_order_relaxed);
+  }
+}
+/* Around a compile after a lookup miss: 1 = a compile for the game (counted), 0 = a
+ * warm-up (it has waited its turn). */
+static int madeira_compile_begin(void) {
+  if (madeira_pso_warm_self) { madeira_warm_yield(); return 0; }
+  atomic_fetch_add_explicit(&madeira_fg_compiling, 1, memory_order_relaxed);
+  return 1;
+}
+static void madeira_compile_end(int fg) {
+  if (fg <= 0) return;
+  atomic_store_explicit(&madeira_fg_last_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), memory_order_relaxed);
+  atomic_fetch_sub_explicit(&madeira_fg_compiling, 1, memory_order_relaxed);
 }
 
 /* madeira-duo overlay-shader: the performance overlay's shader cells, read once per
@@ -2063,22 +2116,35 @@ static void madeira_arch_save_handed(id<MTLBinaryArchive> open, unsigned n) {
   });
 }
 
-/* madeira_arch_q: save the open archive once 10 s have passed without an add. */
+/* madeira_arch_q: save the open archive once 10 s have passed without an add.
+ * madeira-duo arch-age: or once its oldest unsaved add is MADEIRA_PSO_ARCHIVE_MAX_AGE
+ * seconds old (default 20). In a map the adds never stop for 10 s, so a session that
+ * ended there (killed, or the app closed) lost up to five part-filled archives: 50-228
+ * pipelines a session in Path of Exile 2's logs, which the next visit compiled again. */
+static uint64_t madeira_arch_max_age_ns(void) {
+  static uint64_t v;
+  if (!v) {
+    const char *e = getenv("MADEIRA_PSO_ARCHIVE_MAX_AGE");
+    long s = e ? atol(e) : 20;
+    v = (uint64_t)(s >= 2 && s <= 600 ? s : 20) * 1000000000ull;
+  }
+  return v;
+}
 static void madeira_arch_arm(void) {
   if (madeira_arch_timer) return;
   madeira_arch_timer = 1;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), madeira_arch_q, ^{
-    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), madeira_arch_q, ^{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), age = madeira_arch_max_age_ns();
     int again = 0;
     madeira_arch_timer = 0;
     if (madeira_arch_open_n) {
-      if (now - madeira_arch_last_add >= 9500000000ull) madeira_arch_save();
+      if (now - madeira_arch_last_add >= 9500000000ull || now - madeira_arch_open_first >= age) madeira_arch_save();
       else again = 1;
     }
     for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
       struct madeira_arch_slot *s = &madeira_arch_slots[i];
       if (!os_unfair_lock_trylock(&s->lock)) { again = 1; continue; }
-      if (s->n && now - s->last >= 9500000000ull) {
+      if (s->n && (now - s->last >= 9500000000ull || now - s->first >= age)) {
         @autoreleasepool { madeira_arch_save_archive(s->open, s->n); }
         [s->open release];
         s->open = nil;
@@ -2120,6 +2186,7 @@ static void madeira_arch_add(id descriptor, int kind) {
       if (ok && !err) {
         atomic_fetch_add_explicit(&madeira_arch_added, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&madeira_arch_add_ns, madeira_arch_last_add - t0, memory_order_relaxed);
+        if (!madeira_arch_open_n) madeira_arch_open_first = madeira_arch_last_add;   /* madeira-duo arch-age */
         if (++madeira_arch_open_n >= MADEIRA_ARCH_CHUNK) madeira_arch_save();
       } else if (atomic_fetch_add_explicit(&madeira_arch_add_failed, 1, memory_order_relaxed) < 3) {
         fprintf(stderr, "[pso-archive] an add failed: %s\n",
@@ -2171,6 +2238,11 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
       atomic_fetch_add_explicit(&madeira_arch_inline_create_ns, t2 - t1, memory_order_relaxed);
       if (t2 - t1 > 20000000ull)   /* not taken from the archive: compiled again */
         atomic_fetch_add_explicit(&madeira_arch_inline_slow, 1, memory_order_relaxed);
+      if (!madeira_pso_warm_self) {   /* madeira-duo: the adds the game waited for, apart from pso-warm's */
+        atomic_fetch_add_explicit(&madeira_arch_fg_inline, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&madeira_arch_fg_inline_ns, t1 - t0, memory_order_relaxed);
+      }
+      if (!s->n) s->first = t2;   /* madeira-duo arch-age */
       if (++s->n >= MADEIRA_ARCH_CHUNK) {
         madeira_arch_save_handed(s->open, s->n);   /* the queue takes the reference */
         s->open = nil;
@@ -2236,6 +2308,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
     [descriptor release];
     return STATUS_SUCCESS;
   }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create(device, descriptor, 1, options, &err);
@@ -2246,6 +2319,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
         (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 1);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -2596,6 +2670,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
     [descriptor release];
     return STATUS_SUCCESS;
   }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
@@ -2608,6 +2683,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
                                                                                                   error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -2726,6 +2802,7 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
     [descriptor release];
     return STATUS_SUCCESS;
   }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
   if (!params->ret_pso && madeira_arch) {
     madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
@@ -2738,6 +2815,7 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
                                                                                                   error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -7568,9 +7646,10 @@ static void madeira_pso_warm_note(uint64_t ns, int ok) {
     double msh = (double)atomic_load_explicit(&madeira_pso_warm_ns_hits, memory_order_relaxed) / 1e6;
     atomic_store_explicit(&madeira_pso_warm_said_ns, now, memory_order_relaxed);
     fprintf(stderr, "[pso-warm] madeira-bcd %ld of %ld pipelines warmed: %ld compiled (avg %.1f ms), "
-                    "%ld already in Metal's cache (avg %.2f ms), %ld failed; %ld waiting\n",
+                    "%ld already in Metal's cache (avg %.2f ms), %ld failed; %ld waiting; %ld waited for the game's compiles (%.1f s)\n",
             done, sent, compiled, compiled > 0 ? msc / compiled : 0.0, hits, hits ? msh / hits : 0.0, failed,
-            sent > done ? sent - done : 0);
+            sent > done ? sent - done : 0, atomic_load_explicit(&madeira_warm_yields, memory_order_relaxed),
+            (double)atomic_load_explicit(&madeira_warm_yield_ns, memory_order_relaxed) / 1e9);
   }
 }
 
