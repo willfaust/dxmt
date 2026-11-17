@@ -1963,8 +1963,13 @@ static void madeira_arch_say(const char *what) {
               : 0.0);
 }
 
+/* madeira-duo: set by every pipeline the saved chunks answered; pso-warm reads it around
+ * its own create to tell a hit from a compile (its wall time can't: a utility-QoS warm-up
+ * waits seconds for a core while a game saturates them, so hits looked like compiles). */
+static _Thread_local int madeira_pso_warm_hit;
 static void madeira_arch_note_hit(void) {
   long n = atomic_fetch_add_explicit(&madeira_arch_hits, 1, memory_order_relaxed) + 1;
+  madeira_pso_warm_hit = 1;
   if (n == 1 || (n % 2000) == 0) madeira_arch_say(n == 1 ? "first pipeline from the saved chunks" : "so far");
 }
 
@@ -7625,14 +7630,15 @@ static int madeira_pso_warm_setup(void) {
 }
 
 /* One finished warm-up: tally it, and report every 500 and whenever the
- * backlog empties (at most every 10 s). A build under 3 ms was a cache hit. */
-static void madeira_pso_warm_note(uint64_t ns, int ok) {
+ * backlog empties (at most every 10 s). hit: the saved chunks had it. With no
+ * saved chunks in use, a build under 3 ms was a hit in Metal's own cache. */
+static void madeira_pso_warm_note(uint64_t ns, int ok, int hit) {
   long done = atomic_fetch_add_explicit(&madeira_pso_warm_done, 1, memory_order_relaxed) + 1;
   long sent = atomic_load_explicit(&madeira_pso_warm_sent, memory_order_relaxed);
   uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   if (!ok)
     atomic_fetch_add_explicit(&madeira_pso_warm_failed, 1, memory_order_relaxed);
-  else if (ns < 3000000) {
+  else if (hit || (!madeira_arch_in_use() && ns < 3000000)) {
     atomic_fetch_add_explicit(&madeira_pso_warm_hits, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&madeira_pso_warm_ns_hits, ns, memory_order_relaxed);
   } else
@@ -7698,6 +7704,7 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
       uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       obj_handle_t pso = 0;
       madeira_pso_warm_self = 1;   /* madeira-duo overlay-shader: not a miss the game waits for */
+      madeira_pso_warm_hit = 0;
       if (kind == 2) {
         struct unixcall_mtldevice_newcomputepso p;
         memset(&p, 0, sizeof p);
@@ -7718,7 +7725,7 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
         pso = p.ret_pso;
       }
       madeira_pso_warm_self = 0;
-      madeira_pso_warm_note(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, pso != 0);
+      madeira_pso_warm_note(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, pso != 0, madeira_pso_warm_hit);
       if (pso) [(id)pso release];
       if (f0) [(id)f0 release];
       if (f1) [(id)f1 release];
