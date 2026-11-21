@@ -7927,6 +7927,134 @@ static uint32_t madeira_rp_store(const struct madeira_rp_store_req *r) {
   return 1;
 }
 
+/* madeira-duo framegen-feed: MetalFX frame interpolation driven by the D3D12
+ * runtime (MadeiraCtl ops 30-32). MADEIRA_FRAMEGEN (madeira_fg_present, above)
+ * works on the finished drawable and has to guess everything: motion from
+ * block matching, a flat depth, a made-up camera, no idea where the HUD is,
+ * and it runs after the D3D12 runtime's spatial upscale, on four times the
+ * pixels. madeira-d3d12 has the real inputs: the motion vectors, depth and
+ * camera constants the game hands its own upscaler, the frame as it was just
+ * before the HUD was drawn, and the frame before the upscale. So it owns the
+ * textures and the policy (madeira.cfg framegen), and these ops are only the
+ * MetalFX and CAMetalLayer calls it cannot make itself:
+ *   30  make an interpolator. Input size: the motion and depth textures;
+ *       output size: the colour textures. ptr = 0 asks whether this OS has one.
+ *   31  encode one interpolated frame into the caller's command buffer.
+ *   32  present the generated frame, then the game's frame. With a frame cap
+ *       (vsync modes 1, 3, 4) each is held for half the cap's interval, so the
+ *       pair takes what one frame took and the drawable pool still gives the
+ *       game its back-pressure; without one the game's frame follows half a
+ *       frame time after the generated one.
+ * The request layouts are shared with madeira-d3d12 (struct mad_fg_*_req). */
+struct madeira_fgi_create_req {
+  uint64_t device;
+  uint32_t color_pf, output_pf, depth_pf, motion_pf, ui_pf;   /* WMTPixelFormat; ui_pf 0 = no UI texture */
+  uint32_t in_w, in_h, out_w, out_h;
+  uint32_t status;     /* out: 1 made, 2 this OS has no frame interpolator, 3 this GPU is not supported, 4 MetalFX refused */
+  uint64_t interp;     /* out: +1, the caller releases it */
+  uint32_t usage[5];   /* out: the MTLTextureUsage it asks of the colour, depth, motion, UI and output textures */
+  uint32_t pad;
+};
+struct madeira_fgi_encode_req {
+  uint64_t cb, interp, color, prev_color, depth, motion, ui, output, fence;   /* ui and fence may be 0 */
+  float mv_scale_x, mv_scale_y, delta_time, near_plane, far_plane, fov_y, aspect, jitter_x, jitter_y;
+  uint32_t flags;      /* 1 depth is reversed, 2 the UI texture is the frame with the UI composited, 4 reset history */
+};
+struct madeira_fgi_present_req {
+  uint64_t cb, first, second;   /* the generated frame's drawable, then the game's */
+  double frame_s;               /* the game's frame time, seconds */
+  uint32_t flags, pad;
+};
+_Static_assert(sizeof(struct madeira_fgi_create_req) == 80 && sizeof(struct madeira_fgi_encode_req) == 112 &&
+               sizeof(struct madeira_fgi_present_req) == 40, "framegen-feed request layouts are shared with madeira-d3d12");
+
+static uint32_t madeira_fgi_create(struct madeira_fgi_create_req *r) {
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    id<MTLDevice> dev;
+    if (!r) return 1;
+    r->status = 0; r->interp = 0;
+    dev = (id<MTLDevice>)(uintptr_t)r->device;
+    if (!dev || ![MTLFXFrameInterpolatorDescriptor supportsDevice:dev]) { r->status = 3; return 1; }
+    MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    desc.colorTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->color_pf);
+    desc.outputTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->output_pf);
+    desc.depthTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->depth_pf);
+    desc.motionTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->motion_pf);
+    if (r->ui_pf) desc.uiTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->ui_pf);
+    desc.inputWidth = r->in_w;   desc.inputHeight = r->in_h;
+    desc.outputWidth = r->out_w; desc.outputHeight = r->out_h;
+    id<MTLFXFrameInterpolator> fi = [desc newFrameInterpolatorWithDevice:dev];
+    [desc release];
+    if (!fi) { r->status = 4; return 1; }
+    r->usage[0] = (uint32_t)fi.colorTextureUsage;
+    r->usage[1] = (uint32_t)fi.depthTextureUsage;
+    r->usage[2] = (uint32_t)fi.motionTextureUsage;
+    r->usage[3] = (uint32_t)fi.uiTextureUsage;
+    r->usage[4] = (uint32_t)fi.outputTextureUsage;
+    r->interp = (uint64_t)(uintptr_t)fi;
+    r->status = 1;
+    return 1;
+  }
+  if (!r) return 0;
+  r->status = 2; r->interp = 0;
+  return 1;
+}
+
+static uint32_t madeira_fgi_encode(const struct madeira_fgi_encode_req *r) {
+  if (!r->cb || !r->interp || !r->color || !r->prev_color || !r->depth || !r->motion || !r->output) return 0;
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    id<MTLFXFrameInterpolator> fi = (id<MTLFXFrameInterpolator>)(uintptr_t)r->interp;
+    fi.colorTexture = (id<MTLTexture>)(uintptr_t)r->color;
+    fi.prevColorTexture = (id<MTLTexture>)(uintptr_t)r->prev_color;
+    fi.depthTexture = (id<MTLTexture>)(uintptr_t)r->depth;
+    fi.motionTexture = (id<MTLTexture>)(uintptr_t)r->motion;
+    fi.uiTexture = (id<MTLTexture>)(uintptr_t)r->ui;
+    fi.uiTextureComposited = (r->ui && (r->flags & 2)) ? YES : NO;
+    fi.outputTexture = (id<MTLTexture>)(uintptr_t)r->output;
+    fi.fence = (id<MTLFence>)(uintptr_t)r->fence;
+    fi.motionVectorScaleX = r->mv_scale_x;
+    fi.motionVectorScaleY = r->mv_scale_y;
+    fi.deltaTime = r->delta_time;
+    fi.nearPlane = r->near_plane;
+    fi.farPlane = r->far_plane;
+    fi.fieldOfView = r->fov_y;
+    fi.aspectRatio = r->aspect;
+    fi.jitterOffsetX = r->jitter_x;
+    fi.jitterOffsetY = r->jitter_y;
+    fi.depthReversed = (r->flags & 1) ? YES : NO;
+    fi.shouldResetHistory = (r->flags & 4) ? YES : NO;
+    [fi encodeToCommandBuffer:(id<MTLCommandBuffer>)(uintptr_t)r->cb];
+    return 1;
+  }
+  return 0;
+}
+
+static uint32_t madeira_fgi_present(const struct madeira_fgi_present_req *r) {
+  id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)(uintptr_t)r->cb;
+  id<MTLDrawable> first = (id<MTLDrawable>)(uintptr_t)r->first;
+  id<MTLDrawable> second = (id<MTLDrawable>)(uintptr_t)r->second;
+  int mode = g_madeira_vsync_mode;
+  double cap = mode == 1 ? 60.0 : mode == 3 ? 30.0 : mode == 4 ? 40.0 : 0.0;
+  if (!cb || !first || !second) return 0;
+  gpt_note_present();   /* one game frame, as _MTLCommandBuffer_presentDrawable counts it */
+  if (madeira_frame_hooks_on())
+    ios_frame_encode_present(0);
+  madeira_frame_mark_drawable((id)first);    /* the overlay shows what reaches the glass: both */
+  madeira_frame_mark_drawable((id)second);
+  madeira_log_present_cadence("presentFramegenFeed", cap > 0.0 ? 0.5 / cap : 0.0);
+  if (cap > 0.0) {
+    [cb presentDrawable:first afterMinimumDuration:0.5 / cap];
+    [cb presentDrawable:second afterMinimumDuration:0.5 / cap];
+  } else {
+    [cb presentDrawable:first];
+    if (r->frame_s > 0.002 && r->frame_s < 0.25)
+      [cb presentDrawable:second afterMinimumDuration:r->frame_s * 0.5];
+    else
+      [cb presentDrawable:second];
+  }
+  return 1;
+}
+
 static NTSTATUS _madeira_ctl(void *args) {
   struct madeira_ctl_args *a = args;
   if (!a) return STATUS_SUCCESS;
@@ -8085,6 +8213,20 @@ static NTSTATUS _madeira_ctl(void *args) {
   case 24:    /* madeira-bcd: late render-pass store actions (tools/patch-winemetal-rp-store.py) */
     if (!a->ptr || a->len < sizeof(struct madeira_rp_store_req) || wmtr_enabled()) break;
     a->ret = madeira_rp_store((const struct madeira_rp_store_req *)(uintptr_t)a->ptr);
+    break;
+  case 30: {  /* madeira-duo framegen-feed: make a MetalFX frame interpolator (ptr = 0: does this OS have one?) */
+    struct madeira_fgi_create_req *r = (struct madeira_fgi_create_req *)(uintptr_t)a->ptr;
+    if (wmtr_enabled() || (r && a->len < sizeof *r)) break;
+    a->ret = madeira_fgi_create(r);
+    break;
+  }
+  case 31:    /* madeira-duo framegen-feed: encode one interpolated frame */
+    if (!a->ptr || a->len < sizeof(struct madeira_fgi_encode_req) || wmtr_enabled()) break;
+    a->ret = madeira_fgi_encode((const struct madeira_fgi_encode_req *)(uintptr_t)a->ptr);
+    break;
+  case 32:    /* madeira-duo framegen-feed: present the generated frame and the game's */
+    if (!a->ptr || a->len < sizeof(struct madeira_fgi_present_req) || wmtr_enabled()) break;
+    a->ret = madeira_fgi_present((const struct madeira_fgi_present_req *)(uintptr_t)a->ptr);
     break;
   default: break;
   }
