@@ -121,9 +121,24 @@ enum class EventState {
 
 constexpr size_t kEventStallThreshold = 64;
 
+/* MADEIRA: burst polling of an event query. Two pending polls less than this
+ * apart continue a burst; after kEventPollsBeforePark of them the immediate
+ * context parks the caller on the queue's shared event (see GetData). */
+constexpr uint64_t kEventPollBurstGapNs = 250 * 1000;
+constexpr uint32_t kEventPollsBeforePark = 2;
+
 struct MTLD3D11EventQuery : public ID3D11Query {
   virtual void Issue(uint64_t current_seq_id) = 0;
   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
+  /* The event value this query completes at. */
+  virtual uint64_t SignalSeqId() = 0;
+  /* The command chunk that was being recorded when the query was issued: its
+   * signal reaches the GPU only once that chunk is committed. */
+  virtual void SetIssueChunk(uint64_t chunk_seq_id) = 0;
+  virtual uint64_t IssueChunk() = 0;
+  /* Records a pending poll at now_ns; true when it continues a burst long
+   * enough to park on. */
+  virtual bool NotePendingPoll(uint64_t now_ns) = 0;
 };
 
 template <typename DataType>
@@ -138,6 +153,21 @@ public:
     state = QueryState::Issued;
     should_be_signaled_at = current_seq_id;
     stall_counter = 0;
+    issue_chunk = 0;
+    poll_burst = 0;
+    last_pending_poll_ns = 0;
+  }
+
+  uint64_t SignalSeqId() override { return should_be_signaled_at; }
+  void SetIssueChunk(uint64_t chunk_seq_id) override { issue_chunk = chunk_seq_id; }
+  uint64_t IssueChunk() override { return issue_chunk; }
+  bool NotePendingPoll(uint64_t now_ns) override {
+    if (last_pending_poll_ns && now_ns - last_pending_poll_ns <= kEventPollBurstGapNs)
+      poll_burst = std::min(poll_burst + 1, kEventPollsBeforePark + 1);
+    else
+      poll_burst = 1;
+    last_pending_poll_ns = now_ns;
+    return poll_burst > kEventPollsBeforePark;
   }
 
   EventState CheckEventState(uint64_t coherent_seq_id) override {
@@ -162,6 +192,9 @@ private:
   QueryState state = QueryState::Undefined;
   uint32_t stall_counter = 0;
   uint64_t should_be_signaled_at = 0;
+  uint64_t issue_chunk = 0;
+  uint32_t poll_burst = 0;
+  uint64_t last_pending_poll_ns = 0;
 };
 
 HRESULT CreateOcculusionQuery(MTLD3D11Device *pDevice,

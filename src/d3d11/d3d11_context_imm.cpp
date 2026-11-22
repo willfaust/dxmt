@@ -398,6 +398,9 @@ public:
       } else {
         static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(cmd_queue.GetCurrentEventSeqId());
       }
+      /* MADEIRA: the signal (this one, or the earlier one it reuses) may still be
+       * in the chunk being recorded; GetData only parks once that chunk is out. */
+      static_cast<MTLD3D11EventQuery *>(pAsync)->SetIssueChunk(cmd_queue.CurrentSeqId());
       break;
     }
     case D3D11_QUERY_OCCLUSION:
@@ -420,6 +423,52 @@ public:
     }
   }
 
+  /* MADEIRA: games build a GPU fence out of `while (GetData(event) == S_FALSE) {}`
+   * (Path of Exile 2 does it every frame: up to ~130K polls a frame, millions a
+   * second). Under emulation every poll is an x64 -> ARM64EC round trip plus a
+   * Metal call, and the polling thread burns a P-core for nothing, which on a
+   * phone is heat that throttles the threads doing real work. Once the polls
+   * of one query come in a burst (two pending polls less than 250 us apart),
+   * this parks the caller on the queue's shared event until the query's value
+   * is signaled, at most 1 ms (Metal's timeout is in milliseconds), and then
+   * answers. A one-off poll (a query read once a frame, a frame or more after
+   * it was issued) never waits. The park only happens once the chunk holding
+   * the signal has been committed: before that, no wait can see it complete.
+   * The flush that GetData would do anyway (no DONOTFLUSH) is done first, so
+   * the signal is on its way before the caller parks. Same idea as D3D9's
+   * WaitCPUFenceBounded parking (d3d9_query.cpp), on the D3D11 event value.
+   * Opt-in: env.MADEIRA_D3D11_QUERY_PARK = 1. */
+  static bool
+  QueryParkEnabled() {
+    static const bool enabled = [] {
+      const char *value = std::getenv("MADEIRA_D3D11_QUERY_PARK");
+      bool on = value && !std::strcmp(value, "1");
+      if (on)
+        ERR("[query-park] D3D11 event-query parking on (env.MADEIRA_D3D11_QUERY_PARK = 1)");
+      return on;
+    }();
+    return enabled;
+  }
+
+  HRESULT
+  ParkOnEventQuery(MTLD3D11EventQuery *query, UINT &GetDataFlags) {
+    if ((GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+      cmd_queue.CurrentFrameStatistics().event_stall++;
+      Flush();
+      GetDataFlags |= D3D11_ASYNC_GETDATA_DONOTFLUSH;   /* done: the tail of GetData must not flush again */
+    }
+    auto now = std::chrono::steady_clock::now();
+    uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    if (!query->NotePendingPoll(now_ns) || cmd_queue.CurrentSeqId() <= query->IssueChunk())
+      return S_FALSE;
+    cmd_queue.event.waitUntilSignaledValue(query->SignalSeqId(), 1);
+    g_perf.polls_parked.fetch_add(1, std::memory_order_relaxed);
+    g_perf.park_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - now).count(),
+        std::memory_order_relaxed);
+    return query->CheckEventState(cmd_queue.SignaledEventSeqId()) == EventState::Signaled ? S_OK : S_FALSE;
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   GetData(ID3D11Asynchronous *pAsync, void *pData, UINT DataSize, UINT GetDataFlags) override {
@@ -438,7 +487,8 @@ public:
     case D3D11_QUERY_EVENT:
     case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
-      switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
+      auto query = static_cast<MTLD3D11EventQuery *>(pAsync);
+      switch (query->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
         break;
       case EventState::Stall:
@@ -450,6 +500,8 @@ public:
       case EventState::Invalid:
         return DXGI_ERROR_INVALID_CALL;
       }
+      if (hr == S_FALSE && QueryParkEnabled())
+        hr = ParkOnEventQuery(query, GetDataFlags);
       break;
     }
     default:
