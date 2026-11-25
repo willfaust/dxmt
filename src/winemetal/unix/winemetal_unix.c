@@ -1797,7 +1797,8 @@ static NSArray *madeira_arch_list;               /* saved chunks; replaced whole
 static dispatch_queue_t madeira_arch_q;          /* adds and saves, in order */
 static id<MTLDevice> madeira_arch_device;
 static id<MTLBinaryArchive> madeira_arch_open;   /* madeira_arch_q only */
-static unsigned madeira_arch_open_n, madeira_arch_next, madeira_arch_timer;
+static unsigned madeira_arch_open_n, madeira_arch_timer;
+static _Atomic unsigned madeira_arch_next;       /* the next chunk number: both queues take from it */
 static uint64_t madeira_arch_last_add;
 static _Atomic unsigned long long madeira_arch_bytes, madeira_arch_cap;   /* all chunks; the cap */
 static _Atomic long madeira_arch_hits, madeira_arch_misses, madeira_arch_added, madeira_arch_add_failed;
@@ -1810,10 +1811,34 @@ static struct madeira_arch_slot {
   uint64_t last, first;   /* first: the oldest unsaved add (madeira-duo arch-age) */
 } madeira_arch_slots[MADEIRA_ARCH_SLOTS];
 static uint64_t madeira_arch_open_first;   /* madeira_arch_q only: the queue archive's oldest unsaved add */
+/* madeira-duo PROMPT SAVES (MADEIRA_PSO_ARCHIVE_PROMPT, default 1; 0 = as before).
+ * The slots were saved by a timer on madeira_arch_q, a utility queue. In a map the game
+ * fills the efficiency cores and that queue hardly runs: Path of Exile 2 logs of
+ * 2026-11-25 show a 3.5 minute session that added 50 pipelines and saved 12 (its only
+ * saves came 11 s and 0 s before it ended), one of 10 minutes that left 31 of 451
+ * unsaved and saved 92 in one chunk, and one that left 82 of 176. Each lost pipeline is
+ * compiled again by the next session that draws it (0.5-0.6 s each). With the switch on:
+ * a slot whose oldest unsaved add has reached the age is handed over by the add that
+ * finds it so (no timer needed while adds keep coming); slot saves and their timer run on
+ * a user-initiated queue of their own, outside the slot lock; and everything unsaved is
+ * saved when the app leaves the foreground. */
+static dispatch_queue_t madeira_arch_save_q;     /* slot saves; NULL = on madeira_arch_q as before */
+static _Atomic int madeira_arch_slot_timer;
+static void madeira_arch_flush(void);
+static uint64_t madeira_arch_max_age_ns(void);
 static _Atomic long madeira_arch_fg_inline;
 static _Atomic uint64_t madeira_arch_fg_inline_ns;
 static _Atomic long madeira_arch_inline, madeira_arch_inline_slow;
 static _Atomic uint64_t madeira_arch_inline_add_ns, madeira_arch_inline_create_ns;
+
+static int madeira_arch_prompt_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_PSO_ARCHIVE_PROMPT");
+    on = !(e && !strcmp(e, "0"));
+  }
+  return on;
+}
 
 static int madeira_arch_inline_on(void) {
   static int on = -1;
@@ -1864,6 +1889,24 @@ static void madeira_arch_load(id<MTLDevice> device) {
   madeira_arch_device = [device retain];
   madeira_arch_q = dispatch_queue_create("madeira.pso-archive",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  if (madeira_arch_prompt_on()) {   /* madeira-duo prompt saves */
+    madeira_arch_save_q = dispatch_queue_create("madeira.pso-archive.save",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    fprintf(stderr, "[pso-archive] prompt saves: a slot is saved once its oldest add is %llu s old, on a queue of its own, "
+                    "and when the app leaves the foreground (MADEIRA_PSO_ARCHIVE_PROMPT=0 = the timer only)\n",
+            (unsigned long long)(madeira_arch_max_age_ns() / 1000000000ull));
+    @autoreleasepool {
+      NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+      /* by name: no UIKit symbol, so the same source builds for every target */
+      for (NSString *name in @[ @"UIApplicationWillResignActiveNotification",
+                                @"UIApplicationDidEnterBackgroundNotification",
+                                @"UIApplicationWillTerminateNotification" ])
+        [nc addObserverForName:name object:nil queue:nil usingBlock:^(NSNotification *note) {
+          (void)note;
+          madeira_arch_flush();
+        }];
+    }
+  }
   if ((d = opendir(madeira_arch_dir))) {
     while ((e = readdir(d))) {
       char path[1200];
@@ -2115,7 +2158,7 @@ static void madeira_arch_save(void) {
 
 /* madeira_arch_q: a slot's archive, handed over when it filled up or went idle. */
 static void madeira_arch_save_handed(id<MTLBinaryArchive> open, unsigned n) {
-  dispatch_async(madeira_arch_q, ^{
+  dispatch_async(madeira_arch_save_q ? madeira_arch_save_q : madeira_arch_q, ^{
     @autoreleasepool { madeira_arch_save_archive(open, n); }
     [open release];
   });
@@ -2146,7 +2189,7 @@ static void madeira_arch_arm(void) {
       if (now - madeira_arch_last_add >= 9500000000ull || now - madeira_arch_open_first >= age) madeira_arch_save();
       else again = 1;
     }
-    for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
+    for (unsigned i = 0; !madeira_arch_save_q && i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
       struct madeira_arch_slot *s = &madeira_arch_slots[i];
       if (!os_unfair_lock_trylock(&s->lock)) { again = 1; continue; }
       if (s->n && (now - s->last >= 9500000000ull || now - s->first >= age)) {
@@ -2161,6 +2204,68 @@ static void madeira_arch_arm(void) {
     }
     if (again) madeira_arch_arm();
   });
+}
+
+/* madeira-duo prompt saves. Any thread: save the slots that went idle or reached the age;
+ * force = every slot with unsaved adds, waiting for an add in progress. The archive leaves
+ * its slot under the lock and is written outside it. Returns the slots still holding
+ * unsaved adds. */
+static unsigned madeira_arch_sweep_slots(int force) {
+  uint64_t age = madeira_arch_max_age_ns();
+  unsigned left = 0;
+  for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {
+    struct madeira_arch_slot *s = &madeira_arch_slots[i];
+    id<MTLBinaryArchive> open = nil;
+    unsigned n = 0;
+    uint64_t now;
+    if (force) os_unfair_lock_lock(&s->lock);
+    else if (!os_unfair_lock_trylock(&s->lock)) { left++; continue; }
+    now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (s->n && (force || now - s->last >= 9500000000ull || now - s->first >= age)) {
+      open = s->open;
+      n = s->n;
+      s->open = nil;
+      s->n = 0;
+    } else if (s->n) {
+      left++;
+    }
+    os_unfair_lock_unlock(&s->lock);
+    if (open) {
+      @autoreleasepool { madeira_arch_save_archive(open, n); }
+      [open release];
+    }
+  }
+  return left;
+}
+
+/* Any thread: the slots are looked at again in 5 s, on the save queue, while one holds unsaved adds. */
+static void madeira_arch_slot_arm(void) {
+  if (atomic_exchange_explicit(&madeira_arch_slot_timer, 1, memory_order_relaxed)) return;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), madeira_arch_save_q, ^{
+    atomic_store_explicit(&madeira_arch_slot_timer, 0, memory_order_relaxed);
+    if (madeira_arch_sweep_slots(0)) madeira_arch_slot_arm();
+  });
+}
+
+/* The app is leaving the foreground (the poster's thread: returns at once). iOS may never
+ * run this process again, so every unsaved add is saved now; the activity asks iOS for the
+ * time to finish. */
+static void madeira_arch_flush_now(void) {
+  fprintf(stderr, "[pso-archive] the app is leaving the foreground: unsaved pipelines are saved now\n");
+  dispatch_sync(madeira_arch_save_q, ^{ madeira_arch_sweep_slots(1); });
+  dispatch_sync(madeira_arch_q, ^{
+    if (madeira_arch_open_n) madeira_arch_save();
+  });
+}
+static void madeira_arch_flush(void) {
+  if (!madeira_arch_save_q || !madeira_arch_q) return;
+#if TARGET_OS_IOS
+  [[NSProcessInfo processInfo] performExpiringActivityWithReason:@"madeira.pso-archive" usingBlock:^(BOOL expired) {
+    if (!expired) madeira_arch_flush_now();
+  }];
+#else
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ madeira_arch_flush_now(); });
+#endif
 }
 
 /* A pipeline the saved chunks did not have, created: add its functions to the
@@ -2252,6 +2357,10 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
         madeira_arch_save_handed(s->open, s->n);   /* the queue takes the reference */
         s->open = nil;
         s->n = 0;
+      } else if (madeira_arch_save_q && t2 - s->first >= madeira_arch_max_age_ns()) {
+        madeira_arch_save_handed(s->open, s->n);   /* madeira-duo prompt saves: old enough, no timer needed */
+        s->open = nil;
+        s->n = 0;
       }
     }
   } else if (atomic_fetch_add_explicit(&madeira_arch_add_failed, 1, memory_order_relaxed) < 3) {
@@ -2260,6 +2369,7 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
   }
   os_unfair_lock_unlock(&s->lock);
   if (pso) dispatch_async(madeira_arch_q, ^{ madeira_arch_arm(); });
+  if (pso && madeira_arch_save_q) madeira_arch_slot_arm();   /* madeira-duo prompt saves */
   return pso;
 }
 
