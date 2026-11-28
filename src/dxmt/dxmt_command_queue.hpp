@@ -99,6 +99,7 @@ constexpr uint32_t kCommandChunkCount = 32;
 struct PerfCounters {
   std::atomic<uint64_t> map_wait_ns{0}, map_waits{0}, map_waits_unsubmitted{0};
   std::atomic<uint64_t> polls_event{0}, polls_other{0};
+  std::atomic<uint64_t> polls_parked{0}, park_ns{0};   /* MADEIRA: D3D11 event-query parking */
   std::atomic<uint64_t> draws{0}, draws_tess{0}, draws_gs{0};
   std::atomic<uint64_t> decode_ns{0}, refill_ns{0};   /* BC work on the game thread */
   std::atomic<uint64_t> refill_worker_ns{0}, refill_queued{0}, refill_applied{0}, refill_stale{0},

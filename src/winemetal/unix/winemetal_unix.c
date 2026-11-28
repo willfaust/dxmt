@@ -600,6 +600,365 @@ static void madeira_gpu_meter_attach(id<MTLCommandBuffer> cmdbuf) {
   }];
 }
 
+/* madeira-duo gpu-pass-timing: GPU time per Metal encoder, measured on the device.
+ * madeira.cfg gpu-pass-timing = P (seconds, 0 = off): for one second in every P,
+ * every render, compute and blit encoder gets Metal timestamp samples at its stage
+ * boundaries (render: vertex start/end and fragment start/end; compute and blit:
+ * encoder start/end) in a per-command-buffer MTLCounterSampleBuffer. When the
+ * buffer completes, the samples become per-encoder GPU intervals, summed per pass
+ * (keyed by the encoder label with its sequence number dropped, so set
+ * encoder-labels = 1 for names) and logged as [gpu-pass] once per window:
+ * GPU busy per frame, the union of the encoder intervals (what's left are gaps
+ * where no encoder ran: fence waits, scheduling), the overlap between encoders,
+ * and the passes ranked by GPU time. Every gpu-pass-dump-s seconds (default 30)
+ * the next three command buffers are also listed encoder by encoder, in order,
+ * with start offsets, so gaps and overlaps can be seen in place. Off = nothing
+ * attached, one relaxed load per encoder. Remote (wmtr) command buffers are not
+ * timed. */
+#define GPT_STATES 12
+#define GPT_SAMPLES 2048
+#define GPT_MAX_ENC (GPT_SAMPLES / 4)
+#define GPT_KEYS 512
+struct gpt_enc {
+  id encoder;              /* only compared, never messaged after endEncoding */
+  uint16_t base, nsamp;
+  uint16_t w, h;
+  uint8_t kind;            /* 0 render, 1 compute, 2 blit */
+  char label[56];
+};
+struct gpt_cb {
+  int busy;
+  id cb;                   /* the command buffer while it is being encoded; nil once committed */
+  id<MTLCounterSampleBuffer> sb;
+  unsigned n_enc, n_samp;
+  struct gpt_enc enc[GPT_MAX_ENC];
+};
+struct gpt_key {
+  char label[56]; uint8_t kind; uint16_t w, h;
+  unsigned count;
+  double span_ns, vtx_ns, frag_ns;
+};
+static int g_gpt_period = -1, g_gpt_dump_s = 30;
+static _Atomic int g_gpt_open;                 /* states in use; 0 = endEncoding skips the search */
+static os_unfair_lock g_gpt_lock = OS_UNFAIR_LOCK_INIT;
+static struct gpt_cb *g_gpt_state[GPT_STATES];
+static id<MTLCounterSet> g_gpt_set;
+static int g_gpt_ok = -1;                      /* -1 unchecked, 0 unsupported, 1 ready */
+static double g_gpt_ns_per_tick;               /* 0 until two GPU/CPU clock pairs are taken */
+static uint64_t g_gpt_ref_gpu, g_gpt_ref_ns;
+static struct gpt_key g_gpt_keys[GPT_KEYS];
+static unsigned g_gpt_nkeys, g_gpt_dump_left;
+static uint64_t g_gpt_win_start, g_gpt_last_dump;
+static unsigned g_gpt_cbs, g_gpt_encs, g_gpt_lost, g_gpt_nosamp;
+static double g_gpt_busy_ns, g_gpt_union_ns, g_gpt_sum_ns;
+static _Atomic unsigned g_gpt_presents;
+
+static uint64_t gpt_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static int gpt_period(void) {
+  if (g_gpt_period < 0) {
+    g_gpt_dump_s = (int)madeira_cfg_int("gpu-pass-dump-s", 30);
+    g_gpt_period = (int)madeira_cfg_int("gpu-pass-timing", 0);
+    if (g_gpt_period < 0) g_gpt_period = 0;
+  }
+  return g_gpt_period;
+}
+
+/* Whether a command buffer starting to encode now is timed: inside the first
+ * second of each period. */
+static int gpt_window(void) {
+  int p = gpt_period();
+  if (!p) return 0;
+  return (gpt_now_ns() / 1000000000ull) % (uint64_t)p == 0;
+}
+
+static int gpt_device_ready(id<MTLDevice> dev) {
+  if (g_gpt_ok >= 0) return g_gpt_ok;
+  g_gpt_ok = 0;
+  if (![dev respondsToSelector:@selector(supportsCounterSampling:)] ||
+      ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+    fprintf(stderr, "[gpu-pass] madeira-duo: this GPU can't sample counters at stage boundaries; gpu-pass-timing stays off\n");
+    return 0;
+  }
+  for (id<MTLCounterSet> s in dev.counterSets)
+    if ([s.name isEqualToString:MTLCommonCounterSetTimestamp]) { g_gpt_set = [s retain]; break; }
+  if (!g_gpt_set) {
+    fprintf(stderr, "[gpu-pass] madeira-duo: no timestamp counter set; gpu-pass-timing stays off\n");
+    return 0;
+  }
+  g_gpt_ok = 1;
+  fprintf(stderr, "[gpu-pass] madeira-duo: per-encoder GPU timing on, 1 s in every %d s, %d samples per command buffer\n",
+          g_gpt_period, GPT_SAMPLES);
+  return 1;
+}
+
+/* GPU timestamp ticks to nanoseconds: pairs of (GPU timestamp, our clock) taken
+ * at least a second apart. */
+static void gpt_calibrate(id<MTLDevice> dev) {
+  MTLTimestamp cpu = 0, gpu = 0;
+  uint64_t ns;
+  [dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
+  ns = gpt_now_ns();
+  if (!g_gpt_ref_ns) { g_gpt_ref_gpu = gpu; g_gpt_ref_ns = ns; return; }
+  if (ns - g_gpt_ref_ns < 1000000000ull || gpu <= g_gpt_ref_gpu) return;
+  {
+    double r = (double)(ns - g_gpt_ref_ns) / (double)(gpu - g_gpt_ref_gpu);
+    if (!g_gpt_ns_per_tick)
+      fprintf(stderr, "[gpu-pass] madeira-duo: GPU timestamps run at %.4f ns per tick\n", r);
+    g_gpt_ns_per_tick = r;
+  }
+  g_gpt_ref_gpu = gpu; g_gpt_ref_ns = ns;
+}
+
+/* The timing state of a command buffer being encoded; a new one when the buffer
+ * starts encoding inside a window (create). Caller holds g_gpt_lock. */
+static struct gpt_cb *gpt_find_locked(id cb, int create) {
+  struct gpt_cb *freeslot = NULL;
+  for (unsigned i = 0; i < GPT_STATES; i++) {
+    struct gpt_cb *g = g_gpt_state[i];
+    if (g && g->busy && g->cb == cb) return g;
+  }
+  if (!create) return NULL;
+  for (unsigned i = 0; i < GPT_STATES && !freeslot; i++) {
+    if (!g_gpt_state[i]) g_gpt_state[i] = calloc(1, sizeof(struct gpt_cb));
+    if (g_gpt_state[i] && !g_gpt_state[i]->busy) freeslot = g_gpt_state[i];
+  }
+  if (!freeslot) { g_gpt_lost++; return NULL; }
+  if (!freeslot->sb) {
+    MTLCounterSampleBufferDescriptor *d = [[MTLCounterSampleBufferDescriptor alloc] init];
+    NSError *err = nil;
+    d.counterSet = g_gpt_set;
+    d.storageMode = MTLStorageModeShared;
+    d.sampleCount = GPT_SAMPLES;
+    d.label = @"madeira gpu-pass-timing";
+    freeslot->sb = [[(id<MTLCommandBuffer>)cb device] newCounterSampleBufferWithDescriptor:d error:&err];
+    [d release];
+    if (!freeslot->sb) {
+      fprintf(stderr, "[gpu-pass] madeira-duo: no counter sample buffer (%s); gpu-pass-timing off\n",
+              err ? err.localizedDescription.UTF8String : "no error given");
+      g_gpt_ok = 0;
+      return NULL;
+    }
+  }
+  freeslot->busy = 1; freeslot->cb = cb; freeslot->n_enc = 0; freeslot->n_samp = 0;
+  atomic_fetch_add_explicit(&g_gpt_open, 1, memory_order_relaxed);
+  return freeslot;
+}
+
+/* Reserve samples for an encoder about to be created on cb: returns the state
+ * and sets *idx, or NULL when this encoder isn't timed. */
+static struct gpt_cb *gpt_begin(id cb, unsigned kind, unsigned nsamp, unsigned w, unsigned h, unsigned *idx) {
+  struct gpt_cb *g;
+  if (!gpt_period() || !cb) return NULL;
+  if (g_gpt_ok == 0) return NULL;
+  os_unfair_lock_lock(&g_gpt_lock);
+  g = gpt_find_locked(cb, 0);
+  if (!g && gpt_window() && gpt_device_ready([(id<MTLCommandBuffer>)cb device])) {
+    gpt_calibrate([(id<MTLCommandBuffer>)cb device]);
+    g = gpt_find_locked(cb, 1);
+  }
+  if (g && (g->n_enc >= GPT_MAX_ENC || g->n_samp + nsamp > GPT_SAMPLES)) g = NULL;
+  if (g) {
+    struct gpt_enc *e = &g->enc[g->n_enc];
+    e->encoder = nil; e->base = (uint16_t)g->n_samp; e->nsamp = (uint16_t)nsamp;
+    e->w = (uint16_t)(w > 65535 ? 65535 : w); e->h = (uint16_t)(h > 65535 ? 65535 : h);
+    e->kind = (uint8_t)kind; e->label[0] = 0;
+    *idx = g->n_enc++; g->n_samp += nsamp;
+  }
+  os_unfair_lock_unlock(&g_gpt_lock);
+  return g;
+}
+
+static void gpt_created(struct gpt_cb *g, unsigned idx, id encoder) {
+  if (!g) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  if (encoder) g->enc[idx].encoder = encoder;
+  else g->enc[idx].nsamp = 0;   /* the encoder wasn't created: nothing to read */
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+/* At endEncoding: keep the encoder's label (set right after it was created). */
+static void gpt_end(id encoder) {
+  if (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed)) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  for (unsigned i = 0; i < GPT_STATES; i++) {
+    struct gpt_cb *g = g_gpt_state[i];
+    if (!g || !g->busy || !g->cb || !g->n_enc) continue;
+    for (unsigned k = g->n_enc; k-- > 0;) {
+      if (g->enc[k].encoder != encoder) continue;
+      NSString *l = [(id<MTLCommandEncoder>)encoder label];
+      const char *s = l ? l.UTF8String : NULL;
+      if (s) {   /* drop the "#<seq>" so passes of the same kind sum together */
+        char *o = g->enc[k].label, *end = o + sizeof g->enc[k].label - 1;
+        while (*s && o < end) {
+          if (*s == '#') { s++; while (*s >= '0' && *s <= '9') s++; continue; }
+          *o++ = *s++;
+        }
+        *o = 0;
+      }
+      g->enc[k].encoder = nil;
+      os_unfair_lock_unlock(&g_gpt_lock);
+      return;
+    }
+  }
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+static int gpt_cmp_iv(const void *a, const void *b) {
+  const uint64_t *x = a, *y = b;
+  return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+static int gpt_cmp_key(const void *a, const void *b) {
+  const struct gpt_key *x = a, *y = b;
+  return x->span_ns < y->span_ns ? 1 : x->span_ns > y->span_ns ? -1 : 0;
+}
+
+static void gpt_report_locked(uint64_t now) {
+  unsigned presents = atomic_exchange_explicit(&g_gpt_presents, 0, memory_order_relaxed);
+  double f = presents ? (double)presents : 1.0, total = 0;
+  unsigned i, shown;
+  if (!g_gpt_cbs) return;
+  qsort(g_gpt_keys, g_gpt_nkeys, sizeof g_gpt_keys[0], gpt_cmp_key);
+  for (i = 0; i < g_gpt_nkeys; i++) total += g_gpt_keys[i].span_ns;
+  fprintf(stderr, "[gpu-pass] window: %u presents, %u command buffers, %u encoders timed, %u without samples (%u buffers missed); per frame: "
+          "GPU busy %.2f ms, encoders running %.2f ms (gaps %.2f ms), encoder time summed %.2f ms (overlap %.2f ms)\n",
+          presents, g_gpt_cbs, g_gpt_encs, g_gpt_nosamp, g_gpt_lost, g_gpt_busy_ns / f / 1e6, g_gpt_union_ns / f / 1e6,
+          (g_gpt_busy_ns - g_gpt_union_ns) / f / 1e6, g_gpt_sum_ns / f / 1e6, (g_gpt_sum_ns - g_gpt_union_ns) / f / 1e6);
+  for (i = 0, shown = 0; i < g_gpt_nkeys && shown < 40; i++, shown++) {
+    struct gpt_key *k = &g_gpt_keys[i];
+    fprintf(stderr, "[gpu-pass] %2u %6.2f ms/f %4.1f%% x%-5.1f %c %4ux%-4u vtx %5.2f frag %5.2f | %s\n", i + 1,
+            k->span_ns / f / 1e6, total > 0 ? 100.0 * k->span_ns / total : 0.0, k->count / f,
+            k->kind == 0 ? 'R' : k->kind == 1 ? 'C' : 'B', k->w, k->h, k->vtx_ns / f / 1e6, k->frag_ns / f / 1e6,
+            k->label[0] ? k->label : "(no label: encoder-labels = 1)");
+  }
+  g_gpt_nkeys = 0; g_gpt_cbs = 0; g_gpt_encs = 0; g_gpt_lost = 0; g_gpt_nosamp = 0;
+  g_gpt_busy_ns = g_gpt_union_ns = g_gpt_sum_ns = 0;
+  g_gpt_win_start = 0;
+  (void)now;
+}
+
+static void gpt_complete(struct gpt_cb *g, id<MTLCommandBuffer> buffer) {
+  NSData *data = nil;
+  const MTLCounterResultTimestamp *ts;
+  uint64_t (*iv)[2] = NULL, cb0 = 0;
+  unsigned n = 0, i, dump = 0;
+  double npt, union_ns = 0, sum_ns = 0, busy_ns;
+  if (g->n_samp && g_gpt_ns_per_tick > 0)
+    data = [g->sb resolveCounterRange:NSMakeRange(0, g->n_samp)];
+  if (data.length < g->n_samp * sizeof(MTLCounterResultTimestamp)) data = nil;
+  busy_ns = (buffer.GPUEndTime - buffer.GPUStartTime) * 1e9;
+  os_unfair_lock_lock(&g_gpt_lock);
+  npt = g_gpt_ns_per_tick;
+  if (data && (iv = malloc(sizeof *iv * g->n_enc))) {
+    uint64_t now = gpt_now_ns();
+    ts = data.bytes;
+    if (!g_gpt_dump_left && g_gpt_dump_s > 0 && (!g_gpt_last_dump || now - g_gpt_last_dump >= (uint64_t)g_gpt_dump_s * 1000000000ull)) {
+      g_gpt_last_dump = now; g_gpt_dump_left = 3;   /* about one frame's command buffers */
+    }
+    if (g_gpt_dump_left && g->n_enc >= 5) { dump = 1; g_gpt_dump_left--; }
+    for (i = 0; i < g->n_enc; i++) {
+      const struct gpt_enc *e = &g->enc[i];
+      uint64_t s = ~0ull, t = 0, v = 0, fr = 0;
+      unsigned k;
+      if (!e->nsamp) continue;
+      for (k = 0; k < e->nsamp; k++) {
+        uint64_t x = ts[e->base + k].timestamp;
+        if (x == MTLCounterErrorValue || !x) continue;
+        if (x < s) s = x;
+        if (x > t) t = x;
+      }
+      if (t <= s) { g_gpt_nosamp++; continue; }   /* no usable samples (all zero or MTLCounterErrorValue) */
+      if (e->kind == 0) {
+        uint64_t a = ts[e->base].timestamp, b = ts[e->base + 1].timestamp;
+        uint64_t c = ts[e->base + 2].timestamp, d = ts[e->base + 3].timestamp;
+        if (a != MTLCounterErrorValue && b != MTLCounterErrorValue && b > a) v = b - a;
+        if (c != MTLCounterErrorValue && d != MTLCounterErrorValue && d > c) fr = d - c;
+      }
+      if (!n || s < cb0) cb0 = s;
+      iv[n][0] = s; iv[n][1] = t; n++;
+      sum_ns += (t - s) * npt;
+      {   /* sum per pass */
+        struct gpt_key *key = NULL;
+        unsigned j;
+        for (j = 0; j < g_gpt_nkeys; j++)
+          if (g_gpt_keys[j].kind == e->kind && g_gpt_keys[j].w == e->w && g_gpt_keys[j].h == e->h &&
+              !strcmp(g_gpt_keys[j].label, e->label)) { key = &g_gpt_keys[j]; break; }
+        if (!key && g_gpt_nkeys < GPT_KEYS) {
+          key = &g_gpt_keys[g_gpt_nkeys++];
+          memset(key, 0, sizeof *key);
+          memcpy(key->label, e->label, sizeof key->label);
+          key->kind = e->kind; key->w = e->w; key->h = e->h;
+        }
+        if (key) { key->count++; key->span_ns += (t - s) * npt; key->vtx_ns += v * npt; key->frag_ns += fr * npt; }
+      }
+    }
+    if (dump) {
+      fprintf(stderr, "[gpu-pass-dump] command buffer: GPU %.2f ms, %u encoders (start offset us, span us, vtx us, frag us)\n",
+              busy_ns / 1e3 / 1e3, g->n_enc);
+      for (i = 0; i < g->n_enc && i < 400; i++) {
+        const struct gpt_enc *e = &g->enc[i];
+        uint64_t a = ~0ull, b = 0;
+        unsigned k;
+        if (!e->nsamp) continue;
+        for (k = 0; k < e->nsamp; k++) {
+          uint64_t x = ts[e->base + k].timestamp;
+          if (x == MTLCounterErrorValue || !x) continue;
+          if (x < a) a = x;
+          if (x > b) b = x;
+        }
+        if (b <= a) { fprintf(stderr, "[gpu-pass-dump] %3u  (no samples) %c %ux%u %s\n", i, e->kind == 0 ? 'R' : e->kind == 1 ? 'C' : 'B', e->w, e->h, e->label); continue; }
+        fprintf(stderr, "[gpu-pass-dump] %3u %8.1f %7.1f", i, (a - cb0) * npt / 1e3, (b - a) * npt / 1e3);
+        if (e->kind == 0) {
+          uint64_t p = ts[e->base].timestamp, q = ts[e->base + 1].timestamp, r = ts[e->base + 2].timestamp, s2 = ts[e->base + 3].timestamp;
+          fprintf(stderr, " %7.1f %7.1f", (p != MTLCounterErrorValue && q > p) ? (q - p) * npt / 1e3 : 0.0,
+                  (r != MTLCounterErrorValue && s2 > r) ? (s2 - r) * npt / 1e3 : 0.0);
+        } else fprintf(stderr, "       -       -");
+        fprintf(stderr, " %c %ux%u %s\n", e->kind == 0 ? 'R' : e->kind == 1 ? 'C' : 'B', e->w, e->h, e->label);
+      }
+    }
+    qsort(iv, n, sizeof *iv, gpt_cmp_iv);
+    {
+      uint64_t cs = 0, ce = 0;
+      for (i = 0; i < n; i++) {
+        if (!i || iv[i][0] > ce) { if (i) union_ns += (ce - cs) * npt; cs = iv[i][0]; ce = iv[i][1]; }
+        else if (iv[i][1] > ce) ce = iv[i][1];
+      }
+      if (n) union_ns += (ce - cs) * npt;
+    }
+    free(iv);
+    g_gpt_cbs++; g_gpt_encs += n;
+    if (busy_ns > 0) g_gpt_busy_ns += busy_ns;
+    g_gpt_union_ns += union_ns; g_gpt_sum_ns += sum_ns;
+    if (!g_gpt_win_start) g_gpt_win_start = now;
+  }
+  g->busy = 0; g->cb = nil;
+  atomic_fetch_sub_explicit(&g_gpt_open, 1, memory_order_relaxed);
+  /* one report per period, once the window's buffers have come back (or 3 s on,
+   * should a timed buffer never complete) */
+  if (g_gpt_cbs && !gpt_window() &&
+      (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed) || gpt_now_ns() - g_gpt_win_start >= 3000000000ull))
+    gpt_report_locked(gpt_now_ns());
+  os_unfair_lock_unlock(&g_gpt_lock);
+}
+
+/* At commit: read the samples once the GPU is done with the buffer. */
+static void gpt_commit(id<MTLCommandBuffer> cb) {
+  struct gpt_cb *g;
+  if (!atomic_load_explicit(&g_gpt_open, memory_order_relaxed)) return;
+  os_unfair_lock_lock(&g_gpt_lock);
+  g = gpt_find_locked(cb, 0);
+  if (g) g->cb = nil;
+  os_unfair_lock_unlock(&g_gpt_lock);
+  if (!g) return;
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> buffer) { gpt_complete(g, buffer); }];
+}
+
+/* Presents inside the timed second: the frames the window's numbers divide by. */
+static void gpt_note_present(void) {
+  if (g_gpt_ok == 1 && gpt_window())
+    atomic_fetch_add_explicit(&g_gpt_presents, 1, memory_order_relaxed);
+}
+
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
@@ -625,6 +984,7 @@ _MTLCommandBuffer_commit(void *obj) {
   }
   if (atomic_load_explicit(&g_madeira_gpu_meter, memory_order_relaxed))
     madeira_gpu_meter_attach((id<MTLCommandBuffer>)params->handle);
+  gpt_commit((id<MTLCommandBuffer>)params->handle);   /* madeira-duo gpu-pass-timing */
   [(id<MTLCommandBuffer>)params->handle commit];
   return STATUS_SUCCESS;
 }
@@ -1437,7 +1797,8 @@ static NSArray *madeira_arch_list;               /* saved chunks; replaced whole
 static dispatch_queue_t madeira_arch_q;          /* adds and saves, in order */
 static id<MTLDevice> madeira_arch_device;
 static id<MTLBinaryArchive> madeira_arch_open;   /* madeira_arch_q only */
-static unsigned madeira_arch_open_n, madeira_arch_next, madeira_arch_timer;
+static unsigned madeira_arch_open_n, madeira_arch_timer;
+static _Atomic unsigned madeira_arch_next;       /* the next chunk number: both queues take from it */
 static uint64_t madeira_arch_last_add;
 static _Atomic unsigned long long madeira_arch_bytes, madeira_arch_cap;   /* all chunks; the cap */
 static _Atomic long madeira_arch_hits, madeira_arch_misses, madeira_arch_added, madeira_arch_add_failed;
@@ -1447,10 +1808,37 @@ static struct madeira_arch_slot {
   os_unfair_lock lock;
   id<MTLBinaryArchive> open;
   unsigned n;
-  uint64_t last;
+  uint64_t last, first;   /* first: the oldest unsaved add (madeira-duo arch-age) */
 } madeira_arch_slots[MADEIRA_ARCH_SLOTS];
+static uint64_t madeira_arch_open_first;   /* madeira_arch_q only: the queue archive's oldest unsaved add */
+/* madeira-duo PROMPT SAVES (MADEIRA_PSO_ARCHIVE_PROMPT, default 1; 0 = as before).
+ * The slots were saved by a timer on madeira_arch_q, a utility queue. In a map the game
+ * fills the efficiency cores and that queue hardly runs: Path of Exile 2 logs of
+ * 2026-11-25 show a 3.5 minute session that added 50 pipelines and saved 12 (its only
+ * saves came 11 s and 0 s before it ended), one of 10 minutes that left 31 of 451
+ * unsaved and saved 92 in one chunk, and one that left 82 of 176. Each lost pipeline is
+ * compiled again by the next session that draws it (0.5-0.6 s each). With the switch on:
+ * a slot whose oldest unsaved add has reached the age is handed over by the add that
+ * finds it so (no timer needed while adds keep coming); slot saves and their timer run on
+ * a user-initiated queue of their own, outside the slot lock; and everything unsaved is
+ * saved when the app leaves the foreground. */
+static dispatch_queue_t madeira_arch_save_q;     /* slot saves; NULL = on madeira_arch_q as before */
+static _Atomic int madeira_arch_slot_timer;
+static void madeira_arch_flush(void);
+static uint64_t madeira_arch_max_age_ns(void);
+static _Atomic long madeira_arch_fg_inline;
+static _Atomic uint64_t madeira_arch_fg_inline_ns;
 static _Atomic long madeira_arch_inline, madeira_arch_inline_slow;
 static _Atomic uint64_t madeira_arch_inline_add_ns, madeira_arch_inline_create_ns;
+
+static int madeira_arch_prompt_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_PSO_ARCHIVE_PROMPT");
+    on = !(e && !strcmp(e, "0"));
+  }
+  return on;
+}
 
 static int madeira_arch_inline_on(void) {
   static int on = -1;
@@ -1501,6 +1889,24 @@ static void madeira_arch_load(id<MTLDevice> device) {
   madeira_arch_device = [device retain];
   madeira_arch_q = dispatch_queue_create("madeira.pso-archive",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  if (madeira_arch_prompt_on()) {   /* madeira-duo prompt saves */
+    madeira_arch_save_q = dispatch_queue_create("madeira.pso-archive.save",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    fprintf(stderr, "[pso-archive] prompt saves: a slot is saved once its oldest add is %llu s old, on a queue of its own, "
+                    "and when the app leaves the foreground (MADEIRA_PSO_ARCHIVE_PROMPT=0 = the timer only)\n",
+            (unsigned long long)(madeira_arch_max_age_ns() / 1000000000ull));
+    @autoreleasepool {
+      NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+      /* by name: no UIKit symbol, so the same source builds for every target */
+      for (NSString *name in @[ @"UIApplicationWillResignActiveNotification",
+                                @"UIApplicationDidEnterBackgroundNotification",
+                                @"UIApplicationWillTerminateNotification" ])
+        [nc addObserverForName:name object:nil queue:nil usingBlock:^(NSNotification *note) {
+          (void)note;
+          madeira_arch_flush();
+        }];
+    }
+  }
   if ((d = opendir(madeira_arch_dir))) {
     while ((e = readdir(d))) {
       char path[1200];
@@ -1558,6 +1964,9 @@ static void madeira_arch_load(id<MTLDevice> device) {
           cap >> 20, madeira_arch_dir, bad, old);
 }
 
+static int madeira_arch_in_use(void) {   /* madeira-duo overlay-shader: lookups are on */
+  return atomic_load_explicit(&madeira_arch_named, memory_order_acquire) == 2;
+}
 static int madeira_arch_full(void) {
   return atomic_load_explicit(&madeira_arch_bytes, memory_order_relaxed) >=
          atomic_load_explicit(&madeira_arch_cap, memory_order_relaxed);
@@ -1580,7 +1989,8 @@ static void madeira_arch_say(const char *what) {
   long added = atomic_load_explicit(&madeira_arch_added, memory_order_relaxed);
   long in = atomic_load_explicit(&madeira_arch_inline, memory_order_relaxed);
   fprintf(stderr, "[pso-archive] %s: %ld pipelines found in the saved chunks, %ld not (%ld added, avg %.1f ms "
-                  "an add, %ld failed); inline %ld (avg %.1f ms the add, %.1f ms the create from it, %ld created slowly)\n",
+                  "an add, %ld failed); inline %ld (avg %.1f ms the add, %.1f ms the create from it, %ld created slowly; "
+                  "for the game %ld, avg %.1f ms the add)\n",
           what,
           atomic_load_explicit(&madeira_arch_hits, memory_order_relaxed),
           atomic_load_explicit(&madeira_arch_misses, memory_order_relaxed), added,
@@ -1588,12 +1998,113 @@ static void madeira_arch_say(const char *what) {
           atomic_load_explicit(&madeira_arch_add_failed, memory_order_relaxed), in,
           in ? (double)atomic_load_explicit(&madeira_arch_inline_add_ns, memory_order_relaxed) / 1e6 / in : 0.0,
           in ? (double)atomic_load_explicit(&madeira_arch_inline_create_ns, memory_order_relaxed) / 1e6 / in : 0.0,
-          atomic_load_explicit(&madeira_arch_inline_slow, memory_order_relaxed));
+          atomic_load_explicit(&madeira_arch_inline_slow, memory_order_relaxed),
+          atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed),
+          atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed)
+              ? (double)atomic_load_explicit(&madeira_arch_fg_inline_ns, memory_order_relaxed) / 1e6 /
+                    atomic_load_explicit(&madeira_arch_fg_inline, memory_order_relaxed)
+              : 0.0);
 }
 
+/* madeira-duo: set by every pipeline the saved chunks answered; pso-warm reads it around
+ * its own create to tell a hit from a compile (its wall time can't: a utility-QoS warm-up
+ * waits seconds for a core while a game saturates them, so hits looked like compiles). */
+static _Thread_local int madeira_pso_warm_hit;
 static void madeira_arch_note_hit(void) {
   long n = atomic_fetch_add_explicit(&madeira_arch_hits, 1, memory_order_relaxed) + 1;
+  madeira_pso_warm_hit = 1;
   if (n == 1 || (n % 2000) == 0) madeira_arch_say(n == 1 ? "first pipeline from the saved chunks" : "so far");
+}
+
+/* madeira-duo overlay-shader: pipelines the saved chunks did not have, compiled for the
+ * game (inline add, queued add, or a plain create once the archive is full); pso-warm's
+ * own background compiles are left out (madeira_pso_warm_self). One relaxed add on a
+ * path that compiles anyway; read by madeira_shader_overlay_stats. */
+static _Atomic unsigned long long madeira_ovl_arch_miss;
+static _Thread_local int madeira_pso_warm_self;
+static void madeira_ovl_note_miss(void) {
+  if (!madeira_pso_warm_self) atomic_fetch_add_explicit(&madeira_ovl_arch_miss, 1, memory_order_relaxed);
+}
+
+/* madeira-duo warm-yield: pso-warm's background compiles share Metal's compiler with
+ * the pipelines the game is waiting for. In Path of Exile 2 (log 2026-11-15 01:17) it
+ * compiled ~4 compute pipelines a second while new maps loaded and the game's own render
+ * pipelines got ~1 a second; 815 warm compiles against 383 render ones, most of the
+ * warmed ones never dispatched. A warm-up that missed the saved chunks now waits, before
+ * it compiles, until no compile for the game is running and the last one ended 500 ms
+ * ago. Archive hits still go straight through. MADEIRA_PSO_WARM_YIELD=0: no waiting. */
+static _Atomic int madeira_fg_compiling;
+static _Atomic uint64_t madeira_fg_last_ns, madeira_warm_yield_ns;
+static _Atomic long madeira_warm_yields;
+static void madeira_warm_yield(void) {
+  static int on = -1;
+  uint64_t t0, now;
+  int waited = 0;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_PSO_WARM_YIELD");
+    on = !(e && !strcmp(e, "0"));
+  }
+  if (!on) return;
+  t0 = now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  while (atomic_load_explicit(&madeira_fg_compiling, memory_order_relaxed) > 0 ||
+         now - atomic_load_explicit(&madeira_fg_last_ns, memory_order_relaxed) < 500000000ull) {
+    { struct timespec ts = { 0, 20000000 }; nanosleep(&ts, NULL); }
+    waited = 1;
+    now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  }
+  if (waited) {
+    atomic_fetch_add_explicit(&madeira_warm_yields, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&madeira_warm_yield_ns, now - t0, memory_order_relaxed);
+  }
+}
+/* Around a compile after a lookup miss: 1 = a compile for the game (counted), 0 = a
+ * warm-up (it has waited its turn). */
+static int madeira_compile_begin(void) {
+  if (madeira_pso_warm_self) { madeira_warm_yield(); return 0; }
+  atomic_fetch_add_explicit(&madeira_fg_compiling, 1, memory_order_relaxed);
+  return 1;
+}
+static void madeira_compile_end(int fg) {
+  if (fg <= 0) return;
+  atomic_store_explicit(&madeira_fg_last_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), memory_order_relaxed);
+  atomic_fetch_sub_explicit(&madeira_fg_compiling, 1, memory_order_relaxed);
+}
+
+/* madeira-duo overlay-shader: the performance overlay's shader cells, read once per
+ * overlay tick. madeira-d3d12 keeps its counts after the fps-gov fields of the counter
+ * block it publishes with MadeiraCtl op 5 (struct mad_xp in madeira_d3d12.c; byte 184,
+ * after struct ios_xp_pe and struct ios_xp_pe_cap in server_ios.c). Cumulative counts
+ * (the overlay takes the rate) and current queue depths:
+ *   shader_misses    stages madeira-d3d12's shader cache did not have (converted or refused)
+ *   pipeline_misses  pipelines the pso-archive did not have, compiled for the game
+ *   pso_queue        pso-async: pipelines a draw is waiting for, queued or being built
+ *   pso_background   pso-create-build / cs-create-build: queued at creation, not built yet
+ * flags: 1 = madeira-d3d12's block is there, 2 = its shader cache is on, 4 = pso-async
+ * is on, 8 = the pso-archive is in use. Without the block the d3d12 figures are 0. */
+#define MADEIRA_XP_SHADER_AT 184
+struct madeira_xp_shader { int64_t magic, flags, sc_miss, pa_wait, pcb_wait; };
+extern volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;
+void madeira_shader_overlay_stats(unsigned long long *shader_misses, unsigned long long *pipeline_misses,
+                                  long long *pso_queue, long long *pso_background, int *flags) {
+  uint64_t block = ios_xp_pe_block, len = ios_xp_pe_len;
+  int f = madeira_arch_in_use() ? 8 : 0;
+  *shader_misses = 0; *pso_queue = 0; *pso_background = 0;
+  *pipeline_misses = atomic_load_explicit(&madeira_ovl_arch_miss, memory_order_relaxed);
+  /* The block is the game process's memory, which goes when the game exits (Steam can
+   * stay): read it with vm_read_overwrite, as server_ios.c reads guest memory, so a
+   * stale address gives no figures instead of a fault. */
+  if (block && len >= MADEIRA_XP_SHADER_AT + sizeof(struct madeira_xp_shader)) {
+    struct madeira_xp_shader x;
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(block + MADEIRA_XP_SHADER_AT), sizeof x, (vm_address_t)&x,
+                          &got) == KERN_SUCCESS && got == sizeof x && x.magic == 0x31304448534d4d4dLL) {
+      f |= 1 | (int)(x.flags & 3) << 1;
+      *shader_misses = (unsigned long long)x.sc_miss;
+      *pso_queue = x.pa_wait > 0 ? x.pa_wait : 0;
+      *pso_background = x.pcb_wait > 0 ? x.pcb_wait : 0;
+    }
+  }
+  *flags = f;
 }
 
 /* madeira_arch_q: an archive of n pipelines becomes the next chunk file and joins
@@ -1647,28 +2158,41 @@ static void madeira_arch_save(void) {
 
 /* madeira_arch_q: a slot's archive, handed over when it filled up or went idle. */
 static void madeira_arch_save_handed(id<MTLBinaryArchive> open, unsigned n) {
-  dispatch_async(madeira_arch_q, ^{
+  dispatch_async(madeira_arch_save_q ? madeira_arch_save_q : madeira_arch_q, ^{
     @autoreleasepool { madeira_arch_save_archive(open, n); }
     [open release];
   });
 }
 
-/* madeira_arch_q: save the open archive once 10 s have passed without an add. */
+/* madeira_arch_q: save the open archive once 10 s have passed without an add.
+ * madeira-duo arch-age: or once its oldest unsaved add is MADEIRA_PSO_ARCHIVE_MAX_AGE
+ * seconds old (default 20). In a map the adds never stop for 10 s, so a session that
+ * ended there (killed, or the app closed) lost up to five part-filled archives: 50-228
+ * pipelines a session in Path of Exile 2's logs, which the next visit compiled again. */
+static uint64_t madeira_arch_max_age_ns(void) {
+  static uint64_t v;
+  if (!v) {
+    const char *e = getenv("MADEIRA_PSO_ARCHIVE_MAX_AGE");
+    long s = e ? atol(e) : 20;
+    v = (uint64_t)(s >= 2 && s <= 600 ? s : 20) * 1000000000ull;
+  }
+  return v;
+}
 static void madeira_arch_arm(void) {
   if (madeira_arch_timer) return;
   madeira_arch_timer = 1;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), madeira_arch_q, ^{
-    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), madeira_arch_q, ^{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), age = madeira_arch_max_age_ns();
     int again = 0;
     madeira_arch_timer = 0;
     if (madeira_arch_open_n) {
-      if (now - madeira_arch_last_add >= 9500000000ull) madeira_arch_save();
+      if (now - madeira_arch_last_add >= 9500000000ull || now - madeira_arch_open_first >= age) madeira_arch_save();
       else again = 1;
     }
-    for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
+    for (unsigned i = 0; !madeira_arch_save_q && i < MADEIRA_ARCH_SLOTS; i++) {   /* a slot in use is busy, not idle */
       struct madeira_arch_slot *s = &madeira_arch_slots[i];
       if (!os_unfair_lock_trylock(&s->lock)) { again = 1; continue; }
-      if (s->n && now - s->last >= 9500000000ull) {
+      if (s->n && (now - s->last >= 9500000000ull || now - s->first >= age)) {
         @autoreleasepool { madeira_arch_save_archive(s->open, s->n); }
         [s->open release];
         s->open = nil;
@@ -1680,6 +2204,68 @@ static void madeira_arch_arm(void) {
     }
     if (again) madeira_arch_arm();
   });
+}
+
+/* madeira-duo prompt saves. Any thread: save the slots that went idle or reached the age;
+ * force = every slot with unsaved adds, waiting for an add in progress. The archive leaves
+ * its slot under the lock and is written outside it. Returns the slots still holding
+ * unsaved adds. */
+static unsigned madeira_arch_sweep_slots(int force) {
+  uint64_t age = madeira_arch_max_age_ns();
+  unsigned left = 0;
+  for (unsigned i = 0; i < MADEIRA_ARCH_SLOTS; i++) {
+    struct madeira_arch_slot *s = &madeira_arch_slots[i];
+    id<MTLBinaryArchive> open = nil;
+    unsigned n = 0;
+    uint64_t now;
+    if (force) os_unfair_lock_lock(&s->lock);
+    else if (!os_unfair_lock_trylock(&s->lock)) { left++; continue; }
+    now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (s->n && (force || now - s->last >= 9500000000ull || now - s->first >= age)) {
+      open = s->open;
+      n = s->n;
+      s->open = nil;
+      s->n = 0;
+    } else if (s->n) {
+      left++;
+    }
+    os_unfair_lock_unlock(&s->lock);
+    if (open) {
+      @autoreleasepool { madeira_arch_save_archive(open, n); }
+      [open release];
+    }
+  }
+  return left;
+}
+
+/* Any thread: the slots are looked at again in 5 s, on the save queue, while one holds unsaved adds. */
+static void madeira_arch_slot_arm(void) {
+  if (atomic_exchange_explicit(&madeira_arch_slot_timer, 1, memory_order_relaxed)) return;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), madeira_arch_save_q, ^{
+    atomic_store_explicit(&madeira_arch_slot_timer, 0, memory_order_relaxed);
+    if (madeira_arch_sweep_slots(0)) madeira_arch_slot_arm();
+  });
+}
+
+/* The app is leaving the foreground (the poster's thread: returns at once). iOS may never
+ * run this process again, so every unsaved add is saved now; the activity asks iOS for the
+ * time to finish. */
+static void madeira_arch_flush_now(void) {
+  fprintf(stderr, "[pso-archive] the app is leaving the foreground: unsaved pipelines are saved now\n");
+  dispatch_sync(madeira_arch_save_q, ^{ madeira_arch_sweep_slots(1); });
+  dispatch_sync(madeira_arch_q, ^{
+    if (madeira_arch_open_n) madeira_arch_save();
+  });
+}
+static void madeira_arch_flush(void) {
+  if (!madeira_arch_save_q || !madeira_arch_q) return;
+#if TARGET_OS_IOS
+  [[NSProcessInfo processInfo] performExpiringActivityWithReason:@"madeira.pso-archive" usingBlock:^(BOOL expired) {
+    if (!expired) madeira_arch_flush_now();
+  }];
+#else
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ madeira_arch_flush_now(); });
+#endif
 }
 
 /* A pipeline the saved chunks did not have, created: add its functions to the
@@ -1710,6 +2296,7 @@ static void madeira_arch_add(id descriptor, int kind) {
       if (ok && !err) {
         atomic_fetch_add_explicit(&madeira_arch_added, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&madeira_arch_add_ns, madeira_arch_last_add - t0, memory_order_relaxed);
+        if (!madeira_arch_open_n) madeira_arch_open_first = madeira_arch_last_add;   /* madeira-duo arch-age */
         if (++madeira_arch_open_n >= MADEIRA_ARCH_CHUNK) madeira_arch_save();
       } else if (atomic_fetch_add_explicit(&madeira_arch_add_failed, 1, memory_order_relaxed) < 3) {
         fprintf(stderr, "[pso-archive] an add failed: %s\n",
@@ -1761,8 +2348,17 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
       atomic_fetch_add_explicit(&madeira_arch_inline_create_ns, t2 - t1, memory_order_relaxed);
       if (t2 - t1 > 20000000ull)   /* not taken from the archive: compiled again */
         atomic_fetch_add_explicit(&madeira_arch_inline_slow, 1, memory_order_relaxed);
+      if (!madeira_pso_warm_self) {   /* madeira-duo: the adds the game waited for, apart from pso-warm's */
+        atomic_fetch_add_explicit(&madeira_arch_fg_inline, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&madeira_arch_fg_inline_ns, t1 - t0, memory_order_relaxed);
+      }
+      if (!s->n) s->first = t2;   /* madeira-duo arch-age */
       if (++s->n >= MADEIRA_ARCH_CHUNK) {
         madeira_arch_save_handed(s->open, s->n);   /* the queue takes the reference */
+        s->open = nil;
+        s->n = 0;
+      } else if (madeira_arch_save_q && t2 - s->first >= madeira_arch_max_age_ns()) {
+        madeira_arch_save_handed(s->open, s->n);   /* madeira-duo prompt saves: old enough, no timer needed */
         s->open = nil;
         s->n = 0;
       }
@@ -1773,6 +2369,7 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
   }
   os_unfair_lock_unlock(&s->lock);
   if (pso) dispatch_async(madeira_arch_q, ^{ madeira_arch_arm(); });
+  if (pso && madeira_arch_save_q) madeira_arch_slot_arm();   /* madeira-duo prompt saves */
   return pso;
 }
 
@@ -1817,14 +2414,27 @@ _MTLDevice_newComputePipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create(device, descriptor, 1, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso =
         (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 1);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -1846,7 +2456,19 @@ _MTLCommandBuffer_blitCommandEncoder(void *obj) {
     wmtr_enc_note(params->ret, params->handle);  /* ml820: blit destinations read back per cmdbuf */
     return STATUS_SUCCESS;
   }
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoder];
+  {   /* madeira-duo gpu-pass-timing: a timed blit takes its samples through a pass descriptor */
+    unsigned gi = 0;
+    struct gpt_cb *gt = gpt_begin((id)params->handle, 2, 2, 0, 0, &gi);
+    if (gt) {
+      MTLBlitPassDescriptor *bd = [MTLBlitPassDescriptor blitPassDescriptor];
+      bd.sampleBufferAttachments[0].sampleBuffer = gt->sb;
+      bd.sampleBufferAttachments[0].startOfEncoderSampleIndex = gt->enc[gi].base;
+      bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = gt->enc[gi].base + 1;
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoderWithDescriptor:bd];
+      gpt_created(gt, gi, (id)params->ret);
+    } else
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle blitCommandEncoder];
+  }
   if (params->ret && madeira_frame_hooks_on()) ios_frame_pass(1, 0, 0, 0);
   return STATUS_SUCCESS;
 }
@@ -1864,8 +2486,21 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
     if (!params->ret) fprintf(stderr, "[wmt-remote] host refused a compute encoder\n");
     return STATUS_SUCCESS;
   }
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle
-      computeCommandEncoderWithDispatchType:params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+  {   /* madeira-duo gpu-pass-timing: a timed compute encoder takes its samples through a pass descriptor */
+    unsigned gi = 0;
+    struct gpt_cb *gt = gpt_begin((id)params->handle, 1, 2, 0, 0, &gi);
+    if (gt) {
+      MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+      cd.dispatchType = params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+      cd.sampleBufferAttachments[0].sampleBuffer = gt->sb;
+      cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = gt->enc[gi].base;
+      cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = gt->enc[gi].base + 1;
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle computeCommandEncoderWithDescriptor:cd];
+      gpt_created(gt, gi, (id)params->ret);
+    } else
+      params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle
+          computeCommandEncoderWithDispatchType:params->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+  }
   if (params->ret && madeira_frame_hooks_on()) ios_frame_pass(2, 0, 0, 0);
   return STATUS_SUCCESS;
 }
@@ -1965,7 +2600,26 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
-  params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
+  {   /* madeira-duo gpu-pass-timing: vertex and fragment start/end samples for a timed pass */
+    unsigned gi = 0, gw = info->render_target_width, gh = info->render_target_height;
+    struct gpt_cb *gt;
+    if (!gw && gpt_period()) {
+      id<MTLTexture> t = (id<MTLTexture>)(info->colors[0].texture ? info->colors[0].texture : info->depth.texture);
+      unsigned lv = info->colors[0].texture ? info->colors[0].level : info->depth.level;
+      if (t) { gw = (unsigned)(t.width >> lv); gh = (unsigned)(t.height >> lv); if (!gw) gw = 1; if (!gh) gh = 1; }
+    }
+    gt = gpt_begin((id)params->handle, 0, 4, gw, gh, &gi);
+    if (gt) {
+      MTLRenderPassSampleBufferAttachmentDescriptor *sa = descriptor.sampleBufferAttachments[0];
+      sa.sampleBuffer = gt->sb;
+      sa.startOfVertexSampleIndex = gt->enc[gi].base;
+      sa.endOfVertexSampleIndex = gt->enc[gi].base + 1;
+      sa.startOfFragmentSampleIndex = gt->enc[gi].base + 2;
+      sa.endOfFragmentSampleIndex = gt->enc[gi].base + 3;
+    }
+    params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
+    gpt_created(gt, gi, (id)params->ret);
+  }
 
   /* Count realized native passes, including clears and the final present.
    * No new PE ABI or emulated hot-path counters are needed. */
@@ -2001,6 +2655,7 @@ _MTLCommandEncoder_endEncoding(void *obj) {
     wmtr_call(RM_OP_END_ENCODING, &a, sizeof a, 0, 0, 0);
     return STATUS_SUCCESS;
   }
+  gpt_end((id)params->handle);   /* madeira-duo gpu-pass-timing: keep the label */
   [(id<MTLCommandEncoder>)params->handle endEncoding];
   return STATUS_SUCCESS;
 }
@@ -2121,8 +2776,20 @@ _MTLDevice_newRenderPipelineState(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
@@ -2131,6 +2798,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
                                                                                                   error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -2240,8 +2908,20 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
     if (params->ret_pso) madeira_arch_note_hit();
     else err = NULL;
   }
-  if (!params->ret_pso && madeira_arch)
+  if (!params->ret_pso && info->fail_on_binary_archive_miss && !info->num_binary_archives_for_lookup) {
+    /* madeira-duo pso-hit-probe: the caller asked for the saved chunks only (madeira-d3d12
+     * pso-create-block = 2). A miss returns no pipeline and no error, and compiles nothing;
+     * the caller builds it later the usual way, which counts the miss then. */
+    [madeira_arch release];
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
+  int madeira_fg = params->ret_pso ? -1 : madeira_compile_begin();   /* madeira-duo warm-yield */
+  if (!params->ret_pso && madeira_arch) {
+    madeira_ovl_note_miss();   /* madeira-duo overlay-shader */
     params->ret_pso = madeira_arch_create((id<MTLDevice>)params->device, descriptor, 0, options, &err);
+  }
   if (!params->ret_pso) {
     err = NULL;
     params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
@@ -2250,6 +2930,7 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
                                                                                                   error:&err];
     if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);
   }
+  madeira_compile_end(madeira_fg);   /* madeira-duo warm-yield */
   [madeira_arch release];
   params->ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
@@ -4013,6 +4694,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     return STATUS_SUCCESS;
   }
   int mode = g_madeira_vsync_mode;
+  gpt_note_present();   /* madeira-duo gpu-pass-timing */
   {   /* madeira-bcd fps-gov (tools/patch-winemetal-fps-cap.py): the governor's frame cap, opt-in */
     extern unsigned long long ios_fps_cap_dxmt_pace(void);
     unsigned long long fps_cap_ns = ios_fps_cap_dxmt_pace();
@@ -4070,6 +4752,7 @@ static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
   madeira_log_present_cadence("presentDrawableAfterMinDuration", params->arg1);
+  gpt_note_present();   /* madeira-duo gpu-pass-timing */
   madeira_frame_mark_drawable((id)params->arg0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
@@ -7057,14 +7740,15 @@ static int madeira_pso_warm_setup(void) {
 }
 
 /* One finished warm-up: tally it, and report every 500 and whenever the
- * backlog empties (at most every 10 s). A build under 3 ms was a cache hit. */
-static void madeira_pso_warm_note(uint64_t ns, int ok) {
+ * backlog empties (at most every 10 s). hit: the saved chunks had it. With no
+ * saved chunks in use, a build under 3 ms was a hit in Metal's own cache. */
+static void madeira_pso_warm_note(uint64_t ns, int ok, int hit) {
   long done = atomic_fetch_add_explicit(&madeira_pso_warm_done, 1, memory_order_relaxed) + 1;
   long sent = atomic_load_explicit(&madeira_pso_warm_sent, memory_order_relaxed);
   uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   if (!ok)
     atomic_fetch_add_explicit(&madeira_pso_warm_failed, 1, memory_order_relaxed);
-  else if (ns < 3000000) {
+  else if (hit || (!madeira_arch_in_use() && ns < 3000000)) {
     atomic_fetch_add_explicit(&madeira_pso_warm_hits, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&madeira_pso_warm_ns_hits, ns, memory_order_relaxed);
   } else
@@ -7078,9 +7762,10 @@ static void madeira_pso_warm_note(uint64_t ns, int ok) {
     double msh = (double)atomic_load_explicit(&madeira_pso_warm_ns_hits, memory_order_relaxed) / 1e6;
     atomic_store_explicit(&madeira_pso_warm_said_ns, now, memory_order_relaxed);
     fprintf(stderr, "[pso-warm] madeira-bcd %ld of %ld pipelines warmed: %ld compiled (avg %.1f ms), "
-                    "%ld already in Metal's cache (avg %.2f ms), %ld failed; %ld waiting\n",
+                    "%ld already in Metal's cache (avg %.2f ms), %ld failed; %ld waiting; %ld waited for the game's compiles (%.1f s)\n",
             done, sent, compiled, compiled > 0 ? msc / compiled : 0.0, hits, hits ? msh / hits : 0.0, failed,
-            sent > done ? sent - done : 0);
+            sent > done ? sent - done : 0, atomic_load_explicit(&madeira_warm_yields, memory_order_relaxed),
+            (double)atomic_load_explicit(&madeira_warm_yield_ns, memory_order_relaxed) / 1e9);
   }
 }
 
@@ -7128,6 +7813,8 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
     @autoreleasepool {
       uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
       obj_handle_t pso = 0;
+      madeira_pso_warm_self = 1;   /* madeira-duo overlay-shader: not a miss the game waits for */
+      madeira_pso_warm_hit = 0;
       if (kind == 2) {
         struct unixcall_mtldevice_newcomputepso p;
         memset(&p, 0, sizeof p);
@@ -7147,7 +7834,8 @@ static uint32_t madeira_pso_warm_submit(obj_handle_t device, const void *info, c
         _MTLDevice_newRenderPipelineState(&p);
         pso = p.ret_pso;
       }
-      madeira_pso_warm_note(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, pso != 0);
+      madeira_pso_warm_self = 0;
+      madeira_pso_warm_note(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, pso != 0, madeira_pso_warm_hit);
       if (pso) [(id)pso release];
       if (f0) [(id)f0 release];
       if (f1) [(id)f1 release];
@@ -7349,6 +8037,134 @@ static uint32_t madeira_rp_store(const struct madeira_rp_store_req *r) {
   return 1;
 }
 
+/* madeira-duo framegen-feed: MetalFX frame interpolation driven by the D3D12
+ * runtime (MadeiraCtl ops 30-32). MADEIRA_FRAMEGEN (madeira_fg_present, above)
+ * works on the finished drawable and has to guess everything: motion from
+ * block matching, a flat depth, a made-up camera, no idea where the HUD is,
+ * and it runs after the D3D12 runtime's spatial upscale, on four times the
+ * pixels. madeira-d3d12 has the real inputs: the motion vectors, depth and
+ * camera constants the game hands its own upscaler, the frame as it was just
+ * before the HUD was drawn, and the frame before the upscale. So it owns the
+ * textures and the policy (madeira.cfg framegen), and these ops are only the
+ * MetalFX and CAMetalLayer calls it cannot make itself:
+ *   30  make an interpolator. Input size: the motion and depth textures;
+ *       output size: the colour textures. ptr = 0 asks whether this OS has one.
+ *   31  encode one interpolated frame into the caller's command buffer.
+ *   32  present the generated frame, then the game's frame. With a frame cap
+ *       (vsync modes 1, 3, 4) each is held for half the cap's interval, so the
+ *       pair takes what one frame took and the drawable pool still gives the
+ *       game its back-pressure; without one the game's frame follows half a
+ *       frame time after the generated one.
+ * The request layouts are shared with madeira-d3d12 (struct mad_fg_*_req). */
+struct madeira_fgi_create_req {
+  uint64_t device;
+  uint32_t color_pf, output_pf, depth_pf, motion_pf, ui_pf;   /* WMTPixelFormat; ui_pf 0 = no UI texture */
+  uint32_t in_w, in_h, out_w, out_h;
+  uint32_t status;     /* out: 1 made, 2 this OS has no frame interpolator, 3 this GPU is not supported, 4 MetalFX refused */
+  uint64_t interp;     /* out: +1, the caller releases it */
+  uint32_t usage[5];   /* out: the MTLTextureUsage it asks of the colour, depth, motion, UI and output textures */
+  uint32_t pad;
+};
+struct madeira_fgi_encode_req {
+  uint64_t cb, interp, color, prev_color, depth, motion, ui, output, fence;   /* ui and fence may be 0 */
+  float mv_scale_x, mv_scale_y, delta_time, near_plane, far_plane, fov_y, aspect, jitter_x, jitter_y;
+  uint32_t flags;      /* 1 depth is reversed, 2 the UI texture is the frame with the UI composited, 4 reset history */
+};
+struct madeira_fgi_present_req {
+  uint64_t cb, first, second;   /* the generated frame's drawable, then the game's */
+  double frame_s;               /* the game's frame time, seconds */
+  uint32_t flags, pad;
+};
+_Static_assert(sizeof(struct madeira_fgi_create_req) == 80 && sizeof(struct madeira_fgi_encode_req) == 112 &&
+               sizeof(struct madeira_fgi_present_req) == 40, "framegen-feed request layouts are shared with madeira-d3d12");
+
+static uint32_t madeira_fgi_create(struct madeira_fgi_create_req *r) {
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    id<MTLDevice> dev;
+    if (!r) return 1;
+    r->status = 0; r->interp = 0;
+    dev = (id<MTLDevice>)(uintptr_t)r->device;
+    if (!dev || ![MTLFXFrameInterpolatorDescriptor supportsDevice:dev]) { r->status = 3; return 1; }
+    MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    desc.colorTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->color_pf);
+    desc.outputTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->output_pf);
+    desc.depthTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->depth_pf);
+    desc.motionTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->motion_pf);
+    if (r->ui_pf) desc.uiTextureFormat = to_metal_pixel_format((enum WMTPixelFormat)r->ui_pf);
+    desc.inputWidth = r->in_w;   desc.inputHeight = r->in_h;
+    desc.outputWidth = r->out_w; desc.outputHeight = r->out_h;
+    id<MTLFXFrameInterpolator> fi = [desc newFrameInterpolatorWithDevice:dev];
+    [desc release];
+    if (!fi) { r->status = 4; return 1; }
+    r->usage[0] = (uint32_t)fi.colorTextureUsage;
+    r->usage[1] = (uint32_t)fi.depthTextureUsage;
+    r->usage[2] = (uint32_t)fi.motionTextureUsage;
+    r->usage[3] = (uint32_t)fi.uiTextureUsage;
+    r->usage[4] = (uint32_t)fi.outputTextureUsage;
+    r->interp = (uint64_t)(uintptr_t)fi;
+    r->status = 1;
+    return 1;
+  }
+  if (!r) return 0;
+  r->status = 2; r->interp = 0;
+  return 1;
+}
+
+static uint32_t madeira_fgi_encode(const struct madeira_fgi_encode_req *r) {
+  if (!r->cb || !r->interp || !r->color || !r->prev_color || !r->depth || !r->motion || !r->output) return 0;
+  if (@available(iOS 26.0, macOS 26.0, *)) {
+    id<MTLFXFrameInterpolator> fi = (id<MTLFXFrameInterpolator>)(uintptr_t)r->interp;
+    fi.colorTexture = (id<MTLTexture>)(uintptr_t)r->color;
+    fi.prevColorTexture = (id<MTLTexture>)(uintptr_t)r->prev_color;
+    fi.depthTexture = (id<MTLTexture>)(uintptr_t)r->depth;
+    fi.motionTexture = (id<MTLTexture>)(uintptr_t)r->motion;
+    fi.uiTexture = (id<MTLTexture>)(uintptr_t)r->ui;
+    fi.uiTextureComposited = (r->ui && (r->flags & 2)) ? YES : NO;
+    fi.outputTexture = (id<MTLTexture>)(uintptr_t)r->output;
+    fi.fence = (id<MTLFence>)(uintptr_t)r->fence;
+    fi.motionVectorScaleX = r->mv_scale_x;
+    fi.motionVectorScaleY = r->mv_scale_y;
+    fi.deltaTime = r->delta_time;
+    fi.nearPlane = r->near_plane;
+    fi.farPlane = r->far_plane;
+    fi.fieldOfView = r->fov_y;
+    fi.aspectRatio = r->aspect;
+    fi.jitterOffsetX = r->jitter_x;
+    fi.jitterOffsetY = r->jitter_y;
+    fi.depthReversed = (r->flags & 1) ? YES : NO;
+    fi.shouldResetHistory = (r->flags & 4) ? YES : NO;
+    [fi encodeToCommandBuffer:(id<MTLCommandBuffer>)(uintptr_t)r->cb];
+    return 1;
+  }
+  return 0;
+}
+
+static uint32_t madeira_fgi_present(const struct madeira_fgi_present_req *r) {
+  id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)(uintptr_t)r->cb;
+  id<MTLDrawable> first = (id<MTLDrawable>)(uintptr_t)r->first;
+  id<MTLDrawable> second = (id<MTLDrawable>)(uintptr_t)r->second;
+  int mode = g_madeira_vsync_mode;
+  double cap = mode == 1 ? 60.0 : mode == 3 ? 30.0 : mode == 4 ? 40.0 : 0.0;
+  if (!cb || !first || !second) return 0;
+  gpt_note_present();   /* one game frame, as _MTLCommandBuffer_presentDrawable counts it */
+  if (madeira_frame_hooks_on())
+    ios_frame_encode_present(0);
+  madeira_frame_mark_drawable((id)first);    /* the overlay shows what reaches the glass: both */
+  madeira_frame_mark_drawable((id)second);
+  madeira_log_present_cadence("presentFramegenFeed", cap > 0.0 ? 0.5 / cap : 0.0);
+  if (cap > 0.0) {
+    [cb presentDrawable:first afterMinimumDuration:0.5 / cap];
+    [cb presentDrawable:second afterMinimumDuration:0.5 / cap];
+  } else {
+    [cb presentDrawable:first];
+    if (r->frame_s > 0.002 && r->frame_s < 0.25)
+      [cb presentDrawable:second afterMinimumDuration:r->frame_s * 0.5];
+    else
+      [cb presentDrawable:second];
+  }
+  return 1;
+}
+
 static NTSTATUS _madeira_ctl(void *args) {
   struct madeira_ctl_args *a = args;
   if (!a) return STATUS_SUCCESS;
@@ -7507,6 +8323,20 @@ static NTSTATUS _madeira_ctl(void *args) {
   case 24:    /* madeira-bcd: late render-pass store actions (tools/patch-winemetal-rp-store.py) */
     if (!a->ptr || a->len < sizeof(struct madeira_rp_store_req) || wmtr_enabled()) break;
     a->ret = madeira_rp_store((const struct madeira_rp_store_req *)(uintptr_t)a->ptr);
+    break;
+  case 30: {  /* madeira-duo framegen-feed: make a MetalFX frame interpolator (ptr = 0: does this OS have one?) */
+    struct madeira_fgi_create_req *r = (struct madeira_fgi_create_req *)(uintptr_t)a->ptr;
+    if (wmtr_enabled() || (r && a->len < sizeof *r)) break;
+    a->ret = madeira_fgi_create(r);
+    break;
+  }
+  case 31:    /* madeira-duo framegen-feed: encode one interpolated frame */
+    if (!a->ptr || a->len < sizeof(struct madeira_fgi_encode_req) || wmtr_enabled()) break;
+    a->ret = madeira_fgi_encode((const struct madeira_fgi_encode_req *)(uintptr_t)a->ptr);
+    break;
+  case 32:    /* madeira-duo framegen-feed: present the generated frame and the game's */
+    if (!a->ptr || a->len < sizeof(struct madeira_fgi_present_req) || wmtr_enabled()) break;
+    a->ret = madeira_fgi_present((const struct madeira_fgi_present_req *)(uintptr_t)a->ptr);
     break;
   default: break;
   }
